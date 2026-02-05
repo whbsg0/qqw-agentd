@@ -1,0 +1,41 @@
+name: build-agentd
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22.x"
+
+      - name: Build agentd (ios/arm64)
+        working-directory: agentd
+        run: |
+          go mod download
+          SDKROOT="$(xcrun --sdk iphoneos --show-sdk-path)"
+          CC="$(xcrun --sdk iphoneos --find clang)"
+          CXX="$(xcrun --sdk iphoneos --find clang++)"
+          export SDKROOT CC CXX
+          export CGO_ENABLED=1 GOOS=ios GOARCH=arm64
+          export CGO_CFLAGS="-isysroot $SDKROOT -miphoneos-version-min=13.0"
+          export CGO_LDFLAGS="-isysroot $SDKROOT -miphoneos-version-min=13.0"
+          go build -trimpath -ldflags "-s -w -linkmode external" -o dist/agentd-ios-arm64 ./cmd/agentd
+          codesign --sign - --force --timestamp=none dist/agentd-ios-arm64
+
+      - name: Build broker (linux/amd64)
+        working-directory: agentd
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o dist/broker-linux-amd64 ./cmd/broker
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: agentd-artifacts
+          path: |
+            agentd/dist/agentd-ios-arm64
+            agentd/dist/broker-linux-amd64
