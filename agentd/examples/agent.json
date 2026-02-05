@@ -1,0 +1,18 @@
+{
+  "serverUrl": "wss://api.yourdomain.com/agent/ws",
+  "registerToken": "replace-me",
+  "deviceIdPath": "/var/mobile/Library/QQwAgent/device_id",
+  "heartbeatSec": 20,
+  "reconnect": {
+    "baseMs": 1000,
+    "maxMs": 60000,
+    "jitterMs": 3000
+  },
+  "frida": {
+    "host": "127.0.0.1",
+    "port": 27042,
+    "ensureRunning": false,
+    "startCmd": "/var/jb/usr/sbin/frida-server -l 127.0.0.1:27042"
+  }
+}
+
