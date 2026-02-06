@@ -1,0 +1,47 @@
+#!/bin/sh
+set -e
+
+LOG="/private/var/tmp/qqwagentd-postinst.log"
+if [ ! -d /private/var/tmp ]; then LOG="/var/tmp/qqwagentd-postinst.log"; fi
+(echo "=== $(date) ==="; echo "postinst: start"; echo "id: $(id 2>/dev/null || echo unknown)") >> "$LOG" 2>/dev/null || true
+
+log_cmd() {
+  echo "postinst: $*" >> "$LOG" 2>/dev/null || true
+  sh -lc "$*" >> "$LOG" 2>&1 || true
+}
+
+CFG_DIR="/var/mobile/Library/QQwAgent"
+CFG_SAMPLE="$CFG_DIR/agent.json.sample"
+CFG="$CFG_DIR/agent.json"
+PLIST="/var/jb/Library/LaunchDaemons/com.qqw.agentd.plist"
+BIN="/var/jb/usr/local/bin/agentd"
+
+mkdir -p "$CFG_DIR" >/dev/null 2>&1 || true
+chmod 755 "$CFG_DIR" >/dev/null 2>&1 || true
+chown -R mobile:mobile "$CFG_DIR" >/dev/null 2>&1 || true
+
+if [ ! -f "$CFG" ] && [ -f "$CFG_SAMPLE" ]; then
+  cp -f "$CFG_SAMPLE" "$CFG" >/dev/null 2>&1 || true
+  chown mobile:mobile "$CFG" >/dev/null 2>&1 || true
+  chmod 644 "$CFG" >/dev/null 2>&1 || true
+  echo "postinst: wrote default agent.json" >> "$LOG" 2>/dev/null || true
+fi
+
+chmod 755 "$BIN" >/dev/null 2>&1 || true
+chmod 644 "$PLIST" >/dev/null 2>&1 || true
+chown root:wheel "$PLIST" >/dev/null 2>&1 || true
+chown root:wheel "$BIN" >/dev/null 2>&1 || true
+
+if command -v launchctl >/dev/null 2>&1; then
+  log_cmd "ls -la \"$BIN\" \"$PLIST\" \"$CFG\" 2>/dev/null || true"
+  log_cmd "plutil -lint \"$PLIST\" 2>/dev/null || true"
+  log_cmd "launchctl bootout system \"$PLIST\" || true"
+  log_cmd "launchctl bootstrap system \"$PLIST\" || launchctl load \"$PLIST\" || true"
+  log_cmd "launchctl enable system/com.qqw.agentd || true"
+  log_cmd "launchctl kickstart -k system/com.qqw.agentd || true"
+  log_cmd "launchctl print system/com.qqw.agentd | head -n 120 || true"
+  log_cmd "curl -sS http://127.0.0.1:17171/status || true"
+fi
+
+echo "postinst: done" >> "$LOG" 2>/dev/null || true
+exit 0
