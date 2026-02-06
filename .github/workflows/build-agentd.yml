@@ -29,7 +29,7 @@ jobs:
           echo "=== verify Mach-O platform ==="
           file dist/agentd-ios-arm64
           otool -l dist/agentd-ios-arm64 | grep -n "LC_BUILD_VERSION" -A3 | head -n 30
-          PLATFORM="$(otool -l dist/agentd-ios-arm64 | awk '/LC_BUILD_VERSION/{f=1} f&&$1==\"platform\"{print $2; exit}')"
+          PLATFORM="$(otool -l dist/agentd-ios-arm64 | awk '$1=="cmd" && $2=="LC_BUILD_VERSION"{f=1} f && $1=="platform"{print $2; exit}')"
           if [ "$PLATFORM" != "2" ]; then
             echo "ERROR: expected iOS platform=2, got platform=$PLATFORM"
             exit 1
