@@ -9,11 +9,15 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -40,6 +44,9 @@ type Config struct {
 		EnsureRunning bool   `json:"ensureRunning"`
 		StartCmd      string `json:"startCmd"`
 	} `json:"frida"`
+	WhatsApp struct {
+		ChatStoragePath string `json:"chatStoragePath"`
+	} `json:"whatsApp"`
 }
 
 type Envelope struct {
@@ -80,8 +87,15 @@ type TunnelDataPayload struct {
 	B64 string `json:"b64"`
 }
 
+type DbSyncStartPayload struct {
+	JobID     string `json:"jobId"`
+	UploadURL string `json:"uploadUrl"`
+}
+
 type Agent struct {
-	cfg      Config
+	cfgMu sync.RWMutex
+	cfg   Config
+
 	deviceID string
 
 	seq uint64
@@ -95,6 +109,13 @@ type Agent struct {
 	configPath      string
 	connected       atomic.Bool
 	lastConnectedTS atomic.Int64
+
+	runCancelMu  sync.Mutex
+	runCancel    context.CancelFunc
+	reconnectNow chan struct{}
+
+	lastWhatsAppLocateTS  atomic.Int64
+	lastWhatsAppLocateErr atomic.Value
 }
 
 type Tunnel struct {
@@ -121,30 +142,9 @@ func main() {
 		os.Exit(1)
 	}
 
-	if cfg.ServerURL == "" {
-		fmt.Fprintln(os.Stderr, "config: serverUrl is required")
+	if err := normalizeConfig(&cfg); err != nil {
+		fmt.Fprintln(os.Stderr, "config:", err)
 		os.Exit(1)
-	}
-	if cfg.DeviceIDPath == "" {
-		cfg.DeviceIDPath = "/var/mobile/Library/QQwAgent/device_id"
-	}
-	if cfg.HeartbeatSec <= 0 {
-		cfg.HeartbeatSec = 20
-	}
-	if cfg.Reconnect.BaseMs <= 0 {
-		cfg.Reconnect.BaseMs = 1000
-	}
-	if cfg.Reconnect.MaxMs <= 0 {
-		cfg.Reconnect.MaxMs = 60000
-	}
-	if cfg.Reconnect.JitterMs <= 0 {
-		cfg.Reconnect.JitterMs = 3000
-	}
-	if cfg.Frida.Host == "" {
-		cfg.Frida.Host = "127.0.0.1"
-	}
-	if cfg.Frida.Port == 0 {
-		cfg.Frida.Port = 27042
 	}
 
 	deviceID, err := loadOrCreateDeviceID(cfg.DeviceIDPath)
@@ -154,10 +154,11 @@ func main() {
 	}
 
 	a := &Agent{
-		cfg:       cfg,
-		deviceID:  deviceID,
-		tunnels:   make(map[string]*Tunnel),
-		startedAt: time.Now(),
+		cfg:          cfg,
+		deviceID:     deviceID,
+		tunnels:      make(map[string]*Tunnel),
+		startedAt:    time.Now(),
+		reconnectNow: make(chan struct{}, 1),
 	}
 
 	a.startControlServer(cfgPath)
@@ -165,7 +166,7 @@ func main() {
 }
 
 func (a *Agent) startControlServer(cfgPath string) {
-	if a.cfg.ControlListen == "" {
+	if a.getCfg().ControlListen == "" {
 		return
 	}
 	a.configPath = cfgPath
@@ -173,10 +174,10 @@ func (a *Agent) startControlServer(cfgPath string) {
 	mux := http.NewServeMux()
 
 	authOK := func(r *http.Request) bool {
-		if a.cfg.ControlToken == "" {
+		if a.getCfg().ControlToken == "" {
 			return true
 		}
-		return r.Header.Get("X-QQw-Token") == a.cfg.ControlToken
+		return r.Header.Get("X-QQw-Token") == a.getCfg().ControlToken
 	}
 
 	writeJSON := func(w http.ResponseWriter, status int, v any) {
@@ -196,14 +197,76 @@ func (a *Agent) startControlServer(cfgPath string) {
 			w.WriteHeader(http.StatusUnauthorized)
 			return
 		}
+		cfg := a.getCfg()
 		writeJSON(w, http.StatusOK, map[string]any{
 			"deviceId":        a.deviceID,
-			"serverUrl":       a.cfg.ServerURL,
+			"serverUrl":       cfg.ServerURL,
+			"controlListen":   cfg.ControlListen,
 			"connected":       a.connected.Load(),
 			"lastConnectedTs": a.lastConnectedTS.Load(),
 			"pid":             os.Getpid(),
 			"uptimeSec":       int64(time.Since(a.startedAt).Seconds()),
 		})
+	})
+
+	mux.HandleFunc("/whatsapp/status", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		if !authOK(r) {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		cfg := a.getCfg()
+		path := cfg.WhatsApp.ChatStoragePath
+		ok, size, modTS, errText := statReadableFile(path)
+		locErr, _ := a.lastWhatsAppLocateErr.Load().(string)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"chatStoragePath":     path,
+			"existsReadable":      ok,
+			"sizeBytes":           size,
+			"modTs":               modTS,
+			"uploadReady":         ok && size > 0,
+			"lastLocateTs":        a.lastWhatsAppLocateTS.Load(),
+			"lastLocateErr":       locErr,
+			"chatStoragePathErr":  errText,
+			"deviceSecretPresent": cfg.DeviceSecret != "",
+		})
+	})
+
+	mux.HandleFunc("/whatsapp/locate", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		if !authOK(r) {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 12*time.Second)
+		defer cancel()
+
+		found, candidates, err := locateChatStorage(ctx)
+		a.lastWhatsAppLocateTS.Store(time.Now().UnixMilli())
+		if err != nil {
+			a.lastWhatsAppLocateErr.Store(err.Error())
+			writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": err.Error(), "candidates": candidates})
+			return
+		}
+		a.lastWhatsAppLocateErr.Store("")
+
+		prev := a.getCfg()
+		next := prev
+		next.WhatsApp.ChatStoragePath = found
+		_ = normalizeConfig(&next)
+		if err := a.persistConfig(next); err != nil {
+			a.setCfg(next)
+			writeJSON(w, http.StatusOK, map[string]any{"ok": true, "chatStoragePath": found, "persisted": false, "persistErr": err.Error(), "candidates": candidates})
+			return
+		}
+		a.setCfg(next)
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "chatStoragePath": found, "persisted": true, "candidates": candidates})
 	})
 
 	mux.HandleFunc("/config", func(w http.ResponseWriter, r *http.Request) {
@@ -228,14 +291,27 @@ func (a *Agent) startControlServer(cfgPath string) {
 				writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": err.Error()})
 				return
 			}
-			var tmp any
-			if err := json.Unmarshal(body, &tmp); err != nil {
+			var nextCfg Config
+			if err := json.Unmarshal(body, &nextCfg); err != nil {
 				writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "invalid json"})
 				return
 			}
-			if err := os.WriteFile(a.configPath, body, 0o644); err != nil {
+			if err := normalizeConfig(&nextCfg); err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": err.Error()})
+				return
+			}
+
+			canonical, _ := json.MarshalIndent(nextCfg, "", "  ")
+			canonical = append(canonical, '\n')
+			if err := os.WriteFile(a.configPath, canonical, 0o644); err != nil {
 				writeJSON(w, http.StatusInternalServerError, map[string]any{"ok": false, "error": err.Error()})
 				return
+			}
+
+			prev := a.getCfg()
+			a.setCfg(nextCfg)
+			if prev.ServerURL != nextCfg.ServerURL || prev.HeartbeatSec != nextCfg.HeartbeatSec || prev.DeviceSecret != nextCfg.DeviceSecret || prev.RegisterToken != nextCfg.RegisterToken {
+				a.requestReconnect()
 			}
 			writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 		default:
@@ -260,12 +336,12 @@ func (a *Agent) startControlServer(cfgPath string) {
 	})
 
 	srv := &http.Server{
-		Addr:              a.cfg.ControlListen,
+		Addr:              a.getCfg().ControlListen,
 		Handler:           mux,
 		ReadHeaderTimeout: 3 * time.Second,
 	}
 	go func() {
-		ln, err := net.Listen("tcp", a.cfg.ControlListen)
+		ln, err := net.Listen("tcp", a.getCfg().ControlListen)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "control server listen:", err)
 			return
@@ -277,21 +353,146 @@ func (a *Agent) startControlServer(cfgPath string) {
 	}()
 }
 
+func (a *Agent) persistConfig(nextCfg Config) error {
+	if a.configPath == "" {
+		return errors.New("configPath not set")
+	}
+	canonical, _ := json.MarshalIndent(nextCfg, "", "  ")
+	canonical = append(canonical, '\n')
+	return os.WriteFile(a.configPath, canonical, 0o644)
+}
+
+type locateCandidate struct {
+	Path  string `json:"path"`
+	Size  int64  `json:"sizeBytes"`
+	ModTS int64  `json:"modTs"`
+}
+
+func statReadableFile(path string) (ok bool, size int64, modTS int64, errText string) {
+	if strings.TrimSpace(path) == "" {
+		return false, 0, 0, "empty path"
+	}
+	st, err := os.Stat(path)
+	if err != nil {
+		return false, 0, 0, err.Error()
+	}
+	if st.IsDir() {
+		return false, 0, 0, "is a directory"
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return false, 0, 0, err.Error()
+	}
+	_ = f.Close()
+	return true, st.Size(), st.ModTime().UnixMilli(), ""
+}
+
+func locateChatStorage(ctx context.Context) (string, []locateCandidate, error) {
+	roots := []string{
+		"/var/mobile/Containers/Shared/AppGroup",
+		"/var/mobile/Containers/Data/Application",
+		"/private/var/mobile/Containers/Shared/AppGroup",
+		"/private/var/mobile/Containers/Data/Application",
+	}
+	name := "ChatStorage.sqlite"
+
+	candidates := make([]locateCandidate, 0, 8)
+	seen := make(map[string]struct{}, 32)
+	for _, root := range roots {
+		out, err := execFind(ctx, root, 7, name, 20)
+		if err != nil {
+			continue
+		}
+		for _, p := range out {
+			if _, ok := seen[p]; ok {
+				continue
+			}
+			seen[p] = struct{}{}
+			st, err := os.Stat(p)
+			if err != nil || st.IsDir() {
+				continue
+			}
+			candidates = append(candidates, locateCandidate{Path: p, Size: st.Size(), ModTS: st.ModTime().UnixMilli()})
+		}
+	}
+
+	if len(candidates) == 0 {
+		return "", candidates, errors.New("no candidates found")
+	}
+
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].Size != candidates[j].Size {
+			return candidates[i].Size > candidates[j].Size
+		}
+		return candidates[i].ModTS > candidates[j].ModTS
+	})
+
+	return candidates[0].Path, candidates, nil
+}
+
+func execFind(ctx context.Context, root string, maxDepth int, name string, limit int) ([]string, error) {
+	cmd := exec.CommandContext(ctx, "find", root, "-maxdepth", strconv.Itoa(maxDepth), "-type", "f", "-name", name, "-print")
+	b, err := cmd.Output()
+	if err != nil {
+		return nil, err
+	}
+	lines := strings.Split(string(b), "\n")
+	out := make([]string, 0, len(lines))
+	for _, l := range lines {
+		l = strings.TrimSpace(l)
+		if l == "" {
+			continue
+		}
+		out = append(out, l)
+		if limit > 0 && len(out) >= limit {
+			break
+		}
+	}
+	return out, nil
+}
+
 func (a *Agent) runForever() {
-	backoff := time.Duration(a.cfg.Reconnect.BaseMs) * time.Millisecond
-	maxBackoff := time.Duration(a.cfg.Reconnect.MaxMs) * time.Millisecond
-	jitter := time.Duration(a.cfg.Reconnect.JitterMs) * time.Millisecond
+	cfg := a.getCfg()
+	backoff := time.Duration(cfg.Reconnect.BaseMs) * time.Millisecond
+	maxBackoff := time.Duration(cfg.Reconnect.MaxMs) * time.Millisecond
+	jitter := time.Duration(cfg.Reconnect.JitterMs) * time.Millisecond
 
 	for {
+		a.logf("ws: dialing serverUrl=%s", a.getCfg().ServerURL)
 		err := a.runOnce()
 		if err != nil {
-			fmt.Fprintln(os.Stderr, "agent run error:", err)
+			a.logf("ws: run error: %v", err)
 		}
+
+		cfg = a.getCfg()
+		baseBackoff := time.Duration(cfg.Reconnect.BaseMs) * time.Millisecond
+		maxBackoff = time.Duration(cfg.Reconnect.MaxMs) * time.Millisecond
+		jitter = time.Duration(cfg.Reconnect.JitterMs) * time.Millisecond
+		if baseBackoff <= 0 {
+			baseBackoff = 1000 * time.Millisecond
+		}
+		if backoff < baseBackoff {
+			backoff = baseBackoff
+		}
+
 		sleep := backoff + time.Duration(randInt63n(int64(jitter)))
 		if sleep < 0 {
 			sleep = backoff
 		}
-		time.Sleep(sleep)
+		a.logf("ws: reconnect sleep=%s", sleep)
+		timer := time.NewTimer(sleep)
+		select {
+		case <-timer.C:
+		case <-a.reconnectNow:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			backoff = baseBackoff
+			continue
+		}
 		backoff *= 2
 		if backoff > maxBackoff {
 			backoff = maxBackoff
@@ -301,10 +502,15 @@ func (a *Agent) runForever() {
 
 func (a *Agent) runOnce() error {
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	a.setRunCancel(cancel)
+	defer func() {
+		a.clearRunCancel()
+		cancel()
+	}()
 
 	a.connected.Store(false)
-	ws, _, err := websocket.Dial(ctx, a.cfg.ServerURL, &websocket.DialOptions{
+	cfg := a.getCfg()
+	ws, _, err := websocket.Dial(ctx, cfg.ServerURL, &websocket.DialOptions{
 		CompressionMode: websocket.CompressionDisabled,
 	})
 	if err != nil {
@@ -318,8 +524,9 @@ func (a *Agent) runOnce() error {
 	}
 	a.connected.Store(true)
 	a.lastConnectedTS.Store(time.Now().UnixMilli())
+	a.logf("ws: connected")
 
-	hb := time.Duration(a.cfg.HeartbeatSec) * time.Second
+	hb := time.Duration(a.getCfg().HeartbeatSec) * time.Second
 	if hb <= 0 {
 		hb = 20 * time.Second
 	}
@@ -349,15 +556,16 @@ func (a *Agent) runOnce() error {
 }
 
 func (a *Agent) hello(ctx context.Context, ws *websocket.Conn) (string, error) {
+	cfg := a.getCfg()
 	payload := map[string]any{
 		"capabilities": map[string]any{
 			"fridaTcpForward": true,
 		},
 	}
-	if a.cfg.DeviceSecret != "" {
-		payload["deviceSecret"] = a.cfg.DeviceSecret
-	} else if a.cfg.RegisterToken != "" {
-		payload["registerToken"] = a.cfg.RegisterToken
+	if cfg.DeviceSecret != "" {
+		payload["deviceSecret"] = cfg.DeviceSecret
+	} else if cfg.RegisterToken != "" {
+		payload["registerToken"] = cfg.RegisterToken
 	}
 
 	env := Envelope{
@@ -392,12 +600,14 @@ func (a *Agent) hello(ctx context.Context, ws *websocket.Conn) (string, error) {
 		if err := json.Unmarshal(in.Payload, &ack); err != nil {
 			return "", err
 		}
-		if ack.DeviceSecret != "" && a.cfg.DeviceSecret == "" {
-			a.cfg.DeviceSecret = ack.DeviceSecret
+		nextCfg := cfg
+		if ack.DeviceSecret != "" && cfg.DeviceSecret == "" {
+			nextCfg.DeviceSecret = ack.DeviceSecret
 		}
 		if ack.HeartbeatSec > 0 {
-			a.cfg.HeartbeatSec = ack.HeartbeatSec
+			nextCfg.HeartbeatSec = ack.HeartbeatSec
 		}
+		a.setCfg(nextCfg)
 		return ack.SessionID, nil
 	}
 }
@@ -432,32 +642,136 @@ func (a *Agent) readLoop(ctx context.Context, ws *websocket.Conn, sessionID stri
 			a.handleCloseTunnel(in.TunnelID)
 		case "tunnel_data":
 			a.handleTunnelData(ws, in)
+		case "dbsync_start":
+			go a.handleDbSyncStart(in)
 		}
 	}
 }
 
+func (a *Agent) handleDbSyncStart(in Envelope) {
+	cfg := a.getCfg()
+	var p DbSyncStartPayload
+	if err := json.Unmarshal(in.Payload, &p); err != nil {
+		a.logf("dbsync: invalid payload: %v", err)
+		return
+	}
+	if p.JobID == "" || p.UploadURL == "" {
+		a.logf("dbsync: missing jobId/uploadUrl")
+		return
+	}
+	if cfg.WhatsApp.ChatStoragePath == "" {
+		ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+		found, _, err := locateChatStorage(ctx)
+		cancel()
+		if err != nil {
+			a.logf("dbsync: chatStoragePath not configured (locate failed: %v)", err)
+			a.lastWhatsAppLocateTS.Store(time.Now().UnixMilli())
+			a.lastWhatsAppLocateErr.Store(err.Error())
+			return
+		}
+		a.lastWhatsAppLocateTS.Store(time.Now().UnixMilli())
+		a.lastWhatsAppLocateErr.Store("")
+		next := cfg
+		next.WhatsApp.ChatStoragePath = found
+		_ = normalizeConfig(&next)
+		_ = a.persistConfig(next)
+		a.setCfg(next)
+		cfg = next
+	}
+	if cfg.DeviceSecret == "" {
+		a.logf("dbsync: deviceSecret missing (hello_ack not received?)")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	if err := uploadFileMultipart(ctx, p.UploadURL, a.deviceID, cfg.DeviceSecret, cfg.WhatsApp.ChatStoragePath, "ChatStorage.sqlite"); err != nil {
+		a.logf("dbsync: upload failed jobId=%s err=%v", p.JobID, err)
+		return
+	}
+	a.logf("dbsync: upload ok jobId=%s", p.JobID)
+}
+
+func uploadFileMultipart(ctx context.Context, uploadURL, deviceID, deviceSecret, filePath, fileName string) error {
+	f, err := os.Open(filePath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	stat, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	if stat.Size() <= 0 {
+		return errors.New("empty file")
+	}
+
+	pr, pw := io.Pipe()
+	writer := multipart.NewWriter(pw)
+	contentType := writer.FormDataContentType()
+
+	go func() {
+		defer pw.Close()
+		defer writer.Close()
+		_ = writer.WriteField("fileName", fileName)
+		part, err := writer.CreateFormFile("file", fileName)
+		if err != nil {
+			_ = pw.CloseWithError(err)
+			return
+		}
+		if _, err := io.Copy(part, f); err != nil {
+			_ = pw.CloseWithError(err)
+			return
+		}
+	}()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, uploadURL, pr)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", contentType)
+	req.Header.Set("X-Device-Id", deviceID)
+	req.Header.Set("X-Device-Secret", deviceSecret)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return fmt.Errorf("upload failed status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(b)))
+	}
+	return nil
+}
+
 func (a *Agent) handleOpenTunnel(ctx context.Context, ws *websocket.Conn, sessionID string, in Envelope) {
+	cfg := a.getCfg()
 	var p OpenTunnelPayload
 	_ = json.Unmarshal(in.Payload, &p)
 	if p.Target == "" {
 		p.Target = "frida"
 	}
+	a.logf("tunnel: open id=%s target=%s", in.TunnelID, p.Target)
 	if p.Target != "frida" {
 		a.sendTunnelReady(ctx, ws, sessionID, in.TunnelID, false, "UNSUPPORTED_TARGET")
+		a.logf("tunnel: open id=%s fail err=UNSUPPORTED_TARGET", in.TunnelID)
 		return
 	}
 
-	if a.cfg.Frida.EnsureRunning {
-		_ = ensureFridaUp(a.cfg.Frida.Host, a.cfg.Frida.Port, a.cfg.Frida.StartCmd)
+	if cfg.Frida.EnsureRunning {
+		_ = ensureFridaUp(cfg.Frida.Host, cfg.Frida.Port, cfg.Frida.StartCmd)
 	}
 
 	dialCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
 	d := net.Dialer{}
-	conn, err := d.DialContext(dialCtx, "tcp", net.JoinHostPort(a.cfg.Frida.Host, fmt.Sprintf("%d", a.cfg.Frida.Port)))
+	conn, err := d.DialContext(dialCtx, "tcp", net.JoinHostPort(cfg.Frida.Host, fmt.Sprintf("%d", cfg.Frida.Port)))
 	if err != nil {
 		a.sendTunnelReady(ctx, ws, sessionID, in.TunnelID, false, "FRIDA_CONNECT_FAILED")
+		a.logf("tunnel: open id=%s fail err=FRIDA_CONNECT_FAILED", in.TunnelID)
 		return
 	}
 
@@ -472,6 +786,7 @@ func (a *Agent) handleOpenTunnel(ctx context.Context, ws *websocket.Conn, sessio
 	a.tunnelsMu.Unlock()
 
 	a.sendTunnelReady(ctx, ws, sessionID, in.TunnelID, true, "")
+	a.logf("tunnel: open id=%s ok", in.TunnelID)
 
 	go a.tunnelReadPump(tCtx, ws, sessionID, t)
 }
@@ -669,4 +984,75 @@ func ensureFridaUp(host string, port int, startCmd string) error {
 		return err2
 	}
 	return errors.New("frida not available")
+}
+
+func normalizeConfig(cfg *Config) error {
+	if cfg.ServerURL == "" {
+		return errors.New("serverUrl is required")
+	}
+	if cfg.DeviceIDPath == "" {
+		cfg.DeviceIDPath = "/var/mobile/Library/QQwAgent/device_id"
+	}
+	if cfg.HeartbeatSec <= 0 {
+		cfg.HeartbeatSec = 20
+	}
+	if cfg.Reconnect.BaseMs <= 0 {
+		cfg.Reconnect.BaseMs = 1000
+	}
+	if cfg.Reconnect.MaxMs <= 0 {
+		cfg.Reconnect.MaxMs = 60000
+	}
+	if cfg.Reconnect.JitterMs <= 0 {
+		cfg.Reconnect.JitterMs = 3000
+	}
+	if cfg.Frida.Host == "" {
+		cfg.Frida.Host = "127.0.0.1"
+	}
+	if cfg.Frida.Port == 0 {
+		cfg.Frida.Port = 27042
+	}
+	return nil
+}
+
+func (a *Agent) getCfg() Config {
+	a.cfgMu.RLock()
+	defer a.cfgMu.RUnlock()
+	return a.cfg
+}
+
+func (a *Agent) setCfg(cfg Config) {
+	a.cfgMu.Lock()
+	a.cfg = cfg
+	a.cfgMu.Unlock()
+}
+
+func (a *Agent) setRunCancel(cancel context.CancelFunc) {
+	a.runCancelMu.Lock()
+	a.runCancel = cancel
+	a.runCancelMu.Unlock()
+}
+
+func (a *Agent) clearRunCancel() {
+	a.runCancelMu.Lock()
+	a.runCancel = nil
+	a.runCancelMu.Unlock()
+}
+
+func (a *Agent) requestReconnect() {
+	a.runCancelMu.Lock()
+	cancel := a.runCancel
+	a.runCancelMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	select {
+	case a.reconnectNow <- struct{}{}:
+	default:
+	}
+	a.logf("ws: reconnect requested")
+}
+
+func (a *Agent) logf(format string, args ...any) {
+	ts := time.Now().Format(time.RFC3339Nano)
+	_, _ = fmt.Fprintf(os.Stderr, "%s %s\n", ts, fmt.Sprintf(format, args...))
 }

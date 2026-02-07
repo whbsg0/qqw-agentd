@@ -13,6 +13,13 @@
 	<true/>
 	<key>KeepAlive</key>
 	<true/>
+	<key>JetsamProperties</key>
+	<dict>
+		<key>JetsamMemoryLimit</key>
+		<integer>128</integer>
+		<key>JetsamPriority</key>
+		<integer>10</integer>
+	</dict>
 	<key>StandardOutPath</key>
 	<string>/var/mobile/Library/QQwAgent/agent.log</string>
 	<key>StandardErrorPath</key>

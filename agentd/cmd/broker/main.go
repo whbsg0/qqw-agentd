@@ -8,9 +8,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -55,6 +59,11 @@ type TunnelDataPayload struct {
 	B64 string `json:"b64"`
 }
 
+type DbSyncStartPayload struct {
+	JobID     string `json:"jobId"`
+	UploadURL string `json:"uploadUrl"`
+}
+
 type AgentSession struct {
 	deviceID string
 	session  string
@@ -84,6 +93,11 @@ type Broker struct {
 
 	tunnelsMu sync.Mutex
 	tunnels   map[string]*Tunnel
+
+	controlPlaneURL   string
+	controlPlaneProxy *httputil.ReverseProxy
+	brokerAdminToken  string
+	publicBaseURL     string
 }
 
 func main() {
@@ -96,11 +110,35 @@ func main() {
 		tunnels:      make(map[string]*Tunnel),
 	}
 
+	controlPlaneURL := envOr("CONTROL_PLANE_INTERNAL_URL", "http://127.0.0.1:8090")
+	brokerAdminToken := os.Getenv("BROKER_ADMIN_TOKEN")
+	if brokerAdminToken == "" {
+		brokerAdminToken = os.Getenv("CONTROL_PLANE_ADMIN_TOKEN")
+	}
+	publicBaseURL := os.Getenv("BROKER_PUBLIC_BASE_URL")
+	if publicBaseURL == "" {
+		publicBaseURL = "https://api.bbrbr.com"
+	}
+	b.controlPlaneURL = controlPlaneURL
+	b.brokerAdminToken = brokerAdminToken
+	b.publicBaseURL = strings.TrimRight(publicBaseURL, "/")
+
+	cp, err := url.Parse(controlPlaneURL)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "invalid CONTROL_PLANE_INTERNAL_URL")
+		os.Exit(1)
+	}
+	b.controlPlaneProxy = httputil.NewSingleHostReverseProxy(cp)
+
 	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", b.handleHealthz)
 	mux.HandleFunc("/agent/ws", b.handleAgentWS)
 	mux.HandleFunc("/api/devices", b.handleDevices)
 	mux.HandleFunc("/api/open", b.handleOpenTunnel)
 	mux.HandleFunc("/api/tunnels/", b.handleTunnelInfo)
+	mux.HandleFunc("/api/broker/devices/", b.handleBrokerDeviceSubroutes)
+	mux.HandleFunc("/api/device/", b.handleDeviceUpload)
+	mux.HandleFunc("/api/", b.handleAPIProxy)
 
 	srv := &http.Server{
 		Addr:              addr,
@@ -108,11 +146,26 @@ func main() {
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
-	fmt.Println("broker listening on", addr)
+	logJSON("broker_listening", map[string]any{"addr": addr})
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+}
+
+func (b *Broker) handleHealthz(w http.ResponseWriter, r *http.Request) {
+	b.sessionsMu.Lock()
+	sessions := len(b.sessions)
+	b.sessionsMu.Unlock()
+	b.tunnelsMu.Lock()
+	tunnels := len(b.tunnels)
+	b.tunnelsMu.Unlock()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":       true,
+		"ts":       time.Now().UnixMilli(),
+		"sessions": sessions,
+		"tunnels":  tunnels,
+	})
 }
 
 func (b *Broker) handleAgentWS(w http.ResponseWriter, r *http.Request) {
@@ -120,9 +173,11 @@ func (b *Broker) handleAgentWS(w http.ResponseWriter, r *http.Request) {
 		CompressionMode: websocket.CompressionDisabled,
 	})
 	if err != nil {
+		logJSON("agent_ws_accept_failed", map[string]any{"remote": r.RemoteAddr, "err": err.Error()})
 		return
 	}
 	defer ws.Close(websocket.StatusNormalClosure, "")
+	logJSON("agent_ws_accepted", map[string]any{"remote": r.RemoteAddr})
 
 	ctx := r.Context()
 	ws.SetReadLimit(8 * 1024 * 1024)
@@ -134,6 +189,10 @@ func (b *Broker) handleAgentWS(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			if sess != nil {
 				b.removeSession(sess.deviceID, sess.session)
+				logJSON("agent_ws_closed", map[string]any{
+					"deviceId":  sess.deviceID,
+					"sessionId": sess.session,
+				})
 			}
 			return
 		}
@@ -155,6 +214,12 @@ func (b *Broker) handleAgentWS(w http.ResponseWriter, r *http.Request) {
 			}
 			sess = s
 			b.upsertSession(s)
+			logJSON("agent_hello", map[string]any{
+				"deviceId":         in.DeviceID,
+				"sessionId":        sessionID,
+				"fridaServerVer":   p.FridaServerVer,
+				"hasRegisterToken": p.RegisterToken != "",
+			})
 			ackPayload, _ := json.Marshal(HelloAckPayload{
 				SessionID:    sessionID,
 				DeviceSecret: deviceSecret,
@@ -206,6 +271,139 @@ func (b *Broker) handleDevices(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, out)
 }
 
+func (b *Broker) handleBrokerDeviceSubroutes(w http.ResponseWriter, r *http.Request) {
+	if !b.requireAdmin(r) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	path := strings.TrimPrefix(r.URL.Path, "/api/broker/devices/")
+	parts := strings.Split(path, "/")
+	if len(parts) >= 3 && parts[1] == "dbsync" && parts[2] == "start" {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		deviceID := parts[0]
+		var req struct {
+			JobID string `json:"jobId"`
+		}
+		if err := readJSON(r, &req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if deviceID == "" || req.JobID == "" {
+			http.Error(w, "deviceId and jobId required", http.StatusBadRequest)
+			return
+		}
+		sess := b.getSession(deviceID)
+		if sess == nil {
+			http.Error(w, "device offline", http.StatusNotFound)
+			return
+		}
+		payload, _ := json.Marshal(DbSyncStartPayload{
+			JobID:     req.JobID,
+			UploadURL: fmt.Sprintf("%s/api/device/%s/dbsync/jobs/%s/files", b.publicBaseURL, deviceID, req.JobID),
+		})
+		env := Envelope{
+			V:        1,
+			Type:     "dbsync_start",
+			DeviceID: deviceID,
+			Session:  sess.session,
+			TS:       time.Now().UnixMilli(),
+			Payload:  payload,
+		}
+		if err := sess.send(r.Context(), env); err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+		return
+	}
+	http.Error(w, "not found", http.StatusNotFound)
+}
+
+func (b *Broker) handleDeviceUpload(w http.ResponseWriter, r *http.Request) {
+	path := strings.TrimPrefix(r.URL.Path, "/api/device/")
+	parts := strings.Split(path, "/")
+	if len(parts) != 5 || parts[1] != "dbsync" || parts[2] != "jobs" || parts[4] != "files" {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	deviceID := parts[0]
+	jobID := parts[3]
+	if deviceID == "" || jobID == "" {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	secret := r.Header.Get("X-Device-Secret")
+	if secret == "" {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	if !b.verifyDeviceSecret(deviceID, secret) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	if b.brokerAdminToken == "" {
+		http.Error(w, "broker admin token not configured", http.StatusServiceUnavailable)
+		return
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, 256<<20)
+	target := fmt.Sprintf("%s/api/admin/dbsync/jobs/%s/files", strings.TrimRight(b.controlPlaneURL, "/"), jobID)
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, target, r.Body)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+b.brokerAdminToken)
+	if ct := r.Header.Get("Content-Type"); ct != "" {
+		req.Header.Set("Content-Type", ct)
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+	for k, vv := range resp.Header {
+		for _, v := range vv {
+			w.Header().Add(k, v)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+	_, _ = io.Copy(w, resp.Body)
+}
+
+func (b *Broker) handleAPIProxy(w http.ResponseWriter, r *http.Request) {
+	if strings.HasPrefix(r.URL.Path, "/api/admin/") || strings.HasPrefix(r.URL.Path, "/api/employee/") || strings.HasPrefix(r.URL.Path, "/api/trades") || strings.HasPrefix(r.URL.Path, "/api/audit") {
+		b.controlPlaneProxy.ServeHTTP(w, r)
+		return
+	}
+	http.Error(w, "not found", http.StatusNotFound)
+}
+
+func (b *Broker) requireAdmin(r *http.Request) bool {
+	if b.brokerAdminToken == "" {
+		return true
+	}
+	auth := strings.TrimSpace(r.Header.Get("Authorization"))
+	if !strings.HasPrefix(auth, "Bearer ") {
+		return false
+	}
+	token := strings.TrimSpace(strings.TrimPrefix(auth, "Bearer "))
+	return token == b.brokerAdminToken
+}
+
+func (b *Broker) verifyDeviceSecret(deviceID, provided string) bool {
+	b.secretMu.Lock()
+	defer b.secretMu.Unlock()
+	sec, ok := b.deviceSecret[deviceID]
+	return ok && sec != "" && sec == provided
+}
+
 func (b *Broker) handleOpenTunnel(w http.ResponseWriter, r *http.Request) {
 	deviceID := r.URL.Query().Get("deviceId")
 	if deviceID == "" {
@@ -221,6 +419,7 @@ func (b *Broker) handleOpenTunnel(w http.ResponseWriter, r *http.Request) {
 	tunnelID := uuidV4Must()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
+		logJSON("tunnel_listen_failed", map[string]any{"deviceId": deviceID, "tunnelId": tunnelID, "err": err.Error()})
 		http.Error(w, "listen failed", http.StatusInternalServerError)
 		return
 	}
@@ -245,6 +444,7 @@ func (b *Broker) handleOpenTunnel(w http.ResponseWriter, r *http.Request) {
 		Payload:  openPayload,
 	}
 	if err := sess.send(r.Context(), openMsg); err != nil {
+		logJSON("open_tunnel_send_failed", map[string]any{"deviceId": deviceID, "tunnelId": tunnelID, "err": err.Error()})
 		b.removeTunnel(tunnelID)
 		_ = ln.Close()
 		http.Error(w, "open_tunnel send failed", http.StatusBadGateway)
@@ -254,12 +454,14 @@ func (b *Broker) handleOpenTunnel(w http.ResponseWriter, r *http.Request) {
 	select {
 	case ready := <-t.readyCh:
 		if !ready.OK {
+			logJSON("tunnel_ready_failed", map[string]any{"deviceId": deviceID, "tunnelId": tunnelID, "err": ready.Error})
 			b.removeTunnel(tunnelID)
 			_ = ln.Close()
 			http.Error(w, ready.Error, http.StatusBadGateway)
 			return
 		}
 	case <-time.After(10 * time.Second):
+		logJSON("tunnel_ready_timeout", map[string]any{"deviceId": deviceID, "tunnelId": tunnelID})
 		b.removeTunnel(tunnelID)
 		_ = ln.Close()
 		http.Error(w, "tunnel_ready timeout", http.StatusGatewayTimeout)
@@ -269,6 +471,7 @@ func (b *Broker) handleOpenTunnel(w http.ResponseWriter, r *http.Request) {
 	go b.acceptOnceAndPump(sess, t)
 
 	_, portStr, _ := net.SplitHostPort(ln.Addr().String())
+	logJSON("tunnel_opened", map[string]any{"deviceId": deviceID, "tunnelId": tunnelID, "localHost": "127.0.0.1", "localPort": portStr})
 	writeJSON(w, http.StatusOK, map[string]any{
 		"deviceId":  deviceID,
 		"tunnelId":  tunnelID,
@@ -303,8 +506,10 @@ func (b *Broker) acceptOnceAndPump(sess *AgentSession, t *Tunnel) {
 	_ = t.listener.(*net.TCPListener).SetDeadline(time.Now().Add(60 * time.Second))
 	conn, err := t.listener.Accept()
 	if err != nil {
+		logJSON("tunnel_accept_failed", map[string]any{"deviceId": t.deviceID, "tunnelId": t.id, "err": err.Error()})
 		return
 	}
+	logJSON("tunnel_local_connected", map[string]any{"deviceId": t.deviceID, "tunnelId": t.id})
 	t.connMu.Lock()
 	t.conn = conn
 	t.connMu.Unlock()
@@ -396,6 +601,7 @@ func (b *Broker) cleanupTunnel(sess *AgentSession, t *Tunnel) {
 	}
 	t.connMu.Unlock()
 	b.removeTunnel(t.id)
+	logJSON("tunnel_closed", map[string]any{"deviceId": t.deviceID, "tunnelId": t.id})
 	closeMsg := Envelope{
 		V:        1,
 		Type:     "close_tunnel",
@@ -481,11 +687,32 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
+func readJSON(r *http.Request, v any) error {
+	defer r.Body.Close()
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	return dec.Decode(v)
+}
+
 func envOr(key, def string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
 	}
 	return def
+}
+
+func logJSON(event string, fields map[string]any) {
+	if fields == nil {
+		fields = make(map[string]any)
+	}
+	fields["event"] = event
+	fields["ts"] = time.Now().UnixMilli()
+	b, err := json.Marshal(fields)
+	if err != nil {
+		log.Println(event)
+		return
+	}
+	log.Println(string(b))
 }
 
 func uuidV4Must() string {

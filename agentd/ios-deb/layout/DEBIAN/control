@@ -1,6 +1,6 @@
 Package: com.qqw.agentd
 Name: QQwAgentD
-Version: 0.1.0-3
+Version: 0.1.0-5
 Architecture: iphoneos-arm64
 Description: QQw agent daemon (reverse frida tunnel + control HTTP)
 Maintainer: QQw

@@ -32,6 +32,11 @@ chmod 644 "$PLIST" >/dev/null 2>&1 || true
 chown root:wheel "$PLIST" >/dev/null 2>&1 || true
 chown root:wheel "$BIN" >/dev/null 2>&1 || true
 
+if command -v ldid >/dev/null 2>&1; then
+  log_cmd "ldid -S \"$BIN\" || true"
+  log_cmd "ldid -e \"$BIN\" 2>/dev/null | head -n 80 || true"
+fi
+
 if command -v launchctl >/dev/null 2>&1; then
   log_cmd "ls -la \"$BIN\" \"$PLIST\" \"$CFG\" 2>/dev/null || true"
   log_cmd "plutil -lint \"$PLIST\" 2>/dev/null || true"

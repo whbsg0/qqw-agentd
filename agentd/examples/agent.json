@@ -14,5 +14,8 @@
     "port": 27042,
     "ensureRunning": false,
     "startCmd": "/var/jb/usr/sbin/frida-server -l 127.0.0.1:27042"
+  },
+  "whatsApp": {
+    "chatStoragePath": "/path/to/ChatStorage.sqlite"
   }
 }
