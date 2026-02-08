@@ -1,3 +1,4 @@
+
 name: build-agentd
 
 on:
@@ -35,6 +36,26 @@ jobs:
             exit 1
           fi
 
+      - name: Build agentd deb (ios/rootless)
+        working-directory: agentd/ios-deb
+        run: |
+          set -euo pipefail
+          REF_TYPE="${{ github.ref_type }}"
+          REF_NAME="${{ github.ref_name }}"
+          VERSION=""
+          if [ "$REF_TYPE" = "tag" ]; then
+            VERSION="${REF_NAME#v}"
+          else
+            VERSION="0.0.0+sha.${GITHUB_SHA::7}.run.${GITHUB_RUN_NUMBER}"
+          fi
+          case "$VERSION" in
+            *-*) ;;
+            *) VERSION="${VERSION}-1" ;;
+          esac
+          chmod 755 build.sh layout/DEBIAN/postinst layout/DEBIAN/prerm || true
+          ./build.sh ../dist/agentd-ios-arm64 "$VERSION"
+          ls -la packages/*.deb
+
       - name: Build broker (linux/amd64)
         working-directory: agentd
         run: |
@@ -47,3 +68,4 @@ jobs:
           path: |
             agentd/dist/agentd-ios-arm64
             agentd/dist/broker-linux-amd64
+            agentd/ios-deb/packages/*.deb
