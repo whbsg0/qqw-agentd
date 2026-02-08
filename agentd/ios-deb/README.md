@@ -30,6 +30,16 @@ tail -n 200 /private/var/tmp/qqwagentd-postinst.log 2>/dev/null || true
 tail -n 200 /var/mobile/Library/QQwAgent/agent.log 2>/dev/null || true
 ```
 
+## 与 QQwApp Updater 配合（推荐）
+若已安装 QQwApp（方案 1），系统会有 `com.qqw.updater` 常驻进程自动安装 agentd deb：
+- 将 deb 放入：`/var/mobile/Library/QQwUpdates/`
+  - `agentd.deb`
+  - 或 `com.qqw.agentd_*.deb`
+- 等待 60 秒内自动安装并尝试重启 agentd
+- 查看状态与日志：
+  - `/var/mobile/Library/QQwUpdates/status.json`
+  - `/var/mobile/Library/QQwUpdates/updater.log`
+
 ## 配置文件
 - `agent.json` 默认路径：`/var/mobile/Library/QQwAgent/agent.json`
 - 包内只提供 `agent.json.sample`，postinst 会在 `agent.json` 缺失时复制生成，避免覆盖已有配置。
