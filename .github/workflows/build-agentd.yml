@@ -61,6 +61,11 @@ jobs:
         run: |
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o dist/broker-linux-amd64 ./cmd/broker
 
+      - name: Install dpkg-deb (macOS)
+        run: |
+          brew list dpkg >/dev/null 2>&1 || brew install dpkg
+          which dpkg-deb
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
