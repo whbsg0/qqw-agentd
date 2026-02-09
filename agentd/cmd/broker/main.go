@@ -325,14 +325,37 @@ func (b *Broker) handleBrokerDeviceSubroutes(w http.ResponseWriter, r *http.Requ
 func (b *Broker) handleDeviceUpload(w http.ResponseWriter, r *http.Request) {
 	path := strings.TrimPrefix(r.URL.Path, "/api/device/")
 	parts := strings.Split(path, "/")
-	if len(parts) != 5 || parts[1] != "dbsync" || parts[2] != "jobs" || parts[4] != "files" {
+	deviceID := ""
+	target := ""
+	if len(parts) == 5 && parts[1] == "dbsync" && parts[2] == "jobs" && parts[4] == "files" {
+		deviceID = parts[0]
+		jobID := parts[3]
+		if deviceID == "" || jobID == "" {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		target = fmt.Sprintf("%s/api/admin/dbsync/jobs/%s/files", strings.TrimRight(b.controlPlaneURL, "/"), jobID)
+		r.Body = http.MaxBytesReader(w, r.Body, 256<<20)
+	} else if len(parts) == 3 && parts[1] == "asset" && parts[2] == "egress-ip" {
+		deviceID = parts[0]
+		if deviceID == "" {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		target = fmt.Sprintf("%s/api/admin/devices/%s/asset/egress-ip", strings.TrimRight(b.controlPlaneURL, "/"), deviceID)
+	} else {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}
-	deviceID := parts[0]
-	jobID := parts[3]
-	if deviceID == "" || jobID == "" {
-		http.Error(w, "bad request", http.StatusBadRequest)
+	if hdrID := strings.TrimSpace(r.Header.Get("X-Device-Id")); hdrID == "" {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	} else if hdrID != deviceID {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
 	secret := r.Header.Get("X-Device-Secret")
@@ -350,8 +373,6 @@ func (b *Broker) handleDeviceUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	r.Body = http.MaxBytesReader(w, r.Body, 256<<20)
-	target := fmt.Sprintf("%s/api/admin/dbsync/jobs/%s/files", strings.TrimRight(b.controlPlaneURL, "/"), jobID)
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, target, r.Body)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
@@ -378,7 +399,7 @@ func (b *Broker) handleDeviceUpload(w http.ResponseWriter, r *http.Request) {
 }
 
 func (b *Broker) handleAPIProxy(w http.ResponseWriter, r *http.Request) {
-	if strings.HasPrefix(r.URL.Path, "/api/admin/") || strings.HasPrefix(r.URL.Path, "/api/employee/") || strings.HasPrefix(r.URL.Path, "/api/trades") || strings.HasPrefix(r.URL.Path, "/api/audit") {
+	if strings.HasPrefix(r.URL.Path, "/api/admin/") || strings.HasPrefix(r.URL.Path, "/api/employee/") || strings.HasPrefix(r.URL.Path, "/api/enrollments/") || strings.HasPrefix(r.URL.Path, "/api/trades") || strings.HasPrefix(r.URL.Path, "/api/audit") {
 		b.controlPlaneProxy.ServeHTTP(w, r)
 		return
 	}

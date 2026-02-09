@@ -30,6 +30,9 @@ tail -n 200 /private/var/tmp/qqwagentd-postinst.log 2>/dev/null || true
 tail -n 200 /var/mobile/Library/QQwAgent/agent.log 2>/dev/null || true
 ```
 
+说明：
+- `/status` 会返回 `version/commit`（由构建时注入），便于 QQwApp 与后台展示实际运行版本。
+
 ## 与 QQwApp Updater 配合（推荐）
 若已安装 QQwApp（方案 1），系统会有 `com.qqw.updater` 常驻进程自动安装 agentd deb：
 - 将 deb 放入：`/var/mobile/Library/QQwUpdates/`

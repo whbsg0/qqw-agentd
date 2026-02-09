@@ -26,6 +26,9 @@ import (
 	"nhooyr.io/websocket"
 )
 
+var buildVersion = "dev"
+var buildCommit = ""
+
 type Config struct {
 	ServerURL     string `json:"serverUrl"`
 	RegisterToken string `json:"registerToken"`
@@ -200,6 +203,8 @@ func (a *Agent) startControlServer(cfgPath string) {
 		}
 		cfg := a.getCfg()
 		writeJSON(w, http.StatusOK, map[string]any{
+			"version":         buildVersion,
+			"commit":          buildCommit,
 			"deviceId":        a.deviceID,
 			"serverUrl":       cfg.ServerURL,
 			"controlListen":   cfg.ControlListen,
@@ -389,16 +394,22 @@ func statReadableFile(path string) (ok bool, size int64, modTS int64, errText st
 }
 
 func locateChatStorage(ctx context.Context) (string, []locateCandidate, error) {
+	roots := []string{
+		"/var/mobile/Containers/Shared/AppGroup",
+		"/var/mobile/Containers/Data/Application",
+		"/private/var/mobile/Containers/Shared/AppGroup",
+		"/private/var/mobile/Containers/Data/Application",
+	}
 	name := "ChatStorage.sqlite"
 
 	candidates := make([]locateCandidate, 0, 8)
 	seen := make(map[string]struct{}, 32)
 	var lastFindErr error
-	scan := func(root string, maxDepth int, limit int) {
-		out, err := execFind(ctx, root, maxDepth, name, limit)
+	for _, root := range roots {
+		out, err := execFind(ctx, root, 10, name, 50)
 		if err != nil {
 			lastFindErr = err
-			return
+			continue
 		}
 		for _, p := range out {
 			if _, ok := seen[p]; ok {
@@ -411,17 +422,6 @@ func locateChatStorage(ctx context.Context) (string, []locateCandidate, error) {
 			}
 			candidates = append(candidates, locateCandidate{Path: p, Size: st.Size(), ModTS: st.ModTime().UnixMilli()})
 		}
-	}
-
-	scan("/var/mobile/Containers/Shared/AppGroup", 6, 20)
-	if len(candidates) == 0 {
-		scan("/private/var/mobile/Containers/Shared/AppGroup", 6, 20)
-	}
-	if len(candidates) == 0 {
-		scan("/var/mobile/Containers/Data/Application", 10, 50)
-	}
-	if len(candidates) == 0 {
-		scan("/private/var/mobile/Containers/Data/Application", 10, 50)
 	}
 
 	if len(candidates) == 0 {
