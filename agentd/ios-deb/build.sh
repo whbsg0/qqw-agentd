@@ -6,7 +6,7 @@ LAYOUT="$ROOT/layout"
 OUTDIR="$ROOT/packages"
 
 BIN_SRC="${1:-$ROOT/../dist/agentd-ios-arm64}"
-VERSION="${2:-0.1.0-5}"
+VERSION="${2:-1:0.1.0-1}"
 ARCH="iphoneos-arm64"
 
 if [ ! -f "$BIN_SRC" ]; then
@@ -30,6 +30,7 @@ if [ -f "$CTRL" ]; then
   fi
 fi
 
-OUT="$OUTDIR/com.qqw.agentd_${VERSION}_${ARCH}.deb"
+VERSION_SAFE="$(printf '%s' "$VERSION" | tr ':' '_')"
+OUT="$OUTDIR/com.qqw.agentd_${VERSION_SAFE}_${ARCH}.deb"
 dpkg-deb -b "$LAYOUT" "$OUT"
 echo "$OUT"

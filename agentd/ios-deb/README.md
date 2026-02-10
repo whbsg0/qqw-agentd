@@ -10,7 +10,7 @@
 ```sh
 cd /var/mobile/Library/QQwDev/QQw/agentd/ios-deb
 chmod 755 build.sh layout/DEBIAN/postinst layout/DEBIAN/prerm
-./build.sh ../dist/agentd-ios-arm64 0.1.0-1
+./build.sh ../dist/agentd-ios-arm64 1:0.1.0-1
 ```
 
 生成 deb：
@@ -32,6 +32,7 @@ tail -n 200 /var/mobile/Library/QQwAgent/agent.log 2>/dev/null || true
 
 说明：
 - `/status` 会返回 `version/commit`（由构建时注入），便于 QQwApp 与后台展示实际运行版本。
+- deb 版本号建议使用 epoch（`1:...`）。由于某些文件系统限制，deb 产物文件名会把 `:` 替换成 `_`，不影响 dpkg 的版本比较。
 
 ## 与 QQwApp Updater 配合（推荐）
 若已安装 QQwApp（方案 1），系统会有 `com.qqw.updater` 常驻进程自动安装 agentd deb：
