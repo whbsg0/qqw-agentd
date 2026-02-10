@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"database/sql"
@@ -406,35 +407,88 @@ func (b *Broker) handleDeviceUpload(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
-		if b.db == nil {
-			http.Error(w, "DATABASE_URL required", http.StatusServiceUnavailable)
+		if b.brokerAdminToken == "" {
+			http.Error(w, "broker admin token not configured", http.StatusServiceUnavailable)
 			return
 		}
-		ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
-		defer cancel()
-		var assetID, phone, wa, egress, status, notes, metaText string
-		err := b.db.QueryRowContext(ctx, `
-select asset_id, coalesce(phone,''), coalesce(wa_account,''), coalesce(egress_ip,''), coalesce(status,''), coalesce(notes,''), meta::text
-from assets
-where device_id=$1
-limit 1
-`, deviceID).Scan(&assetID, &phone, &wa, &egress, &status, &notes, &metaText)
+		target = fmt.Sprintf("%s/api/admin/devices/%s/asset-snapshot", strings.TrimRight(b.controlPlaneURL, "/"), url.PathEscape(deviceID))
+		req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, target, nil)
 		if err != nil {
-			http.Error(w, "not found", http.StatusNotFound)
+			http.Error(w, err.Error(), http.StatusBadGateway)
 			return
 		}
-		var meta any
-		_ = json.Unmarshal([]byte(metaText), &meta)
-		writeJSON(w, http.StatusOK, map[string]any{
-			"assetId":   assetID,
-			"phone":     phone,
-			"waAccount": wa,
-			"egressIp":  egress,
-			"status":    status,
-			"deviceId":  deviceID,
-			"notes":     notes,
-			"meta":      meta,
-		})
+		req.Header.Set("Authorization", "Bearer "+b.brokerAdminToken)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close()
+		for k, vv := range resp.Header {
+			for _, v := range vv {
+				w.Header().Add(k, v)
+			}
+		}
+		w.WriteHeader(resp.StatusCode)
+		_, _ = io.Copy(w, resp.Body)
+		return
+	} else if len(parts) == 4 && parts[1] == "asset" && parts[2] == "egress-ip" && parts[3] == "fill" {
+		deviceID = parts[0]
+		if deviceID == "" {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if hdrID := strings.TrimSpace(r.Header.Get("X-Device-Id")); hdrID == "" {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		} else if hdrID != deviceID {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		secret := r.Header.Get("X-Device-Secret")
+		if secret == "" {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		if !b.verifyDeviceSecret(deviceID, secret) {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		sess := b.getSession(deviceID)
+		if sess == nil || strings.TrimSpace(sess.remoteIP) == "" {
+			http.Error(w, "device not online", http.StatusServiceUnavailable)
+			return
+		}
+		if b.brokerAdminToken == "" {
+			http.Error(w, "broker admin token not configured", http.StatusServiceUnavailable)
+			return
+		}
+		target = fmt.Sprintf("%s/api/admin/devices/%s/asset/egress-ip", strings.TrimRight(b.controlPlaneURL, "/"), url.PathEscape(deviceID))
+		body, _ := json.Marshal(map[string]any{"egressIp": strings.TrimSpace(sess.remoteIP)})
+		req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, target, bytes.NewReader(body))
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		req.Header.Set("Authorization", "Bearer "+b.brokerAdminToken)
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close()
+		for k, vv := range resp.Header {
+			for _, v := range vv {
+				w.Header().Add(k, v)
+			}
+		}
+		w.WriteHeader(resp.StatusCode)
+		_, _ = io.Copy(w, resp.Body)
 		return
 	} else if len(parts) == 5 && parts[1] == "dbsync" && parts[2] == "jobs" && parts[4] == "files" {
 		deviceID = parts[0]

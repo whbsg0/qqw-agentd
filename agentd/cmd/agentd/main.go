@@ -394,6 +394,58 @@ func (a *Agent) startControlServer(cfgPath string) {
 		writeJSON(w, http.StatusOK, out)
 	})
 
+	mux.HandleFunc("/asset/egress-ip/fill", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		if !authOK(r) {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		cfg := a.getCfg()
+		base := serverHTTPBase(cfg.ServerURL)
+		if base == "" {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]any{"ok": false, "error": "serverUrl invalid"})
+			return
+		}
+		if strings.TrimSpace(cfg.DeviceSecret) == "" {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]any{"ok": false, "error": "deviceSecret missing"})
+			return
+		}
+		target := fmt.Sprintf("%s/api/device/%s/asset/egress-ip/fill", base, url.PathEscape(a.deviceID))
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		defer cancel()
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, target, nil)
+		if err != nil {
+			writeJSON(w, http.StatusBadGateway, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+		req.Header.Set("X-Device-Id", a.deviceID)
+		req.Header.Set("X-Device-Secret", cfg.DeviceSecret)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			writeJSON(w, http.StatusBadGateway, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		if resp.StatusCode != http.StatusOK {
+			msg := strings.TrimSpace(string(body))
+			if msg == "" {
+				msg = resp.Status
+			}
+			writeJSON(w, resp.StatusCode, map[string]any{"ok": false, "error": msg})
+			return
+		}
+		var out any
+		if err := json.Unmarshal(body, &out); err != nil {
+			writeJSON(w, http.StatusBadGateway, map[string]any{"ok": false, "error": "invalid json"})
+			return
+		}
+		writeJSON(w, http.StatusOK, out)
+	})
+
 	mux.HandleFunc("/updater/run", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			w.WriteHeader(http.StatusMethodNotAllowed)
@@ -405,7 +457,17 @@ func (a *Agent) startControlServer(cfgPath string) {
 		}
 		ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
 		defer cancel()
-		cmd := exec.CommandContext(ctx, "launchctl", "kickstart", "-k", "system/com.qqw.updater")
+		launchctlPath := ""
+		for _, p := range []string{"/var/jb/usr/bin/launchctl", "/var/jb/bin/launchctl", "/usr/bin/launchctl", "/bin/launchctl"} {
+			if st, err := os.Stat(p); err == nil && !st.IsDir() {
+				launchctlPath = p
+				break
+			}
+		}
+		if launchctlPath == "" {
+			launchctlPath = "launchctl"
+		}
+		cmd := exec.CommandContext(ctx, launchctlPath, "kickstart", "-k", "system/com.qqw.updater")
 		out, err := cmd.CombinedOutput()
 		if err != nil {
 			writeJSON(w, http.StatusBadGateway, map[string]any{"ok": false, "error": err.Error(), "output": strings.TrimSpace(string(out))})
