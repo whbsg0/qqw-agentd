@@ -394,6 +394,26 @@ func (a *Agent) startControlServer(cfgPath string) {
 		writeJSON(w, http.StatusOK, out)
 	})
 
+	mux.HandleFunc("/updater/run", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		if !authOK(r) {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, "launchctl", "kickstart", "-k", "system/com.qqw.updater")
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			writeJSON(w, http.StatusBadGateway, map[string]any{"ok": false, "error": err.Error(), "output": strings.TrimSpace(string(out))})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	})
+
 	srv := &http.Server{
 		Addr:              a.getCfg().ControlListen,
 		Handler:           mux,
