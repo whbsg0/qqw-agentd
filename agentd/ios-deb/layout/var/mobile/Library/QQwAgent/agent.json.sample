@@ -1,6 +1,5 @@
 {
-  "serverUrl": "wss://api.yourdomain.com/agent/ws",
-  "registerToken": "replace-me",
+  "serverUrl": "wss://api.bbrbr.com/agent/ws",
   "deviceIdPath": "/var/mobile/Library/QQwAgent/device_id",
   "controlListen": "127.0.0.1:17171",
   "heartbeatSec": 20,

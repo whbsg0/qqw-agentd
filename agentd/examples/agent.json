@@ -1,8 +1,8 @@
 {
   "serverUrl": "wss://api.yourdomain.com/agent/ws",
-  "registerToken": "replace-me",
   "deviceIdPath": "/var/mobile/Library/QQwAgent/device_id",
   "controlListen": "127.0.0.1:17171",
+  "deviceSecret": "",
   "heartbeatSec": 20,
   "reconnect": {
     "baseMs": 1000,

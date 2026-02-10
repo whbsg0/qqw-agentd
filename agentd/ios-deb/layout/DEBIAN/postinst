@@ -11,20 +11,38 @@ log_cmd() {
 }
 
 CFG_DIR="/var/mobile/Library/QQwAgent"
-CFG_SAMPLE="$CFG_DIR/agent.json.sample"
 CFG="$CFG_DIR/agent.json"
 PLIST="/var/jb/Library/LaunchDaemons/com.qqw.agentd.plist"
 BIN="/var/jb/usr/local/bin/agentd"
+BASE_URL_FILE="$CFG_DIR/public_base_url.txt"
 
 mkdir -p "$CFG_DIR" >/dev/null 2>&1 || true
 chmod 755 "$CFG_DIR" >/dev/null 2>&1 || true
 chown -R mobile:mobile "$CFG_DIR" >/dev/null 2>&1 || true
 
-if [ ! -f "$CFG" ] && [ -f "$CFG_SAMPLE" ]; then
-  cp -f "$CFG_SAMPLE" "$CFG" >/dev/null 2>&1 || true
+if [ ! -f "$CFG" ]; then
+  BASE_URL="https://api.bbrbr.com"
+  if [ -f "$BASE_URL_FILE" ]; then
+    CAND="$(cat "$BASE_URL_FILE" 2>/dev/null | head -n 1 | tr -d '\r' | sed 's/[[:space:]]*$//')"
+    if [ -n "$CAND" ]; then BASE_URL="$CAND"; fi
+  fi
+  BASE_URL="$(printf '%s' "$BASE_URL" | sed 's/[[:space:]]*$//')"
+  BASE_URL="$(printf '%s' "$BASE_URL" | sed 's:/*$::')"
+  SERVER_URL="$(printf '%s' "$BASE_URL" | sed 's:^https://:wss://:' | sed 's:^http://:ws://:')/agent/ws"
+  cat > "$CFG" <<EOF
+{
+  "serverUrl": "$SERVER_URL",
+  "deviceIdPath": "/var/mobile/Library/QQwAgent/device_id",
+  "controlListen": "127.0.0.1:17171",
+  "heartbeatSec": 20,
+  "reconnect": { "baseMs": 1000, "maxMs": 60000, "jitterMs": 3000 },
+  "frida": { "host": "127.0.0.1", "port": 27042, "ensureRunning": false, "startCmd": "/var/jb/usr/sbin/frida-server -l 127.0.0.1:27042" },
+  "whatsApp": { "chatStoragePath": "" }
+}
+EOF
   chown mobile:mobile "$CFG" >/dev/null 2>&1 || true
   chmod 644 "$CFG" >/dev/null 2>&1 || true
-  echo "postinst: wrote default agent.json" >> "$LOG" 2>/dev/null || true
+  echo "postinst: wrote default agent.json serverUrl=$SERVER_URL" >> "$LOG" 2>/dev/null || true
 fi
 
 chmod 755 "$BIN" >/dev/null 2>&1 || true

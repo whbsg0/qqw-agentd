@@ -13,6 +13,7 @@ import (
 	"mime/multipart"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -341,6 +342,58 @@ func (a *Agent) startControlServer(cfgPath string) {
 		}()
 	})
 
+	mux.HandleFunc("/asset/snapshot", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		if !authOK(r) {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		cfg := a.getCfg()
+		base := serverHTTPBase(cfg.ServerURL)
+		if base == "" {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]any{"ok": false, "error": "serverUrl invalid"})
+			return
+		}
+		if strings.TrimSpace(cfg.DeviceSecret) == "" {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]any{"ok": false, "error": "deviceSecret missing"})
+			return
+		}
+		target := fmt.Sprintf("%s/api/device/%s/asset-snapshot", base, url.PathEscape(a.deviceID))
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		defer cancel()
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+		if err != nil {
+			writeJSON(w, http.StatusBadGateway, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+		req.Header.Set("X-Device-Id", a.deviceID)
+		req.Header.Set("X-Device-Secret", cfg.DeviceSecret)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			writeJSON(w, http.StatusBadGateway, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		if resp.StatusCode != http.StatusOK {
+			msg := strings.TrimSpace(string(body))
+			if msg == "" {
+				msg = resp.Status
+			}
+			writeJSON(w, resp.StatusCode, map[string]any{"ok": false, "error": msg})
+			return
+		}
+		var out any
+		if err := json.Unmarshal(body, &out); err != nil {
+			writeJSON(w, http.StatusBadGateway, map[string]any{"ok": false, "error": "invalid json"})
+			return
+		}
+		writeJSON(w, http.StatusOK, out)
+	})
+
 	srv := &http.Server{
 		Addr:              a.getCfg().ControlListen,
 		Handler:           mux,
@@ -357,6 +410,23 @@ func (a *Agent) startControlServer(cfgPath string) {
 			fmt.Fprintln(os.Stderr, "control server serve:", err)
 		}
 	}()
+}
+
+func serverHTTPBase(serverURL string) string {
+	u, err := url.Parse(strings.TrimSpace(serverURL))
+	if err != nil || u.Host == "" {
+		return ""
+	}
+	scheme := strings.ToLower(strings.TrimSpace(u.Scheme))
+	if scheme == "wss" {
+		scheme = "https"
+	} else if scheme == "ws" {
+		scheme = "http"
+	}
+	if scheme != "http" && scheme != "https" {
+		return ""
+	}
+	return scheme + "://" + u.Host
 }
 
 func (a *Agent) persistConfig(nextCfg Config) error {
@@ -646,6 +716,9 @@ func (a *Agent) hello(ctx context.Context, ws *websocket.Conn) (string, error) {
 			nextCfg.HeartbeatSec = ack.HeartbeatSec
 		}
 		a.setCfg(nextCfg)
+		if nextCfg.DeviceSecret != cfg.DeviceSecret && a.configPath != "" {
+			_ = a.persistConfig(nextCfg)
+		}
 		return ack.SessionID, nil
 	}
 }

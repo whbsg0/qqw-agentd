@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -18,6 +19,7 @@ import (
 	"sync"
 	"time"
 
+	_ "github.com/jackc/pgx/v5/stdlib"
 	"nhooyr.io/websocket"
 )
 
@@ -70,6 +72,7 @@ type AgentSession struct {
 	ws       *websocket.Conn
 	wsMu     sync.Mutex
 	lastSeen time.Time
+	remoteIP string
 }
 
 type Tunnel struct {
@@ -94,6 +97,11 @@ type Broker struct {
 	tunnelsMu sync.Mutex
 	tunnels   map[string]*Tunnel
 
+	db *sql.DB
+
+	dbErrMu        sync.Mutex
+	lastDBErrLogMs map[string]int64
+
 	controlPlaneURL   string
 	controlPlaneProxy *httputil.ReverseProxy
 	brokerAdminToken  string
@@ -104,10 +112,23 @@ func main() {
 	addr := envOr("BROKER_ADDR", ":8080")
 	hb := 20
 	b := &Broker{
-		heartbeatSec: hb,
-		deviceSecret: make(map[string]string),
-		sessions:     make(map[string]*AgentSession),
-		tunnels:      make(map[string]*Tunnel),
+		heartbeatSec:   hb,
+		deviceSecret:   make(map[string]string),
+		sessions:       make(map[string]*AgentSession),
+		tunnels:        make(map[string]*Tunnel),
+		lastDBErrLogMs: make(map[string]int64),
+	}
+
+	if dsn := strings.TrimSpace(os.Getenv("DATABASE_URL")); dsn != "" {
+		db, err := sql.Open("pgx", dsn)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		db.SetMaxOpenConns(10)
+		db.SetMaxIdleConns(10)
+		db.SetConnMaxLifetime(30 * time.Minute)
+		b.db = db
 	}
 
 	controlPlaneURL := envOr("CONTROL_PLANE_INTERNAL_URL", "http://127.0.0.1:8090")
@@ -160,12 +181,35 @@ func (b *Broker) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	b.tunnelsMu.Lock()
 	tunnels := len(b.tunnels)
 	b.tunnelsMu.Unlock()
-	writeJSON(w, http.StatusOK, map[string]any{
+	out := map[string]any{
 		"ok":       true,
 		"ts":       time.Now().UnixMilli(),
 		"sessions": sessions,
 		"tunnels":  tunnels,
-	})
+	}
+	if b.db != nil {
+		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		defer cancel()
+		if err := b.db.PingContext(ctx); err != nil {
+			out["dbOk"] = false
+			out["dbErr"] = err.Error()
+		} else {
+			out["dbOk"] = true
+		}
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (b *Broker) shouldLogDBErr(deviceID string) bool {
+	now := time.Now().UnixMilli()
+	b.dbErrMu.Lock()
+	defer b.dbErrMu.Unlock()
+	last := b.lastDBErrLogMs[deviceID]
+	if last > 0 && now-last < 60_000 {
+		return false
+	}
+	b.lastDBErrLogMs[deviceID] = now
+	return true
 }
 
 func (b *Broker) handleAgentWS(w http.ResponseWriter, r *http.Request) {
@@ -183,12 +227,14 @@ func (b *Broker) handleAgentWS(w http.ResponseWriter, r *http.Request) {
 	ws.SetReadLimit(8 * 1024 * 1024)
 
 	var sess *AgentSession
+	remoteIP := clientIP(r)
 
 	for {
 		_, data, err := ws.Read(ctx)
 		if err != nil {
 			if sess != nil {
 				b.removeSession(sess.deviceID, sess.session)
+				b.recordSessionDisconnected(sess.deviceID, sess.session)
 				logJSON("agent_ws_closed", map[string]any{
 					"deviceId":  sess.deviceID,
 					"sessionId": sess.session,
@@ -211,9 +257,11 @@ func (b *Broker) handleAgentWS(w http.ResponseWriter, r *http.Request) {
 				session:  sessionID,
 				ws:       ws,
 				lastSeen: time.Now(),
+				remoteIP: remoteIP,
 			}
 			sess = s
 			b.upsertSession(s)
+			b.recordSessionConnected(s.deviceID, s.session, s.remoteIP)
 			logJSON("agent_hello", map[string]any{
 				"deviceId":         in.DeviceID,
 				"sessionId":        sessionID,
@@ -237,6 +285,7 @@ func (b *Broker) handleAgentWS(w http.ResponseWriter, r *http.Request) {
 		case "ping":
 			if sess != nil {
 				sess.lastSeen = time.Now()
+				b.recordSessionSeen(sess.deviceID, sess.session, sess.remoteIP)
 			}
 			pong := Envelope{
 				V:        1,
@@ -257,6 +306,10 @@ func (b *Broker) handleAgentWS(w http.ResponseWriter, r *http.Request) {
 }
 
 func (b *Broker) handleDevices(w http.ResponseWriter, r *http.Request) {
+	if !b.requireAdmin(r) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
 	type row struct {
 		DeviceID  string `json:"deviceId"`
 		SessionID string `json:"sessionId"`
@@ -327,7 +380,63 @@ func (b *Broker) handleDeviceUpload(w http.ResponseWriter, r *http.Request) {
 	parts := strings.Split(path, "/")
 	deviceID := ""
 	target := ""
-	if len(parts) == 5 && parts[1] == "dbsync" && parts[2] == "jobs" && parts[4] == "files" {
+	if len(parts) == 2 && parts[1] == "asset-snapshot" {
+		deviceID = parts[0]
+		if deviceID == "" {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if hdrID := strings.TrimSpace(r.Header.Get("X-Device-Id")); hdrID == "" {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		} else if hdrID != deviceID {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		secret := r.Header.Get("X-Device-Secret")
+		if secret == "" {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		if !b.verifyDeviceSecret(deviceID, secret) {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		if b.db == nil {
+			http.Error(w, "DATABASE_URL required", http.StatusServiceUnavailable)
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+		defer cancel()
+		var assetID, phone, wa, egress, status, notes, metaText string
+		err := b.db.QueryRowContext(ctx, `
+select asset_id, coalesce(phone,''), coalesce(wa_account,''), coalesce(egress_ip,''), coalesce(status,''), coalesce(notes,''), meta::text
+from assets
+where device_id=$1
+limit 1
+`, deviceID).Scan(&assetID, &phone, &wa, &egress, &status, &notes, &metaText)
+		if err != nil {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		var meta any
+		_ = json.Unmarshal([]byte(metaText), &meta)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"assetId":   assetID,
+			"phone":     phone,
+			"waAccount": wa,
+			"egressIp":  egress,
+			"status":    status,
+			"deviceId":  deviceID,
+			"notes":     notes,
+			"meta":      meta,
+		})
+		return
+	} else if len(parts) == 5 && parts[1] == "dbsync" && parts[2] == "jobs" && parts[4] == "files" {
 		deviceID = parts[0]
 		jobID := parts[3]
 		if deviceID == "" || jobID == "" {
@@ -651,8 +760,12 @@ func (b *Broker) getOrCreateDeviceSecret(deviceID, provided string) string {
 
 func (b *Broker) upsertSession(s *AgentSession) {
 	b.sessionsMu.Lock()
+	prev := b.sessions[s.deviceID]
 	b.sessions[s.deviceID] = s
 	b.sessionsMu.Unlock()
+	if prev != nil && prev.session != s.session {
+		_ = prev.ws.Close(websocket.StatusNormalClosure, "replaced")
+	}
 }
 
 func (b *Broker) removeSession(deviceID, sessionID string) {
@@ -662,6 +775,115 @@ func (b *Broker) removeSession(deviceID, sessionID string) {
 		delete(b.sessions, deviceID)
 	}
 	b.sessionsMu.Unlock()
+}
+
+func (b *Broker) recordSessionConnected(deviceID, sessionID, ip string) {
+	if b.db == nil {
+		return
+	}
+	deviceID = strings.TrimSpace(deviceID)
+	sessionID = strings.TrimSpace(sessionID)
+	ip = normalizeIP(ip)
+	if deviceID == "" || sessionID == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if _, err := b.db.ExecContext(ctx, `insert into devices(device_id, updated_at) values ($1, now()) on conflict (device_id) do update set updated_at=now()`, deviceID); err != nil {
+		if b.shouldLogDBErr(deviceID) {
+			logJSON("db_write_failed", map[string]any{"op": "devices_upsert", "deviceId": deviceID, "err": err.Error()})
+		}
+	}
+	if _, err := b.db.ExecContext(ctx, `
+insert into agent_sessions(device_id, session_id, connected_at, last_seen_at, last_ip)
+values ($1, $2, now(), now(), nullif($3,'')::inet)
+on conflict (device_id, session_id) do update set
+  disconnected_at = null,
+  last_seen_at = now(),
+  last_ip = excluded.last_ip
+`, deviceID, sessionID, ip); err != nil {
+		if b.shouldLogDBErr(deviceID) {
+			logJSON("db_write_failed", map[string]any{"op": "agent_sessions_connect", "deviceId": deviceID, "sessionId": sessionID, "err": err.Error()})
+		}
+	}
+}
+
+func (b *Broker) recordSessionSeen(deviceID, sessionID, ip string) {
+	if b.db == nil {
+		return
+	}
+	deviceID = strings.TrimSpace(deviceID)
+	sessionID = strings.TrimSpace(sessionID)
+	ip = normalizeIP(ip)
+	if deviceID == "" || sessionID == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if _, err := b.db.ExecContext(ctx, `update devices set updated_at=now() where device_id=$1`, deviceID); err != nil {
+		if b.shouldLogDBErr(deviceID) {
+			logJSON("db_write_failed", map[string]any{"op": "devices_touch", "deviceId": deviceID, "err": err.Error()})
+		}
+	}
+	if _, err := b.db.ExecContext(ctx, `update agent_sessions set last_seen_at=now(), last_ip=nullif($3,'')::inet where device_id=$1 and session_id=$2 and disconnected_at is null`, deviceID, sessionID, ip); err != nil {
+		if b.shouldLogDBErr(deviceID) {
+			logJSON("db_write_failed", map[string]any{"op": "agent_sessions_ping", "deviceId": deviceID, "sessionId": sessionID, "err": err.Error()})
+		}
+	}
+}
+
+func (b *Broker) recordSessionDisconnected(deviceID, sessionID string) {
+	if b.db == nil {
+		return
+	}
+	deviceID = strings.TrimSpace(deviceID)
+	sessionID = strings.TrimSpace(sessionID)
+	if deviceID == "" || sessionID == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if _, err := b.db.ExecContext(ctx, `update devices set updated_at=now() where device_id=$1`, deviceID); err != nil {
+		if b.shouldLogDBErr(deviceID) {
+			logJSON("db_write_failed", map[string]any{"op": "devices_touch", "deviceId": deviceID, "err": err.Error()})
+		}
+	}
+	if _, err := b.db.ExecContext(ctx, `update agent_sessions set disconnected_at=now() where device_id=$1 and session_id=$2 and disconnected_at is null`, deviceID, sessionID); err != nil {
+		if b.shouldLogDBErr(deviceID) {
+			logJSON("db_write_failed", map[string]any{"op": "agent_sessions_disconnect", "deviceId": deviceID, "sessionId": sessionID, "err": err.Error()})
+		}
+	}
+}
+
+func normalizeIP(v string) string {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return ""
+	}
+	if ip := net.ParseIP(v); ip == nil {
+		return ""
+	}
+	return v
+}
+
+func clientIP(r *http.Request) string {
+	xff := strings.TrimSpace(r.Header.Get("X-Forwarded-For"))
+	if xff != "" {
+		parts := strings.Split(xff, ",")
+		if len(parts) > 0 {
+			if ip := strings.TrimSpace(parts[0]); ip != "" {
+				return ip
+			}
+		}
+	}
+	if xr := strings.TrimSpace(r.Header.Get("X-Real-IP")); xr != "" {
+		return xr
+	}
+	host, _, err := net.SplitHostPort(strings.TrimSpace(r.RemoteAddr))
+	if err == nil && strings.TrimSpace(host) != "" {
+		return strings.TrimSpace(host)
+	}
+	return strings.TrimSpace(r.RemoteAddr)
 }
 
 func (b *Broker) getSession(deviceID string) *AgentSession {
