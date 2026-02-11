@@ -121,6 +121,12 @@ type Agent struct {
 
 	lastWhatsAppLocateTS  atomic.Int64
 	lastWhatsAppLocateErr atomic.Value
+
+	lastDbSyncTS        atomic.Int64
+	lastDbSyncJobID     atomic.Value
+	lastDbSyncUploadURL atomic.Value
+	lastDbSyncState     atomic.Value
+	lastDbSyncErr       atomic.Value
 }
 
 type Tunnel struct {
@@ -213,6 +219,13 @@ func (a *Agent) startControlServer(cfgPath string) {
 			"lastConnectedTs": a.lastConnectedTS.Load(),
 			"pid":             os.Getpid(),
 			"uptimeSec":       int64(time.Since(a.startedAt).Seconds()),
+			"dbsync": map[string]any{
+				"ts":        a.lastDbSyncTS.Load(),
+				"jobId":     strings.TrimSpace(valueOrEmptyString(a.lastDbSyncJobID.Load())),
+				"uploadUrl": strings.TrimSpace(valueOrEmptyString(a.lastDbSyncUploadURL.Load())),
+				"state":     strings.TrimSpace(valueOrEmptyString(a.lastDbSyncState.Load())),
+				"error":     strings.TrimSpace(valueOrEmptyString(a.lastDbSyncErr.Load())),
+			},
 		})
 	})
 
@@ -455,6 +468,7 @@ func (a *Agent) startControlServer(cfgPath string) {
 			w.WriteHeader(http.StatusUnauthorized)
 			return
 		}
+		_ = os.WriteFile("/var/mobile/Library/QQwUpdates/force_run", []byte("1\n"), 0o644)
 		ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
 		defer cancel()
 		launchctlPath := ""
@@ -845,18 +859,34 @@ func (a *Agent) handleDbSyncStart(in Envelope) {
 	cfg := a.getCfg()
 	var p DbSyncStartPayload
 	if err := json.Unmarshal(in.Payload, &p); err != nil {
+		a.lastDbSyncTS.Store(time.Now().UnixMilli())
+		a.lastDbSyncState.Store("invalid_payload")
+		a.lastDbSyncErr.Store(err.Error())
 		a.logf("dbsync: invalid payload: %v", err)
 		return
 	}
 	if p.JobID == "" || p.UploadURL == "" {
+		a.lastDbSyncTS.Store(time.Now().UnixMilli())
+		a.lastDbSyncJobID.Store(p.JobID)
+		a.lastDbSyncUploadURL.Store(p.UploadURL)
+		a.lastDbSyncState.Store("missing_fields")
+		a.lastDbSyncErr.Store("missing jobId/uploadUrl")
 		a.logf("dbsync: missing jobId/uploadUrl")
 		return
 	}
+	a.lastDbSyncTS.Store(time.Now().UnixMilli())
+	a.lastDbSyncJobID.Store(p.JobID)
+	a.lastDbSyncUploadURL.Store(p.UploadURL)
+	a.lastDbSyncState.Store("started")
+	a.lastDbSyncErr.Store("")
 	if cfg.WhatsApp.ChatStoragePath == "" {
 		ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
 		found, _, err := locateChatStorage(ctx)
 		cancel()
 		if err != nil {
+			a.lastDbSyncTS.Store(time.Now().UnixMilli())
+			a.lastDbSyncState.Store("locate_failed")
+			a.lastDbSyncErr.Store(err.Error())
 			a.logf("dbsync: chatStoragePath not configured (locate failed: %v)", err)
 			a.lastWhatsAppLocateTS.Store(time.Now().UnixMilli())
 			a.lastWhatsAppLocateErr.Store(err.Error())
@@ -872,6 +902,9 @@ func (a *Agent) handleDbSyncStart(in Envelope) {
 		cfg = next
 	}
 	if cfg.DeviceSecret == "" {
+		a.lastDbSyncTS.Store(time.Now().UnixMilli())
+		a.lastDbSyncState.Store("device_secret_missing")
+		a.lastDbSyncErr.Store("deviceSecret missing")
 		a.logf("dbsync: deviceSecret missing (hello_ack not received?)")
 		return
 	}
@@ -879,10 +912,23 @@ func (a *Agent) handleDbSyncStart(in Envelope) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	if err := uploadFileMultipart(ctx, p.UploadURL, a.deviceID, cfg.DeviceSecret, cfg.WhatsApp.ChatStoragePath, "ChatStorage.sqlite"); err != nil {
+		a.lastDbSyncTS.Store(time.Now().UnixMilli())
+		a.lastDbSyncState.Store("upload_failed")
+		a.lastDbSyncErr.Store(err.Error())
 		a.logf("dbsync: upload failed jobId=%s err=%v", p.JobID, err)
 		return
 	}
+	a.lastDbSyncTS.Store(time.Now().UnixMilli())
+	a.lastDbSyncState.Store("upload_ok")
+	a.lastDbSyncErr.Store("")
 	a.logf("dbsync: upload ok jobId=%s", p.JobID)
+}
+
+func valueOrEmptyString(v any) string {
+	if s, ok := v.(string); ok {
+		return s
+	}
+	return ""
 }
 
 func uploadFileMultipart(ctx context.Context, uploadURL, deviceID, deviceSecret, filePath, fileName string) error {

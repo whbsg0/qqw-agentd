@@ -95,6 +95,10 @@ type Broker struct {
 	sessionsMu sync.Mutex
 	sessions   map[string]*AgentSession
 
+	egressMu           sync.Mutex
+	lastEgressUpdateMs map[string]int64
+	lastEgressIP       map[string]string
+
 	tunnelsMu sync.Mutex
 	tunnels   map[string]*Tunnel
 
@@ -113,11 +117,13 @@ func main() {
 	addr := envOr("BROKER_ADDR", ":8080")
 	hb := 20
 	b := &Broker{
-		heartbeatSec:   hb,
-		deviceSecret:   make(map[string]string),
-		sessions:       make(map[string]*AgentSession),
-		tunnels:        make(map[string]*Tunnel),
-		lastDBErrLogMs: make(map[string]int64),
+		heartbeatSec:       hb,
+		deviceSecret:       make(map[string]string),
+		sessions:           make(map[string]*AgentSession),
+		lastEgressIP:       make(map[string]string),
+		lastEgressUpdateMs: make(map[string]int64),
+		tunnels:            make(map[string]*Tunnel),
+		lastDBErrLogMs:     make(map[string]int64),
 	}
 
 	if dsn := strings.TrimSpace(os.Getenv("DATABASE_URL")); dsn != "" {
@@ -283,10 +289,12 @@ func (b *Broker) handleAgentWS(w http.ResponseWriter, r *http.Request) {
 				Payload:  ackPayload,
 			}
 			_ = s.send(ctx, ack)
+			b.maybeUpdateAssetEgressIP(s.deviceID, s.remoteIP)
 		case "ping":
 			if sess != nil {
 				sess.lastSeen = time.Now()
 				b.recordSessionSeen(sess.deviceID, sess.session, sess.remoteIP)
+				b.maybeUpdateAssetEgressIP(sess.deviceID, sess.remoteIP)
 			}
 			pong := Envelope{
 				V:        1,
@@ -306,6 +314,66 @@ func (b *Broker) handleAgentWS(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (b *Broker) maybeUpdateAssetEgressIP(deviceID, ip string) {
+	deviceID = strings.TrimSpace(deviceID)
+	ip = normalizeIP(ip)
+	if deviceID == "" || ip == "" {
+		return
+	}
+	parsed := net.ParseIP(ip)
+	if parsed == nil {
+		return
+	}
+	if parsed.IsLoopback() || parsed.IsPrivate() || parsed.IsLinkLocalUnicast() || parsed.IsLinkLocalMulticast() {
+		return
+	}
+	if strings.TrimSpace(b.controlPlaneURL) == "" || strings.TrimSpace(b.brokerAdminToken) == "" {
+		return
+	}
+	now := time.Now().UnixMilli()
+	b.egressMu.Lock()
+	lastIP := b.lastEgressIP[deviceID]
+	lastMs := b.lastEgressUpdateMs[deviceID]
+	should := false
+	if lastIP == "" || lastIP != ip {
+		should = true
+	} else if lastMs <= 0 || now-lastMs > 10*60_000 {
+		should = true
+	}
+	if should {
+		b.lastEgressIP[deviceID] = ip
+		b.lastEgressUpdateMs[deviceID] = now
+	}
+	b.egressMu.Unlock()
+	if !should {
+		return
+	}
+
+	body, _ := json.Marshal(map[string]any{"egressIp": ip})
+	target := fmt.Sprintf("%s/api/admin/devices/%s/asset/egress-ip", strings.TrimRight(b.controlPlaneURL, "/"), url.PathEscape(deviceID))
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, target, bytes.NewReader(body))
+	if err != nil {
+		logJSON("asset_egress_autofill_failed", map[string]any{"deviceId": deviceID, "ip": ip, "err": err.Error()})
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+b.brokerAdminToken)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		logJSON("asset_egress_autofill_failed", map[string]any{"deviceId": deviceID, "ip": ip, "err": err.Error()})
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		bs, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		logJSON("asset_egress_autofill_failed", map[string]any{"deviceId": deviceID, "ip": ip, "status": resp.StatusCode, "body": strings.TrimSpace(string(bs))})
+		return
+	}
+	logJSON("asset_egress_autofill_ok", map[string]any{"deviceId": deviceID, "ip": ip})
+}
+
 func (b *Broker) handleDevices(w http.ResponseWriter, r *http.Request) {
 	if !b.requireAdmin(r) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
@@ -315,11 +383,13 @@ func (b *Broker) handleDevices(w http.ResponseWriter, r *http.Request) {
 		DeviceID  string `json:"deviceId"`
 		SessionID string `json:"sessionId"`
 		LastSeen  int64  `json:"lastSeen"`
+		EgressIP  string `json:"egressIp,omitempty"`
+		Connected bool   `json:"connected"`
 	}
 	b.sessionsMu.Lock()
 	out := make([]row, 0, len(b.sessions))
 	for _, s := range b.sessions {
-		out = append(out, row{DeviceID: s.deviceID, SessionID: s.session, LastSeen: s.lastSeen.UnixMilli()})
+		out = append(out, row{DeviceID: s.deviceID, SessionID: s.session, LastSeen: s.lastSeen.UnixMilli(), EgressIP: normalizeIP(s.remoteIP), Connected: true})
 	}
 	b.sessionsMu.Unlock()
 	writeJSON(w, http.StatusOK, out)
@@ -332,6 +402,31 @@ func (b *Broker) handleBrokerDeviceSubroutes(w http.ResponseWriter, r *http.Requ
 	}
 	path := strings.TrimPrefix(r.URL.Path, "/api/broker/devices/")
 	parts := strings.Split(path, "/")
+	if len(parts) == 4 && parts[1] == "asset" && parts[2] == "egress-ip" && parts[3] == "fill" {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		deviceID := strings.TrimSpace(parts[0])
+		if deviceID == "" {
+			http.Error(w, "deviceId required", http.StatusBadRequest)
+			return
+		}
+		sess := b.getSession(deviceID)
+		if sess == nil || strings.TrimSpace(sess.remoteIP) == "" {
+			http.Error(w, "device not online", http.StatusServiceUnavailable)
+			return
+		}
+		ip := normalizeIP(sess.remoteIP)
+		parsed := net.ParseIP(ip)
+		if parsed == nil || parsed.IsLoopback() || parsed.IsPrivate() || parsed.IsLinkLocalUnicast() || parsed.IsLinkLocalMulticast() {
+			http.Error(w, "egress ip not public", http.StatusServiceUnavailable)
+			return
+		}
+		b.maybeUpdateAssetEgressIP(deviceID, ip)
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "egressIp": ip})
+		return
+	}
 	if len(parts) >= 3 && parts[1] == "dbsync" && parts[2] == "start" {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
