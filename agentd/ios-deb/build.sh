@@ -6,7 +6,7 @@ LAYOUT="$ROOT/layout"
 OUTDIR="$ROOT/packages"
 
 BIN_SRC="${1:-$ROOT/../dist/agentd-ios-arm64}"
-VERSION="${2:-1:0.1.0-1}"
+VERSION="${2:-1:0.0.0+run.0+sha.dev-1}"
 ARCH="iphoneos-arm64"
 
 if [ ! -f "$BIN_SRC" ]; then
