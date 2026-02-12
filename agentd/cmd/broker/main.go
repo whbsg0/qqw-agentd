@@ -685,6 +685,18 @@ func (b *Broker) handleDeviceUpload(w http.ResponseWriter, r *http.Request) {
 		}
 		target = fmt.Sprintf("%s/api/admin/dbsync/jobs/%s/files", strings.TrimRight(b.controlPlaneURL, "/"), jobID)
 		r.Body = http.MaxBytesReader(w, r.Body, 256<<20)
+	} else if len(parts) == 2 && parts[1] == "events" {
+		deviceID = parts[0]
+		if deviceID == "" {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		target = fmt.Sprintf("%s/api/admin/devices/%s/events", strings.TrimRight(b.controlPlaneURL, "/"), url.PathEscape(deviceID))
+		r.Body = http.MaxBytesReader(w, r.Body, 16<<20)
 	} else if len(parts) == 3 && parts[1] == "asset" && parts[2] == "egress-ip" {
 		deviceID = parts[0]
 		if deviceID == "" {

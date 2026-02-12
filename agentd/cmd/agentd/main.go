@@ -463,6 +463,68 @@ func (a *Agent) startControlServer(cfgPath string) {
 		writeJSON(w, http.StatusOK, out)
 	})
 
+	mux.HandleFunc("/events", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		if !authOK(r) {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		cfg := a.getCfg()
+		base := serverHTTPBase(cfg.ServerURL)
+		if base == "" {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]any{"ok": false, "error": "serverUrl invalid"})
+			return
+		}
+		if strings.TrimSpace(cfg.DeviceSecret) == "" {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]any{"ok": false, "error": "deviceSecret missing"})
+			return
+		}
+		body, err := io.ReadAll(io.LimitReader(r.Body, 16<<20))
+		if err != nil || len(body) == 0 {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "invalid body"})
+			return
+		}
+		target := fmt.Sprintf("%s/api/device/%s/events", base, url.PathEscape(a.deviceID))
+		ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
+		defer cancel()
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, target, bytes.NewReader(body))
+		if err != nil {
+			writeJSON(w, http.StatusBadGateway, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+		req.Header.Set("X-Device-Id", a.deviceID)
+		req.Header.Set("X-Device-Secret", cfg.DeviceSecret)
+		ct := strings.TrimSpace(r.Header.Get("Content-Type"))
+		if ct == "" {
+			ct = "application/json"
+		}
+		req.Header.Set("Content-Type", ct)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			writeJSON(w, http.StatusBadGateway, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+		defer resp.Body.Close()
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		if resp.StatusCode != http.StatusOK {
+			msg := strings.TrimSpace(string(respBody))
+			if msg == "" {
+				msg = resp.Status
+			}
+			writeJSON(w, resp.StatusCode, map[string]any{"ok": false, "error": msg})
+			return
+		}
+		var out any
+		if err := json.Unmarshal(respBody, &out); err != nil {
+			writeJSON(w, http.StatusBadGateway, map[string]any{"ok": false, "error": "invalid json"})
+			return
+		}
+		writeJSON(w, http.StatusOK, out)
+	})
+
 	mux.HandleFunc("/updater/run", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			w.WriteHeader(http.StatusMethodNotAllowed)

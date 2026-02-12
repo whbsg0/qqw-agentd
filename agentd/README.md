@@ -39,6 +39,7 @@ HTTP API：
   - `GET /status`：返回 deviceId/serverUrl/connected/uptime 等
   - `GET /config`：返回当前配置文件内容
   - `POST /config`：写入配置文件（写入后通常需要 `POST /quit` 触发 launchd 拉起新进程生效）
+  - `POST /events`：上报实时事件（转发到 broker `/api/device/{deviceId}/events`，用于承接 Frida 脚本输出）
   - `POST /quit`：优雅退出（用于配合 launchd 实现“重启”）
 
 ## 快速联调
