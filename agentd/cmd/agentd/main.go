@@ -105,7 +105,8 @@ type Agent struct {
 	cfgMu sync.RWMutex
 	cfg   Config
 
-	deviceID string
+	deviceID   string
+	scriptPath string
 
 	seq uint64
 
@@ -131,6 +132,14 @@ type Agent struct {
 	lastDbSyncUploadURL atomic.Value
 	lastDbSyncState     atomic.Value
 	lastDbSyncErr       atomic.Value
+
+	scriptUpdatedAtTS atomic.Int64
+	scriptLastError   atomic.Value
+	scriptLastEventTS atomic.Int64
+
+	runnerMu  sync.Mutex
+	runnerCmd *exec.Cmd
+	runnerPid atomic.Int64
 }
 
 type Tunnel struct {
@@ -171,6 +180,7 @@ func main() {
 	a := &Agent{
 		cfg:          cfg,
 		deviceID:     deviceID,
+		scriptPath:   filepath.Join(filepath.Dir(cfg.DeviceIDPath), "scripts", "current.js"),
 		tunnels:      make(map[string]*Tunnel),
 		startedAt:    time.Now(),
 		reconnectNow: make(chan struct{}, 1),
@@ -522,7 +532,139 @@ func (a *Agent) startControlServer(cfgPath string) {
 			writeJSON(w, http.StatusBadGateway, map[string]any{"ok": false, "error": "invalid json"})
 			return
 		}
+		a.scriptLastEventTS.Store(time.Now().UnixMilli())
 		writeJSON(w, http.StatusOK, out)
+	})
+
+	mux.HandleFunc("/script/status", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		if !authOK(r) {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		lastErr, _ := a.scriptLastError.Load().(string)
+		running := false
+		a.runnerMu.Lock()
+		running = a.runnerCmd != nil && a.runnerCmd.Process != nil
+		a.runnerMu.Unlock()
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":            true,
+			"running":       running,
+			"scriptPath":    a.scriptPath,
+			"updatedAtTsMs": a.scriptUpdatedAtTS.Load(),
+			"lastError":     strings.TrimSpace(lastErr),
+			"lastEventTsMs": a.scriptLastEventTS.Load(),
+		})
+	})
+
+	mux.HandleFunc("/script/start", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		if !authOK(r) {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		if err := a.startRunner(); err != nil {
+			a.scriptLastError.Store(err.Error())
+			writeJSON(w, http.StatusBadGateway, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+		a.scriptLastError.Store("")
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	})
+
+	mux.HandleFunc("/script/stop", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		if !authOK(r) {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		if err := a.stopRunnerIfRunning(); err != nil {
+			a.scriptLastError.Store(err.Error())
+			writeJSON(w, http.StatusBadGateway, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+		a.scriptLastError.Store("")
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	})
+
+	mux.HandleFunc("/script/update", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		if !authOK(r) {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		cfg := a.getCfg()
+		base := serverHTTPBase(cfg.ServerURL)
+		if base == "" {
+			a.scriptLastError.Store("serverUrl invalid")
+			writeJSON(w, http.StatusServiceUnavailable, map[string]any{"ok": false, "error": "serverUrl invalid"})
+			return
+		}
+		downloadURL := base + "/downloads/scripts/current.js"
+
+		ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+		defer cancel()
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, downloadURL, nil)
+		if err != nil {
+			a.scriptLastError.Store(err.Error())
+			writeJSON(w, http.StatusBadGateway, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			a.scriptLastError.Store(err.Error())
+			writeJSON(w, http.StatusBadGateway, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+		if resp.StatusCode != http.StatusOK {
+			msg := strings.TrimSpace(string(body))
+			if msg == "" {
+				msg = resp.Status
+			}
+			a.scriptLastError.Store(msg)
+			writeJSON(w, resp.StatusCode, map[string]any{"ok": false, "error": msg})
+			return
+		}
+		if len(body) == 0 {
+			a.scriptLastError.Store("empty script")
+			writeJSON(w, http.StatusBadGateway, map[string]any{"ok": false, "error": "empty script"})
+			return
+		}
+
+		_ = os.MkdirAll(filepath.Dir(a.scriptPath), 0o755)
+		if err := os.WriteFile(a.scriptPath, body, 0o644); err != nil {
+			a.scriptLastError.Store(err.Error())
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+		now := time.Now().UnixMilli()
+		a.scriptUpdatedAtTS.Store(now)
+		a.scriptLastError.Store("")
+		if err := a.stopRunner(); err != nil {
+			a.scriptLastError.Store(err.Error())
+			writeJSON(w, http.StatusBadGateway, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+		if err := a.startRunner(); err != nil {
+			a.scriptLastError.Store(err.Error())
+			writeJSON(w, http.StatusBadGateway, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "downloadUrl": downloadURL, "updatedAtTsMs": now})
 	})
 
 	mux.HandleFunc("/updater/run", func(w http.ResponseWriter, r *http.Request) {
@@ -589,6 +731,89 @@ func serverHTTPBase(serverURL string) string {
 		return ""
 	}
 	return scheme + "://" + u.Host
+}
+
+func (a *Agent) runnerBinaryPath() (string, error) {
+	exe, err := os.Executable()
+	if err != nil || strings.TrimSpace(exe) == "" {
+		return "", errors.New("executable path unavailable")
+	}
+	return filepath.Join(filepath.Dir(exe), "qqw-script-runner"), nil
+}
+
+func (a *Agent) startRunner() error {
+	a.runnerMu.Lock()
+	defer a.runnerMu.Unlock()
+
+	if a.runnerCmd != nil && a.runnerCmd.Process != nil {
+		return errors.New("runner already running")
+	}
+	cfg := a.getCfg()
+	if strings.TrimSpace(cfg.ControlListen) == "" {
+		return errors.New("controlListen missing")
+	}
+	runnerPath, err := a.runnerBinaryPath()
+	if err != nil {
+		return err
+	}
+	eventsURL := "http://" + strings.TrimSpace(cfg.ControlListen) + "/events"
+	cmd := exec.Command(
+		runnerPath,
+		"-fridaHost", strings.TrimSpace(cfg.Frida.Host),
+		"-fridaPort", strconv.Itoa(cfg.Frida.Port),
+		"-scriptPath", a.scriptPath,
+		"-eventsUrl", eventsURL,
+	)
+	cmd.Stdout = os.Stderr
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	a.runnerCmd = cmd
+	a.runnerPid.Store(int64(cmd.Process.Pid))
+	go func() {
+		err := cmd.Wait()
+		a.runnerMu.Lock()
+		if a.runnerCmd == cmd {
+			a.runnerCmd = nil
+			a.runnerPid.Store(0)
+		}
+		a.runnerMu.Unlock()
+		if err != nil {
+			a.scriptLastError.Store(err.Error())
+		}
+	}()
+	return nil
+}
+
+func (a *Agent) stopRunner() error {
+	a.runnerMu.Lock()
+	defer a.runnerMu.Unlock()
+
+	if a.runnerCmd == nil || a.runnerCmd.Process == nil {
+		return errors.New("runner not running")
+	}
+	if err := a.runnerCmd.Process.Kill(); err != nil {
+		return err
+	}
+	a.runnerCmd = nil
+	a.runnerPid.Store(0)
+	return nil
+}
+
+func (a *Agent) stopRunnerIfRunning() error {
+	a.runnerMu.Lock()
+	defer a.runnerMu.Unlock()
+
+	if a.runnerCmd == nil || a.runnerCmd.Process == nil {
+		return nil
+	}
+	if err := a.runnerCmd.Process.Kill(); err != nil {
+		return err
+	}
+	a.runnerCmd = nil
+	a.runnerPid.Store(0)
+	return nil
 }
 
 func (a *Agent) persistConfig(nextCfg Config) error {

@@ -14,6 +14,7 @@ CFG_DIR="/var/mobile/Library/QQwAgent"
 CFG="$CFG_DIR/agent.json"
 PLIST="/var/jb/Library/LaunchDaemons/com.qqw.agentd.plist"
 BIN="/var/jb/usr/local/bin/agentd"
+RUNNER="/var/jb/usr/local/bin/qqw-script-runner"
 BASE_URL_FILE="$CFG_DIR/public_base_url.txt"
 
 mkdir -p "$CFG_DIR" >/dev/null 2>&1 || true
@@ -46,17 +47,20 @@ EOF
 fi
 
 chmod 755 "$BIN" >/dev/null 2>&1 || true
+chmod 755 "$RUNNER" >/dev/null 2>&1 || true
 chmod 644 "$PLIST" >/dev/null 2>&1 || true
 chown root:wheel "$PLIST" >/dev/null 2>&1 || true
 chown root:wheel "$BIN" >/dev/null 2>&1 || true
+chown root:wheel "$RUNNER" >/dev/null 2>&1 || true
 
 if command -v ldid >/dev/null 2>&1; then
   log_cmd "ldid -S \"$BIN\" || true"
+  log_cmd "ldid -S \"$RUNNER\" || true"
   log_cmd "ldid -e \"$BIN\" 2>/dev/null | head -n 80 || true"
 fi
 
 if command -v launchctl >/dev/null 2>&1; then
-  log_cmd "ls -la \"$BIN\" \"$PLIST\" \"$CFG\" 2>/dev/null || true"
+  log_cmd "ls -la \"$BIN\" \"$RUNNER\" \"$PLIST\" \"$CFG\" 2>/dev/null || true"
   log_cmd "plutil -lint \"$PLIST\" 2>/dev/null || true"
   log_cmd "launchctl bootout system \"$PLIST\" || true"
   log_cmd "launchctl bootstrap system \"$PLIST\" || launchctl load \"$PLIST\" || true"
