@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -67,6 +69,10 @@ type DbSyncStartPayload struct {
 	UploadURL string `json:"uploadUrl"`
 }
 
+type SetDeviceSecretPayload struct {
+	DeviceSecret string `json:"deviceSecret,omitempty"`
+}
+
 type AgentSession struct {
 	deviceID string
 	session  string
@@ -88,9 +94,9 @@ type Tunnel struct {
 }
 
 type Broker struct {
-	heartbeatSec int
-	secretMu     sync.Mutex
-	deviceSecret map[string]string
+	heartbeatSec     int
+	secretMu         sync.Mutex
+	deviceSecretHash map[string]string
 
 	sessionsMu sync.Mutex
 	sessions   map[string]*AgentSession
@@ -118,7 +124,7 @@ func main() {
 	hb := 20
 	b := &Broker{
 		heartbeatSec:       hb,
-		deviceSecret:       make(map[string]string),
+		deviceSecretHash:   make(map[string]string),
 		sessions:           make(map[string]*AgentSession),
 		lastEgressIP:       make(map[string]string),
 		lastEgressUpdateMs: make(map[string]int64),
@@ -147,6 +153,8 @@ func main() {
 	if publicBaseURL == "" {
 		publicBaseURL = "https://api.bbrbr.com"
 	}
+	controlPlaneURL = strings.Trim(strings.TrimSpace(controlPlaneURL), "`")
+	publicBaseURL = strings.Trim(strings.TrimSpace(publicBaseURL), "`")
 	b.controlPlaneURL = controlPlaneURL
 	b.brokerAdminToken = brokerAdminToken
 	b.publicBaseURL = strings.TrimRight(publicBaseURL, "/")
@@ -174,7 +182,7 @@ func main() {
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
-	logJSON("broker_listening", map[string]any{"addr": addr})
+	logJSON("broker_listening", map[string]any{"addr": addr, "dbEnabled": b.db != nil})
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
@@ -259,6 +267,15 @@ func (b *Broker) handleAgentWS(w http.ResponseWriter, r *http.Request) {
 			_ = json.Unmarshal(in.Payload, &p)
 			sessionID := uuidV4Must()
 			deviceSecret := b.getOrCreateDeviceSecret(in.DeviceID, p.DeviceSecret)
+			if strings.TrimSpace(p.DeviceSecret) != "" && deviceSecret == "" {
+				logJSON("agent_hello_rejected", map[string]any{
+					"deviceId":  in.DeviceID,
+					"reason":    "device_secret_mismatch",
+					"sessionId": sessionID,
+				})
+				_ = ws.Close(websocket.StatusPolicyViolation, "device_secret_mismatch")
+				return
+			}
 			s := &AgentSession{
 				deviceID: in.DeviceID,
 				session:  sessionID,
@@ -402,6 +419,80 @@ func (b *Broker) handleBrokerDeviceSubroutes(w http.ResponseWriter, r *http.Requ
 	}
 	path := strings.TrimPrefix(r.URL.Path, "/api/broker/devices/")
 	parts := strings.Split(path, "/")
+	if len(parts) == 3 && parts[1] == "device-secret" && (parts[2] == "rotate" || parts[2] == "revoke") {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		deviceID := strings.TrimSpace(parts[0])
+		if deviceID == "" {
+			http.Error(w, "deviceId required", http.StatusBadRequest)
+			return
+		}
+		sess := b.getSession(deviceID)
+		if sess == nil {
+			http.Error(w, "device offline", http.StatusNotFound)
+			return
+		}
+
+		if parts[2] == "revoke" {
+			if b.db == nil {
+				http.Error(w, "DATABASE_URL required", http.StatusServiceUnavailable)
+				return
+			}
+			ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+			defer cancel()
+			if _, err := b.db.ExecContext(ctx, `delete from device_secrets where device_id=$1`, deviceID); err != nil {
+				logJSON("db_write_failed", map[string]any{"op": "device_secrets_delete", "deviceId": deviceID, "err": err.Error()})
+				http.Error(w, err.Error(), http.StatusBadGateway)
+				return
+			}
+			b.setDeviceSecretHashCache(deviceID, "")
+			payload, _ := json.Marshal(SetDeviceSecretPayload{DeviceSecret: ""})
+			env := Envelope{V: 1, Type: "set_device_secret", DeviceID: deviceID, Session: sess.session, TS: time.Now().UnixMilli(), Payload: payload}
+			_ = sess.send(r.Context(), env)
+			_ = sess.ws.Close(websocket.StatusNormalClosure, "secret_revoked")
+			logJSON("device_secret_revoked", map[string]any{"deviceId": deviceID})
+			writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+			return
+		}
+
+		if b.db == nil {
+			http.Error(w, "DATABASE_URL required", http.StatusServiceUnavailable)
+			return
+		}
+		newSecret := uuidV4Must()
+		newHash := secretSHA256Hex(newSecret)
+		ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+		defer cancel()
+		if _, err := b.db.ExecContext(ctx, `insert into devices(device_id, updated_at) values ($1, now()) on conflict (device_id) do update set updated_at=now()`, deviceID); err != nil {
+			logJSON("db_write_failed", map[string]any{"op": "devices_upsert_for_secret_rotate", "deviceId": deviceID, "err": err.Error()})
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		if _, err := b.db.ExecContext(ctx, `
+insert into device_secrets(device_id, secret_sha256, issued_at, updated_at)
+values ($1, $2, now(), now())
+on conflict (device_id) do update set
+  secret_sha256=excluded.secret_sha256,
+  issued_at=excluded.issued_at,
+  updated_at=excluded.updated_at
+`, deviceID, newHash); err != nil {
+			logJSON("db_write_failed", map[string]any{"op": "device_secrets_upsert", "deviceId": deviceID, "err": err.Error()})
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		b.setDeviceSecretHashCache(deviceID, newHash)
+		payload, _ := json.Marshal(SetDeviceSecretPayload{DeviceSecret: newSecret})
+		env := Envelope{V: 1, Type: "set_device_secret", DeviceID: deviceID, Session: sess.session, TS: time.Now().UnixMilli(), Payload: payload}
+		if err := sess.send(r.Context(), env); err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		logJSON("device_secret_rotated", map[string]any{"deviceId": deviceID})
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+		return
+	}
 	if len(parts) == 4 && parts[1] == "asset" && parts[2] == "egress-ip" && parts[3] == "fill" {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -677,10 +768,19 @@ func (b *Broker) requireAdmin(r *http.Request) bool {
 }
 
 func (b *Broker) verifyDeviceSecret(deviceID, provided string) bool {
-	b.secretMu.Lock()
-	defer b.secretMu.Unlock()
-	sec, ok := b.deviceSecret[deviceID]
-	return ok && sec != "" && sec == provided
+	deviceID = strings.TrimSpace(deviceID)
+	provided = strings.TrimSpace(provided)
+	if deviceID == "" || provided == "" {
+		return false
+	}
+	if b.db == nil {
+		b.secretMu.Lock()
+		defer b.secretMu.Unlock()
+		h, ok := b.deviceSecretHash[deviceID]
+		return ok && h != "" && h == secretSHA256Hex(provided)
+	}
+	want := b.getDeviceSecretHash(deviceID)
+	return want != "" && want == secretSHA256Hex(provided)
 }
 
 func (b *Broker) handleOpenTunnel(w http.ResponseWriter, r *http.Request) {
@@ -893,18 +993,121 @@ func (b *Broker) cleanupTunnel(sess *AgentSession, t *Tunnel) {
 }
 
 func (b *Broker) getOrCreateDeviceSecret(deviceID, provided string) string {
-	b.secretMu.Lock()
-	defer b.secretMu.Unlock()
-	if s, ok := b.deviceSecret[deviceID]; ok {
+	deviceID = strings.TrimSpace(deviceID)
+	provided = strings.TrimSpace(provided)
+	if deviceID == "" {
+		return ""
+	}
+	if b.db == nil {
+		b.secretMu.Lock()
+		defer b.secretMu.Unlock()
+		if h, ok := b.deviceSecretHash[deviceID]; ok && h != "" {
+			if provided != "" && h == secretSHA256Hex(provided) {
+				return provided
+			}
+			return ""
+		}
+		if provided != "" {
+			b.deviceSecretHash[deviceID] = secretSHA256Hex(provided)
+			return provided
+		}
+		s := uuidV4Must()
+		b.deviceSecretHash[deviceID] = secretSHA256Hex(s)
 		return s
 	}
+
 	if provided != "" {
-		b.deviceSecret[deviceID] = provided
-		return provided
+		existing := b.getDeviceSecretHash(deviceID)
+		if existing == "" {
+			if b.tryInsertDeviceSecretHash(deviceID, secretSHA256Hex(provided)) {
+				b.setDeviceSecretHashCache(deviceID, secretSHA256Hex(provided))
+				return provided
+			}
+			existing = b.getDeviceSecretHash(deviceID)
+		}
+		if existing != "" && existing == secretSHA256Hex(provided) {
+			b.setDeviceSecretHashCache(deviceID, existing)
+			return provided
+		}
+		return ""
+	}
+
+	existing := b.getDeviceSecretHash(deviceID)
+	if existing != "" {
+		return ""
 	}
 	s := uuidV4Must()
-	b.deviceSecret[deviceID] = s
-	return s
+	h := secretSHA256Hex(s)
+	if b.tryInsertDeviceSecretHash(deviceID, h) {
+		b.setDeviceSecretHashCache(deviceID, h)
+		return s
+	}
+	return ""
+}
+
+func secretSHA256Hex(s string) string {
+	sum := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(sum[:])
+}
+
+func (b *Broker) setDeviceSecretHashCache(deviceID, hash string) {
+	b.secretMu.Lock()
+	b.deviceSecretHash[deviceID] = hash
+	b.secretMu.Unlock()
+}
+
+func (b *Broker) getDeviceSecretHash(deviceID string) string {
+	b.secretMu.Lock()
+	if h := b.deviceSecretHash[deviceID]; h != "" {
+		b.secretMu.Unlock()
+		return h
+	}
+	b.secretMu.Unlock()
+	if b.db == nil {
+		return ""
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	var h string
+	err := b.db.QueryRowContext(ctx, `select secret_sha256 from device_secrets where device_id=$1`, deviceID).Scan(&h)
+	if err != nil {
+		if !errors.Is(err, sql.ErrNoRows) && b.shouldLogDBErr(deviceID) {
+			logJSON("db_read_failed", map[string]any{"op": "device_secrets_get", "deviceId": deviceID, "err": err.Error()})
+		}
+		return ""
+	}
+	h = strings.TrimSpace(h)
+	if h != "" {
+		b.setDeviceSecretHashCache(deviceID, h)
+	}
+	return h
+}
+
+func (b *Broker) tryInsertDeviceSecretHash(deviceID, hash string) bool {
+	if b.db == nil || deviceID == "" || hash == "" {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if _, err := b.db.ExecContext(ctx, `insert into devices(device_id, updated_at) values ($1, now()) on conflict (device_id) do update set updated_at=now()`, deviceID); err != nil {
+		if b.shouldLogDBErr(deviceID) {
+			logJSON("db_write_failed", map[string]any{"op": "devices_upsert_for_secret", "deviceId": deviceID, "err": err.Error()})
+		}
+		return false
+	}
+	res, err := b.db.ExecContext(ctx, `
+insert into device_secrets(device_id, secret_sha256, issued_at, updated_at)
+values ($1, $2, now(), now())
+on conflict (device_id) do nothing
+`, deviceID, hash)
+	if err != nil {
+		if b.shouldLogDBErr(deviceID) {
+			logJSON("db_write_failed", map[string]any{"op": "device_secrets_insert", "deviceId": deviceID, "err": err.Error()})
+		}
+		return false
+	}
+	n, _ := res.RowsAffected()
+	return n > 0
 }
 
 func (b *Broker) upsertSession(s *AgentSession) {

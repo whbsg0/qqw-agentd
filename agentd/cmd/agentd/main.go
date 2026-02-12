@@ -97,6 +97,10 @@ type DbSyncStartPayload struct {
 	UploadURL string `json:"uploadUrl"`
 }
 
+type SetDeviceSecretPayload struct {
+	DeviceSecret string `json:"deviceSecret,omitempty"`
+}
+
 type Agent struct {
 	cfgMu sync.RWMutex
 	cfg   Config
@@ -849,6 +853,16 @@ func (a *Agent) readLoop(ctx context.Context, ws *websocket.Conn, sessionID stri
 			a.handleCloseTunnel(in.TunnelID)
 		case "tunnel_data":
 			a.handleTunnelData(ws, in)
+		case "set_device_secret":
+			var p SetDeviceSecretPayload
+			_ = json.Unmarshal(in.Payload, &p)
+			next := a.getCfg()
+			next.DeviceSecret = strings.TrimSpace(p.DeviceSecret)
+			a.setCfg(next)
+			if a.configPath != "" {
+				_ = a.persistConfig(next)
+			}
+			a.logf("deviceSecret updated")
 		case "dbsync_start":
 			go a.handleDbSyncStart(in)
 		}
@@ -1231,6 +1245,9 @@ func normalizeConfig(cfg *Config) error {
 	}
 	if cfg.DeviceIDPath == "" {
 		cfg.DeviceIDPath = "/var/mobile/Library/QQwAgent/device_id"
+	}
+	if cfg.ControlListen == "" {
+		cfg.ControlListen = "127.0.0.1:17171"
 	}
 	if cfg.HeartbeatSec <= 0 {
 		cfg.HeartbeatSec = 20
