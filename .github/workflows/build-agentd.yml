@@ -74,11 +74,17 @@ jobs:
           tar -xJf "$DEVKIT_TAR" -C "$DEVKIT_DIR"
           INCLUDE_DIR="$(find "$DEVKIT_DIR" -maxdepth 3 -type d -name include -print -quit || true)"
           if [ -z "$INCLUDE_DIR" ] || [ ! -d "$INCLUDE_DIR" ]; then
-            echo "ERROR: devkit include dir missing under: $DEVKIT_DIR" >&2
-            ls -la "$DEVKIT_DIR" || true
-            exit 1
+            if [ -f "$DEVKIT_DIR/frida-core.h" ]; then
+              INCLUDE_DIR="$DEVKIT_DIR"
+              DEVKIT_ROOT="$DEVKIT_DIR"
+            else
+              echo "ERROR: devkit include dir missing under: $DEVKIT_DIR" >&2
+              ls -la "$DEVKIT_DIR" || true
+              exit 1
+            fi
+          else
+            DEVKIT_ROOT="$(dirname "$INCLUDE_DIR")"
           fi
-          DEVKIT_ROOT="$(dirname "$INCLUDE_DIR")"
           LIBDIR="$DEVKIT_ROOT"
           if [ -d "$DEVKIT_ROOT/lib" ]; then LIBDIR="$DEVKIT_ROOT/lib"; fi
           INCLUDES="-I$DEVKIT_DIR/include"
