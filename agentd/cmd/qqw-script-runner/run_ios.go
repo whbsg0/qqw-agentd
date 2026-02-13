@@ -1,0 +1,175 @@
+//go:build ios
+
+package main
+
+/*
+#cgo CFLAGS: -Wno-deprecated-declarations
+#include <stdlib.h>
+#include <frida-core.h>
+#include <glib.h>
+#include <glib-object.h>
+
+extern void goFridaOnMessage(char *message);
+
+typedef struct {
+  GMainLoop *loop;
+} qqw_ctx_t;
+
+static void on_message(FridaScript *script, const gchar *message, GBytes *data, gpointer user_data) {
+  if (message == NULL) return;
+  goFridaOnMessage((char *) message);
+}
+
+static void on_detached(FridaSession *session, FridaSessionDetachReason reason, gpointer crash, gpointer user_data) {
+  qqw_ctx_t *ctx = (qqw_ctx_t *) user_data;
+  if (ctx == NULL || ctx->loop == NULL) return;
+  g_main_loop_quit(ctx->loop);
+}
+
+static guint find_pid(FridaDevice *device, const gchar *name, GError **error) {
+  FridaProcessList *plist = frida_device_enumerate_processes_sync(device, NULL, error);
+  if (*error != NULL) return 0;
+  gint n = frida_process_list_size(plist);
+  guint pid = 0;
+  for (gint i = 0; i < n; i++) {
+    FridaProcess *p = frida_process_list_get(plist, i);
+    const gchar *pn = frida_process_get_name(p);
+    if (pn != NULL && g_strcmp0(pn, name) == 0) {
+      pid = frida_process_get_pid(p);
+      g_object_unref(p);
+      break;
+    }
+    g_object_unref(p);
+  }
+  g_object_unref(plist);
+  return pid;
+}
+
+static int qqw_run(const char *address, const char *process_name, const char *script_source, char **error_out) {
+  frida_init();
+  GError *error = NULL;
+
+  FridaDeviceManager *manager = frida_device_manager_new();
+  FridaDevice *device = frida_device_manager_add_remote_device_sync(manager, address, NULL, &error);
+  if (error != NULL) {
+    *error_out = g_strdup(error->message);
+    g_error_free(error);
+    g_object_unref(manager);
+    return 2;
+  }
+
+  guint pid = find_pid(device, process_name, &error);
+  if (error != NULL) {
+    *error_out = g_strdup(error->message);
+    g_error_free(error);
+    g_object_unref(device);
+    g_object_unref(manager);
+    return 2;
+  }
+  if (pid == 0) {
+    *error_out = g_strdup("process not found");
+    g_object_unref(device);
+    g_object_unref(manager);
+    return 2;
+  }
+
+  FridaSession *session = frida_device_attach_sync(device, pid, NULL, &error);
+  if (error != NULL) {
+    *error_out = g_strdup(error->message);
+    g_error_free(error);
+    g_object_unref(device);
+    g_object_unref(manager);
+    return 2;
+  }
+
+  FridaScript *script = frida_session_create_script_sync(session, script_source, NULL, &error);
+  if (error != NULL) {
+    *error_out = g_strdup(error->message);
+    g_error_free(error);
+    g_object_unref(session);
+    g_object_unref(device);
+    g_object_unref(manager);
+    return 2;
+  }
+
+  qqw_ctx_t ctx;
+  ctx.loop = g_main_loop_new(NULL, FALSE);
+  g_signal_connect(script, "message", G_CALLBACK(on_message), &ctx);
+  g_signal_connect(session, "detached", G_CALLBACK(on_detached), &ctx);
+
+  frida_script_load_sync(script, NULL, &error);
+  if (error != NULL) {
+    *error_out = g_strdup(error->message);
+    g_error_free(error);
+    g_main_loop_unref(ctx.loop);
+    g_object_unref(script);
+    g_object_unref(session);
+    g_object_unref(device);
+    g_object_unref(manager);
+    return 2;
+  }
+
+  g_main_loop_run(ctx.loop);
+
+  frida_script_unload_sync(script, NULL, NULL);
+  g_main_loop_unref(ctx.loop);
+  g_object_unref(script);
+  g_object_unref(session);
+  g_object_unref(device);
+  g_object_unref(manager);
+  return 0;
+}
+
+static void qqw_free(char *p) {
+  if (p != NULL) g_free(p);
+}
+*/
+import "C"
+
+import (
+	"errors"
+	"strconv"
+	"sync"
+	"unsafe"
+)
+
+var (
+	posterMu sync.RWMutex
+	poster   *eventPoster
+)
+
+//export goFridaOnMessage
+func goFridaOnMessage(message *C.char) {
+	posterMu.RLock()
+	p := poster
+	posterMu.RUnlock()
+	if p == nil {
+		return
+	}
+	handleFridaMessageJSONLine(p, C.GoString(message))
+}
+
+func run(fridaHost string, fridaPort int, scriptSource string, eventsURL string) error {
+	posterMu.Lock()
+	poster = newEventPoster(eventsURL)
+	posterMu.Unlock()
+
+	addr := fridaHost + ":" + strconv.Itoa(fridaPort)
+	cAddr := C.CString(addr)
+	cProc := C.CString("WhatsApp")
+	cSrc := C.CString(scriptSource)
+	defer C.free(unsafe.Pointer(cAddr))
+	defer C.free(unsafe.Pointer(cProc))
+	defer C.free(unsafe.Pointer(cSrc))
+
+	var cErr *C.char
+	rc := C.qqw_run(cAddr, cProc, cSrc, &cErr)
+	if cErr != nil {
+		defer C.qqw_free(cErr)
+		return errors.New(C.GoString(cErr))
+	}
+	if rc != 0 {
+		return errors.New("runner exited")
+	}
+	return nil
+}

@@ -92,6 +92,45 @@ type TunnelDataPayload struct {
 	B64 string `json:"b64"`
 }
 
+type limitedLineBuffer struct {
+	mu  sync.Mutex
+	max int
+	buf []byte
+}
+
+func newLimitedLineBuffer(max int) *limitedLineBuffer {
+	if max <= 0 {
+		max = 4096
+	}
+	return &limitedLineBuffer{max: max, buf: make([]byte, 0, max)}
+}
+
+func (b *limitedLineBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if len(p) >= b.max {
+		b.buf = append(b.buf[:0], p[len(p)-b.max:]...)
+		return len(p), nil
+	}
+	if len(b.buf)+len(p) > b.max {
+		drop := (len(b.buf) + len(p)) - b.max
+		if drop >= len(b.buf) {
+			b.buf = b.buf[:0]
+		} else {
+			copy(b.buf, b.buf[drop:])
+			b.buf = b.buf[:len(b.buf)-drop]
+		}
+	}
+	b.buf = append(b.buf, p...)
+	return len(p), nil
+}
+
+func (b *limitedLineBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return strings.TrimSpace(string(b.buf))
+}
+
 type DbSyncStartPayload struct {
 	JobID     string `json:"jobId"`
 	UploadURL string `json:"uploadUrl"`
@@ -765,6 +804,7 @@ func (a *Agent) startRunner() error {
 		return err
 	}
 	eventsURL := "http://" + strings.TrimSpace(cfg.ControlListen) + "/events"
+	outBuf := newLimitedLineBuffer(16 * 1024)
 	cmd := exec.Command(
 		runnerPath,
 		"-fridaHost", strings.TrimSpace(cfg.Frida.Host),
@@ -772,8 +812,10 @@ func (a *Agent) startRunner() error {
 		"-scriptPath", a.scriptPath,
 		"-eventsUrl", eventsURL,
 	)
-	cmd.Stdout = os.Stderr
-	cmd.Stderr = os.Stderr
+	cmd.Env = append(os.Environ(), "PATH=/var/jb/usr/bin:/var/jb/bin:/usr/bin:/bin:/usr/sbin:/sbin")
+	mw := io.MultiWriter(os.Stderr, outBuf)
+	cmd.Stdout = mw
+	cmd.Stderr = mw
 	if err := cmd.Start(); err != nil {
 		return err
 	}
@@ -788,7 +830,14 @@ func (a *Agent) startRunner() error {
 		}
 		a.runnerMu.Unlock()
 		if err != nil {
-			a.scriptLastError.Store(err.Error())
+			s := outBuf.String()
+			if s != "" {
+				a.scriptLastError.Store(s)
+			} else {
+				a.scriptLastError.Store(err.Error())
+			}
+		} else {
+			a.scriptLastError.Store("")
 		}
 	}()
 	return nil
