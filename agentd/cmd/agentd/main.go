@@ -734,8 +734,16 @@ func serverHTTPBase(serverURL string) string {
 }
 
 func (a *Agent) runnerBinaryPath() (string, error) {
+	const fixed = "/var/jb/usr/local/bin/qqw-script-runner"
+	if st, err := os.Stat(fixed); err == nil && !st.IsDir() {
+		return fixed, nil
+	}
 	exe, err := os.Executable()
 	if err != nil || strings.TrimSpace(exe) == "" {
+		arg0 := strings.TrimSpace(os.Args[0])
+		if arg0 != "" {
+			return filepath.Join(filepath.Dir(arg0), "qqw-script-runner"), nil
+		}
 		return "", errors.New("executable path unavailable")
 	}
 	return filepath.Join(filepath.Dir(exe), "qqw-script-runner"), nil
