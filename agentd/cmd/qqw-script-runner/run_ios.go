@@ -13,6 +13,19 @@ typedef struct {
   GMainLoop *loop;
 } qqw_ctx_t;
 
+static gchar * qqw_strdup_printf2(const gchar *prefix, const gchar *msg) {
+  if (prefix == NULL) prefix = "";
+  if (msg == NULL) msg = "";
+  return g_strdup_printf("%s%s", prefix, msg);
+}
+
+static gchar * qqw_strdup_printf3(const gchar *prefix, const gchar *mid, const gchar *msg) {
+  if (prefix == NULL) prefix = "";
+  if (mid == NULL) mid = "";
+  if (msg == NULL) msg = "";
+  return g_strdup_printf("%s%s%s", prefix, mid, msg);
+}
+
 static void on_message(FridaScript *script, const gchar *message, GBytes *data, gpointer user_data) {
   if (message == NULL) return;
   goFridaOnMessage((char *) message);
@@ -49,8 +62,18 @@ static int qqw_run(const char *address, const char *process_name, const char *sc
 
   FridaDeviceManager *manager = frida_device_manager_new();
   FridaDevice *device = frida_device_manager_add_remote_device_sync(manager, address, NULL, NULL, &error);
+  if (error != NULL && address != NULL) {
+    const char *colon = strchr(address, ':');
+    if (colon != NULL) {
+      gchar *host_only = g_strndup(address, (gsize) (colon - address));
+      g_error_free(error);
+      error = NULL;
+      device = frida_device_manager_add_remote_device_sync(manager, host_only, NULL, NULL, &error);
+      g_free(host_only);
+    }
+  }
   if (error != NULL) {
-    *error_out = g_strdup(error->message);
+    *error_out = qqw_strdup_printf2("add_remote_device: ", error->message);
     g_error_free(error);
     g_object_unref(manager);
     return 2;
@@ -58,14 +81,14 @@ static int qqw_run(const char *address, const char *process_name, const char *sc
 
   guint pid = find_pid(device, process_name, &error);
   if (error != NULL) {
-    *error_out = g_strdup(error->message);
+    *error_out = qqw_strdup_printf2("enumerate_processes: ", error->message);
     g_error_free(error);
     g_object_unref(device);
     g_object_unref(manager);
     return 2;
   }
   if (pid == 0) {
-    *error_out = g_strdup("process not found");
+    *error_out = qqw_strdup_printf3("process not found: ", process_name, "");
     g_object_unref(device);
     g_object_unref(manager);
     return 2;
@@ -73,7 +96,7 @@ static int qqw_run(const char *address, const char *process_name, const char *sc
 
   FridaSession *session = frida_device_attach_sync(device, pid, NULL, NULL, &error);
   if (error != NULL) {
-    *error_out = g_strdup(error->message);
+    *error_out = qqw_strdup_printf2("attach: ", error->message);
     g_error_free(error);
     g_object_unref(device);
     g_object_unref(manager);
@@ -82,7 +105,7 @@ static int qqw_run(const char *address, const char *process_name, const char *sc
 
   FridaScript *script = frida_session_create_script_sync(session, script_source, NULL, NULL, &error);
   if (error != NULL) {
-    *error_out = g_strdup(error->message);
+    *error_out = qqw_strdup_printf2("create_script: ", error->message);
     g_error_free(error);
     g_object_unref(session);
     g_object_unref(device);
@@ -97,7 +120,7 @@ static int qqw_run(const char *address, const char *process_name, const char *sc
 
   frida_script_load_sync(script, NULL, &error);
   if (error != NULL) {
-    *error_out = g_strdup(error->message);
+    *error_out = qqw_strdup_printf2("script_load: ", error->message);
     g_error_free(error);
     g_main_loop_unref(ctx.loop);
     g_object_unref(script);
