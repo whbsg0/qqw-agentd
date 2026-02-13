@@ -51,13 +51,42 @@ jobs:
         working-directory: agentd
         run: |
           go mod download
+          FRIDA_CORE_VERSION="16.7.19"
+          DEVKIT_DIR="$(pwd)/dist/frida-core-devkit-ios-arm64"
+          mkdir -p "$DEVKIT_DIR"
+          curl -fsSL -o /tmp/frida-core-devkit.tar.xz "https://github.com/frida/frida/releases/download/${FRIDA_CORE_VERSION}/frida-core-devkit-${FRIDA_CORE_VERSION}-ios-arm64.tar.xz"
+          tar -xJf /tmp/frida-core-devkit.tar.xz -C "$DEVKIT_DIR" --strip-components=1
+          if [ ! -d "$DEVKIT_DIR/include" ]; then
+            echo "ERROR: devkit include dir missing: $DEVKIT_DIR/include" >&2
+            exit 1
+          fi
+          LIBDIR="$DEVKIT_DIR"
+          if [ -d "$DEVKIT_DIR/lib" ]; then LIBDIR="$DEVKIT_DIR/lib"; fi
+          INCLUDES="-I$DEVKIT_DIR/include"
+          for d in "$DEVKIT_DIR/include/glib-2.0" "$DEVKIT_DIR/include/gio-unix-2.0" "$DEVKIT_DIR/include/json-glib-1.0"; do
+            if [ -d "$d" ]; then INCLUDES="$INCLUDES -I$d"; fi
+          done
+          for d in "$LIBDIR/glib-2.0/include" "$LIBDIR/gio-unix-2.0/include"; do
+            if [ -d "$d" ]; then INCLUDES="$INCLUDES -I$d"; fi
+          done
+          LDFLAGS_EXTRA="-framework Foundation -framework CoreFoundation -framework Security"
+          if [ -f "$LIBDIR/libfrida-core.a" ]; then
+            LDFLAGS_EXTRA="$LDFLAGS_EXTRA $LIBDIR/libfrida-core.a"
+            for f in "$LIBDIR"/*.a; do
+              if [ "$(basename "$f")" != "libfrida-core.a" ]; then
+                LDFLAGS_EXTRA="$LDFLAGS_EXTRA $f"
+              fi
+            done
+          else
+            LDFLAGS_EXTRA="$LDFLAGS_EXTRA -L$LIBDIR -lfrida-core"
+          fi
           SDKROOT="$(xcrun --sdk iphoneos --show-sdk-path)"
           CC="$(xcrun --sdk iphoneos --find clang)"
           CXX="$(xcrun --sdk iphoneos --find clang++)"
           export SDKROOT CC CXX
           export CGO_ENABLED=1 GOOS=ios GOARCH=arm64
-          export CGO_CFLAGS="-isysroot $SDKROOT -miphoneos-version-min=13.0"
-          export CGO_LDFLAGS="-isysroot $SDKROOT -miphoneos-version-min=13.0"
+          export CGO_CFLAGS="-isysroot $SDKROOT -miphoneos-version-min=13.0 $INCLUDES"
+          export CGO_LDFLAGS="-isysroot $SDKROOT -miphoneos-version-min=13.0 $LDFLAGS_EXTRA"
           go build -trimpath -ldflags "-s -w -linkmode external" -o dist/qqw-script-runner-ios-arm64 ./cmd/qqw-script-runner
           codesign --sign - --force --timestamp=none dist/qqw-script-runner-ios-arm64
           echo "=== verify Mach-O platform ==="
