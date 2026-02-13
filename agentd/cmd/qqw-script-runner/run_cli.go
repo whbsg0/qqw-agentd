@@ -11,7 +11,7 @@ import (
 	"strings"
 )
 
-func run(fridaHost string, fridaPort int, scriptSource string, eventsURL string) error {
+func run(fridaHost string, fridaPort int, processName string, scriptSource string, eventsURL string) error {
 	poster := newEventPoster(eventsURL)
 
 	tmp, err := os.CreateTemp("", "qqw-script-*.js")
@@ -29,7 +29,7 @@ func run(fridaHost string, fridaPort int, scriptSource string, eventsURL string)
 	hostPort := strings.TrimSpace(fridaHost) + ":" + strconv.Itoa(fridaPort)
 	cmd := exec.Command("frida",
 		"-H", hostPort,
-		"-n", "WhatsApp",
+		"-n", strings.TrimSpace(processName),
 		"-l", tmpPath,
 		"--no-pause",
 		"--runtime=v8",
@@ -55,4 +55,3 @@ func run(fridaHost string, fridaPort int, scriptSource string, eventsURL string)
 	}
 	return errors.New("runner exited")
 }
-

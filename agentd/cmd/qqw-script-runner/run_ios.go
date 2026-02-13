@@ -170,14 +170,14 @@ func goFridaOnMessage(message *C.char) {
 	handleFridaMessageJSONLine(p, C.GoString(message))
 }
 
-func run(fridaHost string, fridaPort int, scriptSource string, eventsURL string) error {
+func run(fridaHost string, fridaPort int, processName string, scriptSource string, eventsURL string) error {
 	posterMu.Lock()
 	poster = newEventPoster(eventsURL)
 	posterMu.Unlock()
 
 	addr := fridaHost + ":" + strconv.Itoa(fridaPort)
 	cAddr := C.CString(addr)
-	cProc := C.CString("WhatsApp")
+	cProc := C.CString(processName)
 	cSrc := C.CString(scriptSource)
 	defer C.free(unsafe.Pointer(cAddr))
 	defer C.free(unsafe.Pointer(cProc))

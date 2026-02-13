@@ -809,6 +809,7 @@ func (a *Agent) startRunner() error {
 		runnerPath,
 		"-fridaHost", strings.TrimSpace(cfg.Frida.Host),
 		"-fridaPort", strconv.Itoa(cfg.Frida.Port),
+		"-processName", "WhatsApp",
 		"-scriptPath", a.scriptPath,
 		"-eventsUrl", eventsURL,
 	)
