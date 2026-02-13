@@ -50,20 +50,40 @@ jobs:
       - name: Build qqw-script-runner (ios/arm64)
         working-directory: agentd
         run: |
+          set -euo pipefail
           go mod download
           FRIDA_CORE_VERSION="16.7.19"
-          DEVKIT_DIR="$(pwd)/dist/frida-core-devkit-ios-arm64"
+          DEVKIT_DIR="$(pwd)/dist/frida-core-devkit"
           mkdir -p "$DEVKIT_DIR"
-          curl -fsSL -o /tmp/frida-core-devkit.tar.xz "https://github.com/frida/frida/releases/download/${FRIDA_CORE_VERSION}/frida-core-devkit-${FRIDA_CORE_VERSION}-ios-arm64.tar.xz"
-          tar -xJf /tmp/frida-core-devkit.tar.xz -C "$DEVKIT_DIR" --strip-components=1
-          if [ ! -d "$DEVKIT_DIR/include" ]; then
-            echo "ERROR: devkit include dir missing: $DEVKIT_DIR/include" >&2
+
+          DEVKIT_TAR="/tmp/frida-core-devkit.tar.xz"
+          rm -f "$DEVKIT_TAR"
+          for SUFFIX in ios-arm64 ios-arm64e ios-arm64eoabi; do
+            URL="https://github.com/frida/frida/releases/download/${FRIDA_CORE_VERSION}/frida-core-devkit-${FRIDA_CORE_VERSION}-${SUFFIX}.tar.xz"
+            echo "download: $URL"
+            if curl -fsSL -o "$DEVKIT_TAR" "$URL"; then
+              break
+            fi
+          done
+          if [ ! -f "$DEVKIT_TAR" ]; then
+            echo "ERROR: devkit download failed" >&2
             exit 1
           fi
-          LIBDIR="$DEVKIT_DIR"
-          if [ -d "$DEVKIT_DIR/lib" ]; then LIBDIR="$DEVKIT_DIR/lib"; fi
+
+          rm -rf "$DEVKIT_DIR"/*
+          tar -xJf "$DEVKIT_TAR" -C "$DEVKIT_DIR"
+          INCLUDE_DIR="$(find "$DEVKIT_DIR" -maxdepth 3 -type d -name include -print -quit || true)"
+          if [ -z "$INCLUDE_DIR" ] || [ ! -d "$INCLUDE_DIR" ]; then
+            echo "ERROR: devkit include dir missing under: $DEVKIT_DIR" >&2
+            ls -la "$DEVKIT_DIR" || true
+            exit 1
+          fi
+          DEVKIT_ROOT="$(dirname "$INCLUDE_DIR")"
+          LIBDIR="$DEVKIT_ROOT"
+          if [ -d "$DEVKIT_ROOT/lib" ]; then LIBDIR="$DEVKIT_ROOT/lib"; fi
           INCLUDES="-I$DEVKIT_DIR/include"
-          for d in "$DEVKIT_DIR/include/glib-2.0" "$DEVKIT_DIR/include/gio-unix-2.0" "$DEVKIT_DIR/include/json-glib-1.0"; do
+          INCLUDES="-I$INCLUDE_DIR"
+          for d in "$INCLUDE_DIR/glib-2.0" "$INCLUDE_DIR/gio-unix-2.0" "$INCLUDE_DIR/json-glib-1.0"; do
             if [ -d "$d" ]; then INCLUDES="$INCLUDES -I$d"; fi
           done
           for d in "$LIBDIR/glib-2.0/include" "$LIBDIR/gio-unix-2.0/include"; do
