@@ -654,7 +654,7 @@ func (a *Agent) startControlServer(cfgPath string) {
 		now := time.Now().UnixMilli()
 		a.scriptUpdatedAtTS.Store(now)
 		a.scriptLastError.Store("")
-		if err := a.stopRunner(); err != nil {
+		if err := a.stopRunnerIfRunning(); err != nil {
 			a.scriptLastError.Store(err.Error())
 			writeJSON(w, http.StatusBadGateway, map[string]any{"ok": false, "error": err.Error()})
 			return
