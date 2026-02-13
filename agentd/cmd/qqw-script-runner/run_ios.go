@@ -56,7 +56,7 @@ static guint find_pid(FridaDevice *device, const gchar *name, GError **error) {
   return pid;
 }
 
-static int qqw_run(const char *address, const char *process_name, const char *script_source, char **error_out) {
+static int qqw_run(const char *address, const char *process_name, const char *bundle_id, const char *script_source, char **error_out) {
   frida_init();
   GError *error = NULL;
 
@@ -87,17 +87,40 @@ static int qqw_run(const char *address, const char *process_name, const char *sc
     g_object_unref(manager);
     return 2;
   }
-  if (pid == 0) {
+  guint target_pid = pid;
+  FridaSession *session = NULL;
+  int spawned = 0;
+  if (target_pid != 0) {
+    session = frida_device_attach_sync(device, target_pid, NULL, NULL, &error);
+    if (error != NULL && bundle_id != NULL && bundle_id[0] != '\0' && g_strcmp0(error->message, "Timeout was reached") == 0) {
+      g_error_free(error);
+      error = NULL;
+      target_pid = frida_device_spawn_sync(device, bundle_id, NULL, NULL, &error);
+      spawned = 1;
+      if (error == NULL && target_pid != 0) {
+        session = frida_device_attach_sync(device, target_pid, NULL, NULL, &error);
+      }
+    }
+  } else if (bundle_id != NULL && bundle_id[0] != '\0') {
+    target_pid = frida_device_spawn_sync(device, bundle_id, NULL, NULL, &error);
+    spawned = 1;
+    if (error == NULL && target_pid != 0) {
+      session = frida_device_attach_sync(device, target_pid, NULL, NULL, &error);
+    }
+  } else {
     *error_out = qqw_strdup_printf3("process not found: ", process_name, "");
     g_object_unref(device);
     g_object_unref(manager);
     return 2;
   }
 
-  FridaSession *session = frida_device_attach_sync(device, pid, NULL, NULL, &error);
-  if (error != NULL) {
-    *error_out = qqw_strdup_printf2("attach: ", error->message);
-    g_error_free(error);
+  if (error != NULL || session == NULL) {
+    if (error != NULL) {
+      *error_out = qqw_strdup_printf2("attach: ", error->message);
+      g_error_free(error);
+    } else {
+      *error_out = g_strdup("attach: failed");
+    }
     g_object_unref(device);
     g_object_unref(manager);
     return 2;
@@ -128,6 +151,19 @@ static int qqw_run(const char *address, const char *process_name, const char *sc
     g_object_unref(device);
     g_object_unref(manager);
     return 2;
+  }
+  if (spawned) {
+    frida_device_resume_sync(device, target_pid, NULL, &error);
+    if (error != NULL) {
+      *error_out = qqw_strdup_printf2("resume: ", error->message);
+      g_error_free(error);
+      g_main_loop_unref(ctx.loop);
+      g_object_unref(script);
+      g_object_unref(session);
+      g_object_unref(device);
+      g_object_unref(manager);
+      return 2;
+    }
   }
 
   g_main_loop_run(ctx.loop);
@@ -170,7 +206,7 @@ func goFridaOnMessage(message *C.char) {
 	handleFridaMessageJSONLine(p, C.GoString(message))
 }
 
-func run(fridaHost string, fridaPort int, processName string, scriptSource string, eventsURL string) error {
+func run(fridaHost string, fridaPort int, processName string, bundleID string, scriptSource string, eventsURL string) error {
 	posterMu.Lock()
 	poster = newEventPoster(eventsURL)
 	posterMu.Unlock()
@@ -178,13 +214,15 @@ func run(fridaHost string, fridaPort int, processName string, scriptSource strin
 	addr := fridaHost + ":" + strconv.Itoa(fridaPort)
 	cAddr := C.CString(addr)
 	cProc := C.CString(processName)
+	cBundle := C.CString(bundleID)
 	cSrc := C.CString(scriptSource)
 	defer C.free(unsafe.Pointer(cAddr))
 	defer C.free(unsafe.Pointer(cProc))
+	defer C.free(unsafe.Pointer(cBundle))
 	defer C.free(unsafe.Pointer(cSrc))
 
 	var cErr *C.char
-	rc := C.qqw_run(cAddr, cProc, cSrc, &cErr)
+	rc := C.qqw_run(cAddr, cProc, cBundle, cSrc, &cErr)
 	if cErr != nil {
 		defer C.qqw_free(cErr)
 		return errors.New(C.GoString(cErr))

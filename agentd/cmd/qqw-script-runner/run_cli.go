@@ -11,7 +11,7 @@ import (
 	"strings"
 )
 
-func run(fridaHost string, fridaPort int, processName string, scriptSource string, eventsURL string) error {
+func run(fridaHost string, fridaPort int, processName string, bundleID string, scriptSource string, eventsURL string) error {
 	poster := newEventPoster(eventsURL)
 
 	tmp, err := os.CreateTemp("", "qqw-script-*.js")
