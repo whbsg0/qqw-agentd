@@ -25,7 +25,7 @@ static void on_detached(FridaSession *session, FridaSessionDetachReason reason, 
 }
 
 static guint find_pid(FridaDevice *device, const gchar *name, GError **error) {
-  FridaProcessList *plist = frida_device_enumerate_processes_sync(device, NULL, error);
+  FridaProcessList *plist = frida_device_enumerate_processes_sync(device, NULL, NULL, error);
   if (*error != NULL) return 0;
   gint n = frida_process_list_size(plist);
   guint pid = 0;
@@ -48,7 +48,7 @@ static int qqw_run(const char *address, const char *process_name, const char *sc
   GError *error = NULL;
 
   FridaDeviceManager *manager = frida_device_manager_new();
-  FridaDevice *device = frida_device_manager_add_remote_device_sync(manager, address, NULL, &error);
+  FridaDevice *device = frida_device_manager_add_remote_device_sync(manager, address, NULL, NULL, &error);
   if (error != NULL) {
     *error_out = g_strdup(error->message);
     g_error_free(error);
@@ -71,7 +71,7 @@ static int qqw_run(const char *address, const char *process_name, const char *sc
     return 2;
   }
 
-  FridaSession *session = frida_device_attach_sync(device, pid, NULL, &error);
+  FridaSession *session = frida_device_attach_sync(device, pid, NULL, NULL, &error);
   if (error != NULL) {
     *error_out = g_strdup(error->message);
     g_error_free(error);
@@ -80,7 +80,7 @@ static int qqw_run(const char *address, const char *process_name, const char *sc
     return 2;
   }
 
-  FridaScript *script = frida_session_create_script_sync(session, script_source, NULL, &error);
+  FridaScript *script = frida_session_create_script_sync(session, script_source, NULL, NULL, &error);
   if (error != NULL) {
     *error_out = g_strdup(error->message);
     g_error_free(error);
