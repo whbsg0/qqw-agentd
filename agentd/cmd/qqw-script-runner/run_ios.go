@@ -6,8 +6,6 @@ package main
 #cgo CFLAGS: -Wno-deprecated-declarations
 #include <stdlib.h>
 #include <frida-core.h>
-#include <glib.h>
-#include <glib-object.h>
 
 extern void goFridaOnMessage(char *message);
 
