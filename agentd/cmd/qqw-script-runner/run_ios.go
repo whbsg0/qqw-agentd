@@ -60,71 +60,108 @@ static int qqw_run(const char *address, const char *process_name, const char *bu
   frida_init();
   GError *error = NULL;
 
-  FridaDeviceManager *manager = frida_device_manager_new();
-  FridaDevice *device = frida_device_manager_add_remote_device_sync(manager, address, NULL, NULL, &error);
-  if (error != NULL && address != NULL) {
-    const char *colon = strchr(address, ':');
-    if (colon != NULL) {
-      gchar *host_only = g_strndup(address, (gsize) (colon - address));
-      g_error_free(error);
-      error = NULL;
-      device = frida_device_manager_add_remote_device_sync(manager, host_only, NULL, NULL, &error);
-      g_free(host_only);
-    }
-  }
-  if (error != NULL) {
-    *error_out = qqw_strdup_printf2("add_remote_device: ", error->message);
-    g_error_free(error);
-    g_object_unref(manager);
-    return 2;
-  }
+  const gchar *proc = process_name != NULL && process_name[0] != '\0' ? process_name : "WhatsApp";
+  const gchar *bid = bundle_id != NULL ? bundle_id : "";
+  const int max_attempts = 3;
 
-  guint pid = find_pid(device, process_name, &error);
-  if (error != NULL) {
-    *error_out = qqw_strdup_printf2("enumerate_processes: ", error->message);
-    g_error_free(error);
-    g_object_unref(device);
-    g_object_unref(manager);
-    return 2;
-  }
-  guint target_pid = pid;
-  FridaSession *session = NULL;
-  int spawned = 0;
-  if (target_pid != 0) {
-    session = frida_device_attach_sync(device, target_pid, NULL, NULL, &error);
-    if (error != NULL && bundle_id != NULL && bundle_id[0] != '\0' && g_strcmp0(error->message, "Timeout was reached") == 0) {
-      g_error_free(error);
-      error = NULL;
-      target_pid = frida_device_spawn_sync(device, bundle_id, NULL, NULL, &error);
-      spawned = 1;
-      if (error == NULL && target_pid != 0) {
-        session = frida_device_attach_sync(device, target_pid, NULL, NULL, &error);
+  FridaDeviceManager *manager = NULL;
+  FridaDevice *device = NULL;
+
+  for (int attempt = 1; attempt <= max_attempts; attempt++) {
+    if (device != NULL) { g_object_unref(device); device = NULL; }
+    if (manager != NULL) { g_object_unref(manager); manager = NULL; }
+    if (error != NULL) { g_error_free(error); error = NULL; }
+
+    manager = frida_device_manager_new();
+    device = frida_device_manager_add_remote_device_sync(manager, address, NULL, NULL, &error);
+    if (error != NULL && address != NULL) {
+      const char *colon = strchr(address, ':');
+      if (colon != NULL) {
+        gchar *host_only = g_strndup(address, (gsize) (colon - address));
+        g_error_free(error);
+        error = NULL;
+        device = frida_device_manager_add_remote_device_sync(manager, host_only, NULL, NULL, &error);
+        g_free(host_only);
       }
     }
-  } else if (bundle_id != NULL && bundle_id[0] != '\0') {
-    target_pid = frida_device_spawn_sync(device, bundle_id, NULL, NULL, &error);
-    spawned = 1;
-    if (error == NULL && target_pid != 0) {
-      session = frida_device_attach_sync(device, target_pid, NULL, NULL, &error);
-    }
-  } else {
-    *error_out = qqw_strdup_printf3("process not found: ", process_name, "");
-    g_object_unref(device);
-    g_object_unref(manager);
-    return 2;
-  }
-
-  if (error != NULL || session == NULL) {
     if (error != NULL) {
-      *error_out = qqw_strdup_printf2("attach: ", error->message);
+      if (attempt < max_attempts && g_strcmp0(error->message, "Timeout was reached") == 0) {
+        g_usleep((gulong) (200000 * attempt));
+        continue;
+      }
+      *error_out = qqw_strdup_printf2("add_remote_device: ", error->message);
       g_error_free(error);
-    } else {
-      *error_out = g_strdup("attach: failed");
+      if (device != NULL) g_object_unref(device);
+      g_object_unref(manager);
+      return 2;
     }
-    g_object_unref(device);
-    g_object_unref(manager);
-    return 2;
-  }
+
+    guint pid = find_pid(device, proc, &error);
+    if (error != NULL) {
+      if (attempt < max_attempts && (g_strcmp0(error->message, "Timeout was reached") == 0 || g_strrstr(error->message, "end-of-stream") != NULL)) {
+        g_error_free(error);
+        error = NULL;
+        g_usleep((gulong) (200000 * attempt));
+        continue;
+      }
+      *error_out = qqw_strdup_printf2("enumerate_processes: ", error->message);
+      g_error_free(error);
+      g_object_unref(device);
+      g_object_unref(manager);
+      return 2;
+    }
+
+    guint target_pid = pid;
+    FridaSession *session = NULL;
+    int spawned = 0;
+    if (target_pid != 0) {
+      session = frida_device_attach_sync(device, target_pid, NULL, NULL, &error);
+      if (error != NULL && bid[0] != '\0' && g_strcmp0(error->message, "Timeout was reached") == 0) {
+        g_error_free(error);
+        error = NULL;
+        target_pid = frida_device_spawn_sync(device, bid, NULL, NULL, &error);
+        spawned = 1;
+        if (error == NULL && target_pid != 0) {
+          g_usleep(200000);
+          session = frida_device_attach_sync(device, target_pid, NULL, NULL, &error);
+        }
+      }
+    } else if (bid[0] != '\0') {
+      target_pid = frida_device_spawn_sync(device, bid, NULL, NULL, &error);
+      spawned = 1;
+      if (error == NULL && target_pid != 0) {
+        g_usleep(200000);
+        session = frida_device_attach_sync(device, target_pid, NULL, NULL, &error);
+      }
+    } else {
+      *error_out = qqw_strdup_printf3("process not found: ", proc, "");
+      g_object_unref(device);
+      g_object_unref(manager);
+      return 2;
+    }
+
+    if (error != NULL || session == NULL) {
+      if (attempt < max_attempts && error != NULL) {
+        if (g_strcmp0(error->message, "Timeout was reached") == 0 || g_strrstr(error->message, "end-of-stream") != NULL) {
+          g_error_free(error);
+          error = NULL;
+          if (spawned && target_pid != 0) {
+            frida_device_kill_sync(device, target_pid, NULL, NULL);
+          }
+          g_usleep((gulong) (800000 * attempt));
+          continue;
+        }
+      }
+      if (error != NULL) {
+        *error_out = qqw_strdup_printf2("attach: ", error->message);
+        g_error_free(error);
+      } else {
+        *error_out = g_strdup("attach: failed");
+      }
+      g_object_unref(device);
+      g_object_unref(manager);
+      return 2;
+    }
 
   FridaScript *script = frida_session_create_script_sync(session, script_source, NULL, NULL, &error);
   if (error != NULL) {
@@ -175,6 +212,13 @@ static int qqw_run(const char *address, const char *process_name, const char *bu
   g_object_unref(device);
   g_object_unref(manager);
   return 0;
+  }
+
+  *error_out = g_strdup("attach: failed after retries");
+  if (device != NULL) g_object_unref(device);
+  if (manager != NULL) g_object_unref(manager);
+  if (error != NULL) g_error_free(error);
+  return 2;
 }
 
 static void qqw_free(char *p) {
@@ -186,6 +230,7 @@ import "C"
 import (
 	"errors"
 	"strconv"
+	"strings"
 	"sync"
 	"unsafe"
 )
@@ -212,9 +257,10 @@ func run(fridaHost string, fridaPort int, processName string, bundleID string, s
 	posterMu.Unlock()
 
 	addr := fridaHost + ":" + strconv.Itoa(fridaPort)
+
 	cAddr := C.CString(addr)
-	cProc := C.CString(processName)
-	cBundle := C.CString(bundleID)
+	cProc := C.CString(strings.TrimSpace(processName))
+	cBundle := C.CString(strings.TrimSpace(bundleID))
 	cSrc := C.CString(scriptSource)
 	defer C.free(unsafe.Pointer(cAddr))
 	defer C.free(unsafe.Pointer(cProc))
