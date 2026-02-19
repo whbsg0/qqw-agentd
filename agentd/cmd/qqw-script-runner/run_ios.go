@@ -81,6 +81,25 @@ static void on_detached(FridaSession *session, FridaSessionDetachReason reason, 
   g_main_loop_quit(ctx->loop);
 }
 
+static guint find_pid(FridaDevice *device, const gchar *name, GError **error) {
+  FridaProcessList *plist = frida_device_enumerate_processes_sync(device, NULL, NULL, error);
+  if (*error != NULL) return 0;
+  gint n = frida_process_list_size(plist);
+  guint pid = 0;
+  for (gint i = 0; i < n; i++) {
+    FridaProcess *p = frida_process_list_get(plist, i);
+    const gchar *pn = frida_process_get_name(p);
+    if (pn != NULL && g_strcmp0(pn, name) == 0) {
+      pid = frida_process_get_pid(p);
+      g_object_unref(p);
+      break;
+    }
+    g_object_unref(p);
+  }
+  g_object_unref(plist);
+  return pid;
+}
+
 static int qqw_run(const char *address, const char *process_name, const char *bundle_id, int require_foreground, int wait_foreground_ms, const char *script_source, char **error_out) {
   frida_init();
   GError *error = NULL;
@@ -121,31 +140,68 @@ static int qqw_run(const char *address, const char *process_name, const char *bu
       return 2;
     }
 
-    if (bid[0] == '\0') {
-      *error_out = g_strdup("bundle id required for spawn");
+    if (require_foreground) {
+      FridaFrontmostQueryOptions *fopts = frida_frontmost_query_options_new();
+      frida_frontmost_query_options_set_scope(fopts, FRIDA_SCOPE_MINIMAL);
+      gint64 deadline = g_get_monotonic_time() + (gint64) wait_foreground_ms * 1000;
+      for (;;) {
+        if (error != NULL) { g_error_free(error); error = NULL; }
+        FridaApplication *front = frida_device_get_frontmost_application_sync(device, fopts, NULL, &error);
+        if (error == NULL && front != NULL) {
+          const gchar *fid = frida_application_get_identifier(front);
+          const gchar *fname = frida_application_get_name(front);
+          gboolean ok = FALSE;
+          if (bid[0] != '\0' && fid != NULL && g_strcmp0(fid, bid) == 0) ok = TRUE;
+          if (!ok && fname != NULL && g_strcmp0(fname, proc) == 0) ok = TRUE;
+          g_object_unref(front);
+          if (ok) break;
+        } else if (front != NULL) {
+          g_object_unref(front);
+        }
+        if (g_get_monotonic_time() >= deadline) {
+          if (error != NULL) {
+            *error_out = qqw_strdup_printf2("frontmost: ", error->message);
+            g_error_free(error);
+          } else {
+            *error_out = g_strdup("frontmost: timeout waiting for target app");
+          }
+          g_object_unref(device);
+          g_object_unref(manager);
+          g_object_unref(fopts);
+          return 2;
+        }
+        g_usleep(200000);
+      }
+      g_object_unref(fopts);
+    }
+
+    guint pid = find_pid(device, proc, &error);
+    if (error != NULL) {
+      if (attempt < max_attempts && (g_strcmp0(error->message, "Timeout was reached") == 0 || g_strrstr(error->message, "end-of-stream") != NULL)) {
+        g_error_free(error);
+        error = NULL;
+        g_usleep((gulong) (200000 * attempt));
+        continue;
+      }
+      *error_out = qqw_strdup_printf2("enumerate_processes: ", error->message);
+      g_error_free(error);
+      g_object_unref(device);
+      g_object_unref(manager);
+      return 2;
+    }
+    if (pid == 0) {
+      *error_out = qqw_strdup_printf3("process not found: ", proc, "");
       g_object_unref(device);
       g_object_unref(manager);
       return 2;
     }
 
-    guint target_pid = 0;
-    FridaSession *session = NULL;
-    int spawned = 0;
-    target_pid = frida_device_spawn_sync(device, bid, NULL, NULL, &error);
-    spawned = 1;
-    if (error == NULL && target_pid != 0) {
-      g_usleep(200000);
-      session = frida_device_attach_sync(device, target_pid, NULL, NULL, &error);
-    }
-
+    FridaSession *session = frida_device_attach_sync(device, pid, NULL, NULL, &error);
     if (error != NULL || session == NULL) {
       if (attempt < max_attempts && error != NULL) {
         if (g_strcmp0(error->message, "Timeout was reached") == 0 || g_strrstr(error->message, "end-of-stream") != NULL) {
           g_error_free(error);
           error = NULL;
-          if (spawned && target_pid != 0) {
-            frida_device_kill_sync(device, target_pid, NULL, NULL);
-          }
           g_usleep((gulong) (800000 * attempt));
           continue;
         }
@@ -188,19 +244,6 @@ static int qqw_run(const char *address, const char *process_name, const char *bu
     return 2;
   }
   qqw_set_script(script);
-  if (spawned) {
-    frida_device_resume_sync(device, target_pid, NULL, &error);
-    if (error != NULL) {
-      *error_out = qqw_strdup_printf2("resume: ", error->message);
-      g_error_free(error);
-      g_main_loop_unref(ctx.loop);
-      g_object_unref(script);
-      g_object_unref(session);
-      g_object_unref(device);
-      g_object_unref(manager);
-      return 2;
-    }
-  }
 
   g_main_loop_run(ctx.loop);
 
