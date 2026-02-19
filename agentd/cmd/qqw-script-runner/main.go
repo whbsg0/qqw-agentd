@@ -12,19 +12,26 @@ func main() {
 	var fridaPort int
 	var scriptPath string
 	var eventsURL string
+	var rpcAddr string
 	var processName string
 	var bundleID string
+	var requireForeground bool
+	var waitForegroundMs int
 	flag.StringVar(&fridaHost, "fridaHost", "", "frida host")
 	flag.IntVar(&fridaPort, "fridaPort", 0, "frida port")
 	flag.StringVar(&scriptPath, "scriptPath", "", "script path")
 	flag.StringVar(&eventsURL, "eventsUrl", "", "events url")
+	flag.StringVar(&rpcAddr, "rpcAddr", "127.0.0.1:17172", "local rpc listen addr")
 	flag.StringVar(&processName, "processName", "WhatsApp", "target process name")
 	flag.StringVar(&bundleID, "bundleId", "", "target bundle id (spawn fallback)")
+	flag.BoolVar(&requireForeground, "requireForeground", true, "require target app to be frontmost before injection")
+	flag.IntVar(&waitForegroundMs, "waitForegroundMs", 30000, "max wait for target app to become frontmost")
 	flag.Parse()
 
 	fridaHost = strings.TrimSpace(fridaHost)
 	scriptPath = strings.TrimSpace(scriptPath)
 	eventsURL = strings.TrimSpace(eventsURL)
+	rpcAddr = strings.TrimSpace(rpcAddr)
 	processName = strings.TrimSpace(processName)
 	bundleID = strings.TrimSpace(bundleID)
 	if fridaHost == "" || fridaPort <= 0 || scriptPath == "" || eventsURL == "" || processName == "" {
@@ -42,7 +49,10 @@ func main() {
 		_, _ = io.WriteString(os.Stderr, "script read failed\n")
 		os.Exit(2)
 	}
-	if err := run(fridaHost, fridaPort, processName, bundleID, string(scriptBytes), eventsURL); err != nil {
+	if rpcAddr != "" {
+		go startRPCServer(rpcAddr)
+	}
+	if err := run(fridaHost, fridaPort, processName, bundleID, requireForeground, waitForegroundMs, string(scriptBytes), eventsURL); err != nil {
 		_, _ = io.WriteString(os.Stderr, err.Error()+"\n")
 		os.Exit(2)
 	}

@@ -13,6 +13,52 @@ typedef struct {
   GMainLoop *loop;
 } qqw_ctx_t;
 
+static GMutex g_script_mu;
+static FridaScript *g_script = NULL;
+
+static void qqw_set_script(FridaScript *script) {
+  g_mutex_lock(&g_script_mu);
+  if (g_script != NULL) {
+    g_object_unref(g_script);
+    g_script = NULL;
+  }
+  if (script != NULL) {
+    g_script = script;
+    g_object_ref(g_script);
+  }
+  g_mutex_unlock(&g_script_mu);
+}
+
+static int qqw_script_ready() {
+  g_mutex_lock(&g_script_mu);
+  int ok = (g_script != NULL);
+  g_mutex_unlock(&g_script_mu);
+  return ok;
+}
+
+static int qqw_post_json(const char *json, char **error_out) {
+  if (json == NULL) {
+    *error_out = g_strdup("post: empty");
+    return 2;
+  }
+  g_mutex_lock(&g_script_mu);
+  if (g_script == NULL) {
+    g_mutex_unlock(&g_script_mu);
+    *error_out = g_strdup("post: script not ready");
+    return 2;
+  }
+  GError *error = NULL;
+  frida_script_post_sync(g_script, json, NULL, NULL, &error);
+  if (error != NULL) {
+    *error_out = qqw_strdup_printf2("post: ", error->message);
+    g_error_free(error);
+    g_mutex_unlock(&g_script_mu);
+    return 2;
+  }
+  g_mutex_unlock(&g_script_mu);
+  return 0;
+}
+
 static gchar * qqw_strdup_printf2(const gchar *prefix, const gchar *msg) {
   if (prefix == NULL) prefix = "";
   if (msg == NULL) msg = "";
@@ -34,6 +80,7 @@ static void on_message(FridaScript *script, const gchar *message, GBytes *data, 
 static void on_detached(FridaSession *session, FridaSessionDetachReason reason, gpointer crash, gpointer user_data) {
   qqw_ctx_t *ctx = (qqw_ctx_t *) user_data;
   if (ctx == NULL || ctx->loop == NULL) return;
+  qqw_set_script(NULL);
   g_main_loop_quit(ctx->loop);
 }
 
@@ -56,7 +103,7 @@ static guint find_pid(FridaDevice *device, const gchar *name, GError **error) {
   return pid;
 }
 
-static int qqw_run(const char *address, const char *process_name, const char *bundle_id, const char *script_source, char **error_out) {
+static int qqw_run(const char *address, const char *process_name, const char *bundle_id, int require_foreground, int wait_foreground_ms, const char *script_source, char **error_out) {
   frida_init();
   GError *error = NULL;
 
@@ -94,6 +141,41 @@ static int qqw_run(const char *address, const char *process_name, const char *bu
       if (device != NULL) g_object_unref(device);
       g_object_unref(manager);
       return 2;
+    }
+
+    if (require_foreground) {
+      FridaFrontmostQueryOptions *fopts = frida_frontmost_query_options_new();
+      frida_frontmost_query_options_set_scope(fopts, FRIDA_SCOPE_MINIMAL);
+      gint64 deadline = g_get_monotonic_time() + (gint64) wait_foreground_ms * 1000;
+      for (;;) {
+        if (error != NULL) { g_error_free(error); error = NULL; }
+        FridaApplication *front = frida_device_get_frontmost_application_sync(device, fopts, NULL, &error);
+        if (error == NULL && front != NULL) {
+          const gchar *fid = frida_application_get_identifier(front);
+          const gchar *fname = frida_application_get_name(front);
+          gboolean ok = FALSE;
+          if (bid[0] != '\0' && fid != NULL && g_strcmp0(fid, bid) == 0) ok = TRUE;
+          if (!ok && fname != NULL && g_strcmp0(fname, proc) == 0) ok = TRUE;
+          g_object_unref(front);
+          if (ok) break;
+        } else if (front != NULL) {
+          g_object_unref(front);
+        }
+        if (g_get_monotonic_time() >= deadline) {
+          if (error != NULL) {
+            *error_out = qqw_strdup_printf2("frontmost: ", error->message);
+            g_error_free(error);
+          } else {
+            *error_out = g_strdup("frontmost: timeout waiting for target app");
+          }
+          g_object_unref(device);
+          g_object_unref(manager);
+          g_object_unref(fopts);
+          return 2;
+        }
+        g_usleep(200000);
+      }
+      g_object_unref(fopts);
     }
 
     guint pid = find_pid(device, proc, &error);
@@ -189,6 +271,7 @@ static int qqw_run(const char *address, const char *process_name, const char *bu
     g_object_unref(manager);
     return 2;
   }
+  qqw_set_script(script);
   if (spawned) {
     frida_device_resume_sync(device, target_pid, NULL, &error);
     if (error != NULL) {
@@ -205,6 +288,7 @@ static int qqw_run(const char *address, const char *process_name, const char *bu
 
   g_main_loop_run(ctx.loop);
 
+  qqw_set_script(NULL);
   frida_script_unload_sync(script, NULL, NULL);
   g_main_loop_unref(ctx.loop);
   g_object_unref(script);
@@ -238,6 +322,7 @@ import (
 var (
 	posterMu sync.RWMutex
 	poster   *eventPoster
+	scriptMu sync.Mutex
 )
 
 //export goFridaOnMessage
@@ -251,7 +336,7 @@ func goFridaOnMessage(message *C.char) {
 	handleFridaMessageJSONLine(p, C.GoString(message))
 }
 
-func run(fridaHost string, fridaPort int, processName string, bundleID string, scriptSource string, eventsURL string) error {
+func run(fridaHost string, fridaPort int, processName string, bundleID string, requireForeground bool, waitForegroundMs int, scriptSource string, eventsURL string) error {
 	posterMu.Lock()
 	poster = newEventPoster(eventsURL)
 	posterMu.Unlock()
@@ -268,13 +353,42 @@ func run(fridaHost string, fridaPort int, processName string, bundleID string, s
 	defer C.free(unsafe.Pointer(cSrc))
 
 	var cErr *C.char
-	rc := C.qqw_run(cAddr, cProc, cBundle, cSrc, &cErr)
+	rf := C.int(0)
+	if requireForeground {
+		rf = 1
+	}
+	rc := C.qqw_run(cAddr, cProc, cBundle, rf, C.int(waitForegroundMs), cSrc, &cErr)
 	if cErr != nil {
 		defer C.qqw_free(cErr)
 		return errors.New(C.GoString(cErr))
 	}
 	if rc != 0 {
 		return errors.New("runner exited")
+	}
+	return nil
+}
+
+func scriptReady() bool {
+	return C.qqw_script_ready() != 0
+}
+
+func postToScriptJSON(msg string) error {
+	msg = strings.TrimSpace(msg)
+	if msg == "" {
+		return errors.New("post: empty")
+	}
+	scriptMu.Lock()
+	defer scriptMu.Unlock()
+	cMsg := C.CString(msg)
+	defer C.free(unsafe.Pointer(cMsg))
+	var cErr *C.char
+	rc := C.qqw_post_json(cMsg, &cErr)
+	if cErr != nil {
+		defer C.qqw_free(cErr)
+		return errors.New(C.GoString(cErr))
+	}
+	if rc != 0 {
+		return errors.New("post: failed")
 	}
 	return nil
 }

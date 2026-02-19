@@ -140,6 +140,18 @@ type SetDeviceSecretPayload struct {
 	DeviceSecret string `json:"deviceSecret,omitempty"`
 }
 
+type TxSendPayload struct {
+	OpID               string `json:"opId"`
+	Kind               string `json:"kind"`
+	JID                string `json:"jid"`
+	Text               string `json:"text,omitempty"`
+	QuoteStanzaID      string `json:"quoteStanzaId,omitempty"`
+	ParticipantJID     string `json:"participantJid,omitempty"`
+	MessageOrigin      int    `json:"messageOrigin,omitempty"`
+	CreationEntryPoint int    `json:"creationEntryPoint,omitempty"`
+	TimeoutMs          int    `json:"timeoutMs,omitempty"`
+}
+
 type Agent struct {
 	cfgMu sync.RWMutex
 	cfg   Config
@@ -242,6 +254,18 @@ func (a *Agent) startControlServer(cfgPath string) {
 			return true
 		}
 		return r.Header.Get("X-QQw-Token") == a.getCfg().ControlToken
+	}
+
+	authOKEvents := func(r *http.Request) bool {
+		if authOK(r) {
+			return true
+		}
+		host, _, err := net.SplitHostPort(strings.TrimSpace(r.RemoteAddr))
+		if err != nil {
+			host = strings.TrimSpace(r.RemoteAddr)
+		}
+		ip := net.ParseIP(host)
+		return ip != nil && ip.IsLoopback()
 	}
 
 	writeJSON := func(w http.ResponseWriter, status int, v any) {
@@ -517,7 +541,7 @@ func (a *Agent) startControlServer(cfgPath string) {
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
-		if !authOK(r) {
+		if !authOKEvents(r) {
 			w.WriteHeader(http.StatusUnauthorized)
 			return
 		}
@@ -811,6 +835,9 @@ func (a *Agent) startRunner() error {
 		"-fridaPort", strconv.Itoa(cfg.Frida.Port),
 		"-processName", "WhatsApp",
 		"-bundleId", "net.whatsapp.WhatsApp",
+		"-requireForeground=true",
+		"-waitForegroundMs=45000",
+		"-rpcAddr", "127.0.0.1:17172",
 		"-scriptPath", a.scriptPath,
 		"-eventsUrl", eventsURL,
 	)
@@ -1211,8 +1238,70 @@ func (a *Agent) readLoop(ctx context.Context, ws *websocket.Conn, sessionID stri
 			a.logf("deviceSecret updated")
 		case "dbsync_start":
 			go a.handleDbSyncStart(in)
+		case "tx_send":
+			go a.handleTxSend(in)
 		}
 	}
+}
+
+func (a *Agent) handleTxSend(in Envelope) {
+	var p TxSendPayload
+	if err := json.Unmarshal(in.Payload, &p); err != nil {
+		a.logf("tx_send: invalid payload: %v", err)
+		return
+	}
+	p.OpID = strings.TrimSpace(p.OpID)
+	p.Kind = strings.TrimSpace(p.Kind)
+	p.JID = strings.TrimSpace(p.JID)
+	p.Text = strings.TrimSpace(p.Text)
+	p.QuoteStanzaID = strings.TrimSpace(p.QuoteStanzaID)
+	p.ParticipantJID = strings.TrimSpace(p.ParticipantJID)
+	if p.OpID == "" || p.Kind == "" || p.JID == "" {
+		a.logf("tx_send: missing opId/kind/jid")
+		return
+	}
+	if p.TimeoutMs <= 0 {
+		p.TimeoutMs = 20_000
+	}
+	if a.runnerPid.Load() == 0 {
+		_ = a.startRunner()
+	}
+	rpcURL := "http://127.0.0.1:17172/rpc/tx/send"
+	body, _ := json.Marshal(map[string]any{
+		"opId":               p.OpID,
+		"kind":               p.Kind,
+		"jid":                p.JID,
+		"text":               p.Text,
+		"quoteStanzaId":      p.QuoteStanzaID,
+		"participantJid":     p.ParticipantJID,
+		"messageOrigin":      p.MessageOrigin,
+		"creationEntryPoint": p.CreationEntryPoint,
+		"timeoutMs":          p.TimeoutMs,
+	})
+	cctx, cancel := context.WithTimeout(context.Background(), time.Duration(p.TimeoutMs+3000)*time.Millisecond)
+	defer cancel()
+	req, err := http.NewRequestWithContext(cctx, http.MethodPost, rpcURL, bytes.NewReader(body))
+	if err != nil {
+		a.logf("tx_send: build request failed: %v", err)
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		a.logf("tx_send: rpc failed: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		bs, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		msg := strings.TrimSpace(string(bs))
+		if msg == "" {
+			msg = resp.Status
+		}
+		a.logf("tx_send: rpc status=%d err=%s", resp.StatusCode, msg)
+		return
+	}
+	a.logf("tx_send: dispatched opId=%s kind=%s jid=%s", p.OpID, p.Kind, p.JID)
 }
 
 func (a *Agent) handleDbSyncStart(in Envelope) {

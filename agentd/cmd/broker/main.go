@@ -73,6 +73,18 @@ type SetDeviceSecretPayload struct {
 	DeviceSecret string `json:"deviceSecret,omitempty"`
 }
 
+type TxSendPayload struct {
+	OpID               string `json:"opId"`
+	Kind               string `json:"kind"`
+	JID                string `json:"jid"`
+	Text               string `json:"text,omitempty"`
+	QuoteStanzaID      string `json:"quoteStanzaId,omitempty"`
+	ParticipantJID     string `json:"participantJid,omitempty"`
+	MessageOrigin      int    `json:"messageOrigin,omitempty"`
+	CreationEntryPoint int    `json:"creationEntryPoint,omitempty"`
+	TimeoutMs          int    `json:"timeoutMs,omitempty"`
+}
+
 type AgentSession struct {
 	deviceID string
 	session  string
@@ -556,6 +568,56 @@ on conflict (device_id) do update set
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return
 		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+		return
+	}
+	if len(parts) == 3 && parts[1] == "tx" && parts[2] == "send" {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		deviceID := strings.TrimSpace(parts[0])
+		if deviceID == "" {
+			http.Error(w, "deviceId required", http.StatusBadRequest)
+			return
+		}
+		sess := b.getSession(deviceID)
+		if sess == nil {
+			http.Error(w, "device offline", http.StatusNotFound)
+			return
+		}
+		var req TxSendPayload
+		if err := readJSON(r, &req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		req.OpID = strings.TrimSpace(req.OpID)
+		req.Kind = strings.TrimSpace(req.Kind)
+		req.JID = strings.TrimSpace(req.JID)
+		req.Text = strings.TrimSpace(req.Text)
+		req.QuoteStanzaID = strings.TrimSpace(req.QuoteStanzaID)
+		req.ParticipantJID = strings.TrimSpace(req.ParticipantJID)
+		if req.OpID == "" || req.Kind == "" || req.JID == "" {
+			http.Error(w, "opId/kind/jid required", http.StatusBadRequest)
+			return
+		}
+		if req.TimeoutMs <= 0 {
+			req.TimeoutMs = 20_000
+		}
+		payload, _ := json.Marshal(req)
+		env := Envelope{
+			V:        1,
+			Type:     "tx_send",
+			DeviceID: deviceID,
+			Session:  sess.session,
+			TS:       time.Now().UnixMilli(),
+			Payload:  payload,
+		}
+		if err := sess.send(r.Context(), env); err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		logJSON("tx_send_dispatched", map[string]any{"deviceId": deviceID, "opId": req.OpID, "kind": req.Kind, "jid": req.JID})
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 		return
 	}

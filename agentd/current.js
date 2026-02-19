@@ -1255,11 +1255,128 @@ rpc.exports = {
   fileputChunk: fileput_chunk,
   fileputEnd: fileput_end,
   fileputProbe: fileput_probe,
+  sampleseton(meta) {
+    try {
+      const o = (typeof meta === "string") ? JSON.parse(meta) : (meta || {});
+      RX_SAMPLE.enabled = true;
+      RX_SAMPLE.msg_kind = String(o.msg_kind || o.msgKind || RX_SAMPLE.msg_kind || "unknown");
+      RX_SAMPLE.quoted_kind = String(o.quoted_kind || o.quotedKind || RX_SAMPLE.quoted_kind || "none");
+      RX_SAMPLE.quoted_stanza_id = String(o.quoted_stanza_id || o.quotedStanzaId || RX_SAMPLE.quoted_stanza_id || "");
+      return { ok: true, build: SCRIPT_BUILD_ID, enabled: true, sample: RX_SAMPLE };
+    } catch (e) {
+      return { ok: false, build: SCRIPT_BUILD_ID, error: String(e) };
+    }
+  },
+  sampleset(msg_kind, quoted_kind, quoted_stanza_id) {
+    try {
+      RX_SAMPLE.enabled = true;
+      RX_SAMPLE.msg_kind = String(msg_kind || "unknown");
+      RX_SAMPLE.quoted_kind = String(quoted_kind || "none");
+      RX_SAMPLE.quoted_stanza_id = String(quoted_stanza_id || "");
+      return { ok: true, build: SCRIPT_BUILD_ID, enabled: true, sample: RX_SAMPLE };
+    } catch (e) {
+      return { ok: false, build: SCRIPT_BUILD_ID, error: String(e) };
+    }
+  },
+  sampleoff() {
+    RX_SAMPLE.enabled = false;
+    RX_SAMPLE.msg_kind = "unknown";
+    RX_SAMPLE.quoted_kind = "none";
+    RX_SAMPLE.quoted_stanza_id = "";
+    return { ok: true, build: SCRIPT_BUILD_ID, enabled: false };
+  },
 };
 
-const RX_STATE = { installed: false, error: null, installedAt: null };
+function _txEmitResult(opId, kind, jid, res, extraErr) {
+  try {
+    const ok = !!(res && res.ok);
+    const stanzaId = res && res.stanzaId ? String(res.stanzaId) : "";
+    const err = ok ? "" : String((res && res.error) ? res.error : (extraErr ? extraErr : "failed"));
+    send({
+      type: "wa.tx.send.result",
+      build: SCRIPT_BUILD_ID,
+      ts: Date.now(),
+      op_id: String(opId || ""),
+      kind: String(kind || ""),
+      jid: String(jid || ""),
+      ok: ok,
+      stanzaId: stanzaId,
+      error: err
+    });
+  } catch (_) {}
+}
+
+function _txHandleMsg(message) {
+  const p = message && message.payload ? message.payload : (message || {});
+  const opId = String(p.opId || p.op_id || "");
+  const kind = String(p.kind || "");
+  const jid = String(p.jid || p.chatJid || "");
+  const text = String(p.text || "");
+  const quoteStanzaId = String(p.quoteStanzaId || p.quote_stanza_id || "");
+  const participantJid = String(p.participantJid || p.participant_jid || "");
+  const messageOrigin = Number.isFinite(p.messageOrigin) ? p.messageOrigin : 0;
+  const creationEntryPoint = Number.isFinite(p.creationEntryPoint) ? p.creationEntryPoint : 0;
+  if (!opId || !kind || !jid) {
+    _txEmitResult(opId, kind, jid, { ok: false, stanzaId: "", error: "missing opId/kind/jid" }, null);
+    return;
+  }
+  try { waitready(); } catch (_) {}
+  try {
+    let res = null;
+    if (kind === "text") {
+      res = sendtext(jid, text, messageOrigin, creationEntryPoint);
+    } else if (kind === "quote") {
+      res = sendquotetext(jid, quoteStanzaId, text, participantJid, messageOrigin, creationEntryPoint);
+    } else if (kind === "image") {
+      res = sendimage(jid, String(p.caption || ""), String(p.path || p.imagePath || ""), messageOrigin);
+    } else if (kind === "video") {
+      res = sendvideo(jid, String(p.caption || ""), String(p.path || p.videoPath || ""), messageOrigin);
+    } else if (kind === "audio") {
+      res = sendaudio(jid, String(p.path || p.audioPath || ""), messageOrigin);
+    } else {
+      res = { ok: false, stanzaId: "", error: "unknown kind" };
+    }
+    _txEmitResult(opId, kind, jid, res, null);
+  } catch (e) {
+    _txEmitResult(opId, kind, jid, { ok: false, stanzaId: "", error: String(e) }, null);
+  }
+}
+
+function _txLoop() {
+  recv("qqw.tx_send", function (message) {
+    try { _txHandleMsg(message); } catch (_) {}
+    _txLoop();
+  }).wait();
+}
+
+try { setImmediate(_txLoop); } catch (_) {}
+
+const RX_STATE = { installed: false, error: null, installedAt: null, waVersion: null };
+const RX_SAMPLE = { enabled: false, msg_kind: "unknown", quoted_kind: "none", quoted_stanza_id: "" };
 
 function RX_objcAvailable() { try { return !!(ObjC && ObjC.available); } catch (_) { return false; } }
+
+function RX_getMainBundleVersionString() {
+  try {
+    if (!RX_objcAvailable()) return null;
+    const NSBundle = ObjC.classes.NSBundle;
+    if (!NSBundle) return null;
+    const b = NSBundle.mainBundle();
+    if (!b) return null;
+    const info = b.infoDictionary();
+    if (!info) return null;
+    const shortV = info.objectForKey_("CFBundleShortVersionString");
+    const buildV = info.objectForKey_("CFBundleVersion");
+    const s = shortV ? String(shortV) : "";
+    const bld = buildV ? String(buildV) : "";
+    if (s && bld) return s + "(" + bld + ")";
+    if (s) return s;
+    if (bld) return bld;
+    return null;
+  } catch (_) {
+    return null;
+  }
+}
 
 function RX_safeObjCInvoke(fn) {
   try {
@@ -1431,6 +1548,39 @@ function RX_bytesToHexChunks(u8, chunkChars) {
   }
 }
 
+function RX_bytesToBase64(u8) {
+  try {
+    if (!u8 || u8.length === 0) return "";
+    const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let out = "";
+    let i = 0;
+    while (i + 2 < u8.length) {
+      const n = ((u8[i] & 0xff) << 16) | ((u8[i + 1] & 0xff) << 8) | (u8[i + 2] & 0xff);
+      out += alphabet[(n >>> 18) & 63];
+      out += alphabet[(n >>> 12) & 63];
+      out += alphabet[(n >>> 6) & 63];
+      out += alphabet[n & 63];
+      i += 3;
+    }
+    const rem = u8.length - i;
+    if (rem === 1) {
+      const n = (u8[i] & 0xff) << 16;
+      out += alphabet[(n >>> 18) & 63];
+      out += alphabet[(n >>> 12) & 63];
+      out += "==";
+    } else if (rem === 2) {
+      const n = ((u8[i] & 0xff) << 16) | ((u8[i + 1] & 0xff) << 8);
+      out += alphabet[(n >>> 18) & 63];
+      out += alphabet[(n >>> 12) & 63];
+      out += alphabet[(n >>> 6) & 63];
+      out += "=";
+    }
+    return out;
+  } catch (_) {
+    return "";
+  }
+}
+
 function RX_jidToString(anyObj) {
   try {
     if (!RX_objcAvailable()) return null;
@@ -1522,6 +1672,266 @@ function RX_extractStanzaFieldsFromContext(ctxPtr) {
   }
 }
 
+function RX_readVarint(buf, i) {
+  let x = 0;
+  let shift = 0;
+  while (i < buf.length) {
+    const c = buf[i] & 0xff;
+    i += 1;
+    x |= (c & 0x7f) << shift;
+    if ((c & 0x80) === 0) return { v: x, i };
+    shift += 7;
+    if (shift > 70) break;
+  }
+  return { v: 0, i: buf.length, err: "badvarint" };
+}
+
+function RX_decodeUtf8(bytes) {
+  try {
+    let s = "";
+    let i = 0;
+    while (i < bytes.length) {
+      const b0 = bytes[i] & 0xff;
+      if (b0 < 0x80) {
+        s += String.fromCharCode(b0);
+        i += 1;
+        continue;
+      }
+      if ((b0 & 0xe0) === 0xc0 && i + 1 < bytes.length) {
+        const b1 = bytes[i + 1] & 0x3f;
+        const cp = ((b0 & 0x1f) << 6) | b1;
+        s += String.fromCharCode(cp);
+        i += 2;
+        continue;
+      }
+      if ((b0 & 0xf0) === 0xe0 && i + 2 < bytes.length) {
+        const b1 = bytes[i + 1] & 0x3f;
+        const b2 = bytes[i + 2] & 0x3f;
+        const cp = ((b0 & 0x0f) << 12) | (b1 << 6) | b2;
+        s += String.fromCharCode(cp);
+        i += 3;
+        continue;
+      }
+      i += 1;
+    }
+    return s;
+  } catch (_) {
+    return "";
+  }
+}
+
+function RX_isMostlyPrintable(bytes) {
+  try {
+    if (!bytes || bytes.length <= 0) return false;
+    let good = 0;
+    for (let i = 0; i < bytes.length; i++) {
+      const x = bytes[i] & 0xff;
+      if (x === 9 || x === 10 || x === 13 || (x >= 32 && x < 127)) good += 1;
+    }
+    return (good / bytes.length) > 0.9;
+  } catch (_) {
+    return false;
+  }
+}
+
+function RX_dumpProto(buf, depth, maxFields) {
+  const out = [];
+  try {
+    const lim = Math.max(50, Math.min(20000, Number(maxFields) || 2000));
+    let i = 0;
+    let n = 0;
+    const d = Math.max(0, Math.min(8, Number(depth) || 0));
+    while (i < buf.length && n < lim) {
+      const t = RX_readVarint(buf, i);
+      if (t.err) break;
+      const tag = t.v >>> 0;
+      i = t.i;
+      const field = tag >>> 3;
+      const wire = tag & 7;
+      const item = { field, wire };
+      if (wire === 0) {
+        const v = RX_readVarint(buf, i);
+        i = v.i;
+        item.varint = v.v;
+      } else if (wire === 1) {
+        if (i + 8 > buf.length) { item.error = "truncated64"; break; }
+        item.fixed64hex = buf.slice(i, i + 8).map(b => (b & 0xff).toString(16).padStart(2, "0")).join("");
+        i += 8;
+      } else if (wire === 2) {
+        const ln0 = RX_readVarint(buf, i);
+        if (ln0.err) break;
+        const ln = ln0.v >>> 0;
+        i = ln0.i;
+        if (i + ln > buf.length) { item.error = "truncatedLen"; break; }
+        const data = buf.slice(i, i + ln);
+        i += ln;
+        item.len = ln;
+        if (RX_isMostlyPrintable(data)) item.utf8 = RX_decodeUtf8(data);
+        item.hexHead = data.slice(0, 32).map(b => (b & 0xff).toString(16).padStart(2, "0")).join("");
+        if (ln >= 2 && d < 4) {
+          const nested = RX_dumpProto(data, d + 1, 300);
+          if (nested && nested.length) item.nested = nested;
+        }
+      } else if (wire === 5) {
+        if (i + 4 > buf.length) { item.error = "truncated32"; break; }
+        item.fixed32hex = buf.slice(i, i + 4).map(b => (b & 0xff).toString(16).padStart(2, "0")).join("");
+        i += 4;
+      } else {
+        item.error = "unsupportedWire:" + String(wire);
+        break;
+      }
+      out.push(item);
+      n += 1;
+    }
+  } catch (_) {}
+  return out;
+}
+
+function RX_findFirstFieldUtf8(fields, fieldNo) {
+  try {
+    for (let i = 0; i < fields.length; i++) {
+      const it = fields[i];
+      if (it && it.field === fieldNo && it.wire === 2 && typeof it.utf8 === "string" && it.utf8.length) return it.utf8;
+    }
+  } catch (_) {}
+  return "";
+}
+
+function RX_findFirstNested(fields, fieldNo) {
+  try {
+    for (let i = 0; i < fields.length; i++) {
+      const it = fields[i];
+      if (it && it.field === fieldNo && it.wire === 2 && it.nested && it.nested.length) return it.nested;
+    }
+  } catch (_) {}
+  return null;
+}
+
+function RX_extractPbFromProtoBytes(bytes) {
+  const pb = { kind: "", text: "", caption: "", directPath: "", mediaKey: "", fileEncSha256: "", fileSha256: "" };
+  const extra = { bytes32: [], mime: "", url: "", directPath: "", quoted: null, strings: [] };
+  try {
+    const top = RX_dumpProto(bytes, 0, 2000);
+    let text = RX_findFirstFieldUtf8(top, 1);
+    let quoted = null;
+    if (!text) {
+      const f6 = RX_findFirstNested(top, 6);
+      if (f6) {
+        const rt = RX_findFirstFieldUtf8(f6, 1);
+        if (rt) text = rt;
+        const f17 = RX_findFirstNested(f6, 17);
+        if (f17) {
+          const qStanza = RX_findFirstFieldUtf8(f17, 1);
+          const qChat = RX_findFirstFieldUtf8(f17, 2);
+          const f3 = RX_findFirstNested(f17, 3);
+          const qText = f3 ? RX_findFirstFieldUtf8(f3, 1) : "";
+          if (qStanza || qChat || qText) quoted = { stanzaId: qStanza, chatJid: qChat, text: qText };
+        }
+      }
+    }
+    if (text) {
+      pb.kind = "text";
+      pb.text = text;
+    }
+    if (quoted) extra.quoted = quoted;
+
+    const bytes32 = [];
+    const strings = [];
+    const scan = (fields) => {
+      for (let i = 0; i < fields.length; i++) {
+        const it = fields[i];
+        if (!it || it.wire !== 2) continue;
+        if (typeof it.utf8 === "string" && it.utf8.length) {
+          if (strings.length < 50) strings.push(it.utf8);
+        }
+        if (typeof it.len === "number" && it.len === 32 && typeof it.hexHead === "string" && it.hexHead.length >= 64) {
+          if (bytes32.length < 20) bytes32.push(it.hexHead);
+        }
+        if (it.nested && it.nested.length) scan(it.nested);
+      }
+    };
+    scan(top);
+    extra.bytes32 = bytes32;
+    extra.strings = strings.slice(0, 20);
+
+    const pick = (pred) => {
+      for (let i = 0; i < strings.length; i++) {
+        const s = String(strings[i] || "");
+        if (pred(s)) return s;
+      }
+      return "";
+    };
+    const mime = pick(s => s.indexOf("/") !== -1 && s.length <= 40 && (s.startsWith("image/") || s.startsWith("video/") || s.startsWith("audio/") || s.startsWith("application/")));
+    if (mime) extra.mime = mime;
+    const url = pick(s => s.startsWith("https://mmg.whatsapp.net/") || s.startsWith("http://mmg.whatsapp.net/"));
+    if (url) extra.url = url;
+    const directPath = pick(s => s.startsWith("/o1/v/") || s.startsWith("/v/t62") || s.indexOf("/o1/v/") !== -1 || s.indexOf("/v/t62") !== -1);
+    if (directPath) extra.directPath = directPath;
+
+    if (!pb.kind) {
+      if (mime.startsWith("image/")) pb.kind = "image";
+      else if (mime.startsWith("video/")) pb.kind = "video";
+      else if (mime.startsWith("audio/")) pb.kind = "audio";
+    }
+    if (!pb.directPath && extra.directPath) pb.directPath = extra.directPath;
+    if (!pb.directPath && extra.url) {
+      try {
+        const u = String(extra.url);
+        const p = u.replace(/^https?:\/\/mmg\.whatsapp\.net\//, "/");
+        const q = p.indexOf("?");
+        pb.directPath = q >= 0 ? p.slice(0, q) : p;
+      } catch (_) {}
+    }
+  } catch (_) {}
+  return { pb, extra };
+}
+
+function RX_scoreProtoBytes(bytes) {
+  try {
+    if (!bytes || !bytes.length) return { score: -1, parsed: null, hasField35: false };
+    const top = RX_dumpProto(bytes, 0, 800);
+    const has35 = !!RX_findFirstNested(top, 35);
+    const parsed = RX_extractPbFromProtoBytes(bytes);
+    let score = 0;
+    if (parsed && parsed.pb && parsed.pb.kind) score += 10;
+    if (parsed && parsed.pb && parsed.pb.text) score += 6;
+    if (parsed && parsed.extra && parsed.extra.quoted) score += 6;
+    if (parsed && parsed.extra && parsed.extra.mime) score += 4;
+    if (parsed && parsed.extra && (parsed.extra.directPath || parsed.extra.url)) score += 4;
+    if (has35) score += 2;
+    return { score, parsed, hasField35: has35 };
+  } catch (_) {
+    return { score: -1, parsed: null, hasField35: false };
+  }
+}
+
+function RX_pickBestNSDataCandidate(cands) {
+  try {
+    let best = null;
+    for (let i = 0; i < cands.length; i++) {
+      const c = cands[i];
+      if (!c || !c.data || !c.data.bytes || !c.data.bytes.length) continue;
+      const scored = RX_scoreProtoBytes(c.data.bytes);
+      const len = c.data.bytes.length | 0;
+      const key = { score: scored.score, len, source: c.source, data: c.data, bytes: c.data.bytes, parsed: scored.parsed };
+      if (!best) {
+        best = key;
+        continue;
+      }
+      if (key.score > best.score) {
+        best = key;
+        continue;
+      }
+      if (key.score === best.score && key.len > 0 && best.len > 0 && key.len < best.len) {
+        best = key;
+      }
+    }
+    return best;
+  } catch (_) {
+    return null;
+  }
+}
+
 const RX_CONFIG = {
   moduleNameHints: ["WhatsApp", "WhatsAppDecrypted", "WhatsApp_Decrypted"],
   rva: 0x35B1CE4,
@@ -1529,13 +1939,16 @@ const RX_CONFIG = {
     "reallyProcessResultsAfterSignalForContext:plaintextProtobuf:originalMessageData:notificationBehavior:journalID:error:retryCount:origin:reportEmptyPlaintextError:",
     "processResultsAfterSignalForContext:plaintextProtobuf:originalMessageData:notificationBehavior:journalID:error:retryCount:origin:reportEmptyPlaintextError:",
   ],
-  limits: { maxEvents: 800, maxLinesPerSecond: 60 },
-  protobuf: { hardCapBytes: 4 * 1024 * 1024, hexChunkChars: 12000, alwaysEmitHex: true },
+  limits: { maxEvents: 0, maxLinesPerSecond: 60 },
+  protobuf: { hardCapBytes: 256 * 1024, alwaysEmitB64: true },
 };
 
 function RX_install() {
   try {
     if (!RX_objcAvailable()) throw new Error("ObjC unavailable");
+    if (!RX_STATE.waVersion) {
+      try { RX_STATE.waVersion = RX_getMainBundleVersionString(); } catch (_) {}
+    }
     const mod = RX_pickModuleByHints(RX_CONFIG.moduleNameHints);
     if (!mod || !mod.base) throw new Error("module not found");
     const addr = mod.base.add(ptr(Number(RX_CONFIG.rva) || 0));
@@ -1547,7 +1960,8 @@ function RX_install() {
     Interceptor.attach(addr, {
       onEnter(args) {
         try {
-          if (events >= RX_CONFIG.limits.maxEvents) return;
+          const maxEvents = Number(RX_CONFIG.limits.maxEvents) || 0;
+          if (maxEvents > 0 && events >= maxEvents) return;
           const tid = Process.getCurrentThreadId();
           if (reentry[tid]) return;
           reentry[tid] = 1;
@@ -1568,23 +1982,32 @@ function RX_install() {
           }
 
           const ctxPtr = args[2];
+          const arg3Ptr = args[3];
           const arg4Ptr = args[4];
           const arg5Ptr = args[5];
 
           const doWork = () => {
             try {
               const stanza = RX_extractStanzaFieldsFromContext(ctxPtr);
-              let data = RX_tryReadNSDataAll(arg4Ptr, RX_CONFIG.protobuf.hardCapBytes);
-              let source = "arg4";
-              if (!data) {
-                data = RX_tryReadNSDataAll(arg5Ptr, RX_CONFIG.protobuf.hardCapBytes);
-                source = "arg5";
-              }
+              const cand3 = RX_tryReadNSDataAll(arg3Ptr, RX_CONFIG.protobuf.hardCapBytes);
+              const cand4 = RX_tryReadNSDataAll(arg4Ptr, RX_CONFIG.protobuf.hardCapBytes);
+              const cand5 = RX_tryReadNSDataAll(arg5Ptr, RX_CONFIG.protobuf.hardCapBytes);
+              const best = RX_pickBestNSDataCandidate([
+                { source: "arg3", data: cand3 },
+                { source: "arg4", data: cand4 },
+                { source: "arg5", data: cand5 },
+              ]);
+              const data = best ? best.data : (cand3 || cand4 || cand5);
+              const source = best ? best.source : (cand3 ? "arg3" : (cand4 ? "arg4" : (cand5 ? "arg5" : null)));
+              const bytes = best && best.bytes ? best.bytes : (data ? data.bytes : null);
+              const b64 = (bytes && RX_CONFIG.protobuf.alwaysEmitB64) ? RX_bytesToBase64(bytes) : "";
               const proto = data ? {
                 len: data.totalLen,
                 truncated: data.truncated,
-                hexChunks: RX_CONFIG.protobuf.alwaysEmitHex ? RX_bytesToHexChunks(data.bytes, RX_CONFIG.protobuf.hexChunkChars) : null,
+                b64: b64 || null,
+                hexChunks: null,
               } : null;
+              const parsed = best && best.parsed ? best.parsed : ((bytes && bytes.length) ? RX_extractPbFromProtoBytes(bytes) : null);
 
               const chatJID = stanza.chatJID ? String(stanza.chatJID) : "";
               const stanzaId = stanza.stanzaId ? String(stanza.stanzaId) : "";
@@ -1610,10 +2033,28 @@ function RX_install() {
                     uniqueKey: uniqueKey,
                   },
                   protobuf: proto,
-                  diag: { cmdSel: cmdSel ? String(cmdSel) : null, protobufSource: proto ? source : null },
+                  diag: { cmdSel: cmdSel ? String(cmdSel) : null, protobufSource: proto ? source : null, waVersion: RX_STATE.waVersion ? String(RX_STATE.waVersion) : null },
                   rawType: "wa.recv.native_post_decrypt.pinned_style",
                 },
               });
+              if (RX_SAMPLE.enabled) {
+                send({
+                  type: "qqw.sample",
+                  event_id: 0,
+                  device_id: "",
+                  wa_version: RX_STATE.waVersion ? String(RX_STATE.waVersion) : "",
+                  script_build: SCRIPT_BUILD_ID,
+                  wa_event_type: "wa.recv.update",
+                  chat_jid: chatJID,
+                  stanza_id: stanzaId,
+                  msg_kind: String(RX_SAMPLE.msg_kind || "unknown"),
+                  quoted_kind: String(RX_SAMPLE.quoted_kind || "none"),
+                  quoted_stanza_id: String(RX_SAMPLE.quoted_stanza_id || ""),
+                  protobuf_len: data ? (data.totalLen | 0) : 0,
+                  protobuf_truncated: !!(data && data.truncated),
+                  protobuf_b64: b64 || ""
+                });
+              }
             } catch (_) {}
           };
 
@@ -1640,4 +2081,3 @@ function RX_install() {
 setImmediate(() => {
   try { RX_install(); } catch (_) {}
 });
-
