@@ -16,6 +16,8 @@ typedef struct {
 static GMutex g_script_mu;
 static FridaScript *g_script = NULL;
 
+static gchar * qqw_strdup_printf2(const gchar *prefix, const gchar *msg);
+
 static void qqw_set_script(FridaScript *script) {
   g_mutex_lock(&g_script_mu);
   if (g_script != NULL) {
@@ -47,14 +49,7 @@ static int qqw_post_json(const char *json, char **error_out) {
     *error_out = g_strdup("post: script not ready");
     return 2;
   }
-  GError *error = NULL;
-  frida_script_post_sync(g_script, json, NULL, NULL, &error);
-  if (error != NULL) {
-    *error_out = qqw_strdup_printf2("post: ", error->message);
-    g_error_free(error);
-    g_mutex_unlock(&g_script_mu);
-    return 2;
-  }
+  frida_script_post(g_script, json, NULL);
   g_mutex_unlock(&g_script_mu);
   return 0;
 }
