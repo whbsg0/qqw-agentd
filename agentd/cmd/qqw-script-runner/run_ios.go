@@ -147,7 +147,13 @@ static int qqw_run(const char *address, const char *process_name, const char *bu
       for (;;) {
         if (error != NULL) { g_error_free(error); error = NULL; }
         FridaApplication *front = frida_device_get_frontmost_application_sync(device, fopts, NULL, &error);
-        if (error == NULL && front != NULL) {
+        if (error != NULL) {
+          fprintf(stderr, "frontmost query failed: %s\n", error->message);
+          g_error_free(error);
+          error = NULL;
+          break;
+        }
+        if (front != NULL) {
           const gchar *fid = frida_application_get_identifier(front);
           const gchar *fname = frida_application_get_name(front);
           gboolean ok = FALSE;
@@ -155,20 +161,10 @@ static int qqw_run(const char *address, const char *process_name, const char *bu
           if (!ok && fname != NULL && g_strcmp0(fname, proc) == 0) ok = TRUE;
           g_object_unref(front);
           if (ok) break;
-        } else if (front != NULL) {
-          g_object_unref(front);
         }
-        if (g_get_monotonic_time() >= deadline) {
-          if (error != NULL) {
-            *error_out = qqw_strdup_printf2("frontmost: ", error->message);
-            g_error_free(error);
-          } else {
-            *error_out = g_strdup("frontmost: timeout waiting for target app");
-          }
-          g_object_unref(device);
-          g_object_unref(manager);
-          g_object_unref(fopts);
-          return 2;
+        if (wait_foreground_ms <= 0 || g_get_monotonic_time() >= deadline) {
+          fprintf(stderr, "frontmost: timeout waiting for target app (ignored)\n");
+          break;
         }
         g_usleep(200000);
       }
