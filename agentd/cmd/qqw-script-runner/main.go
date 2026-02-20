@@ -1,10 +1,21 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"flag"
 	"io"
 	"os"
+	"regexp"
 	"strings"
+	"time"
+)
+
+var (
+	runnerStartedAtMs  int64
+	runnerScriptPath   string
+	runnerScriptSha256 string
+	runnerScriptBuild  string
 )
 
 func main() {
@@ -49,11 +60,19 @@ func main() {
 		_, _ = io.WriteString(os.Stderr, "script read failed\n")
 		os.Exit(2)
 	}
+	runnerStartedAtMs = time.Now().UnixMilli()
+	runnerScriptPath = scriptPath
+	sum := sha256.Sum256(scriptBytes)
+	runnerScriptSha256 = hex.EncodeToString(sum[:])
+	re := regexp.MustCompile(`\bSCRIPT_BUILD_ID\s*=\s*"([^"]+)"`)
+	if m := re.FindSubmatch(scriptBytes); len(m) == 2 {
+		runnerScriptBuild = strings.TrimSpace(string(m[1]))
+	}
 	if rpcAddr != "" {
 		go startRPCServer(rpcAddr)
 	}
 	if err := run(fridaHost, fridaPort, processName, bundleID, requireForeground, waitForegroundMs, string(scriptBytes), eventsURL); err != nil {
-		_, _ = io.WriteString(os.Stderr, err.Error()+"\n")
+		_, _ = io.WriteString(os.Stderr, "inject failed: "+err.Error()+"\n")
 		os.Exit(2)
 	}
 }

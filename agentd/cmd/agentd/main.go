@@ -152,6 +152,16 @@ type TxSendPayload struct {
 	TimeoutMs          int    `json:"timeoutMs,omitempty"`
 }
 
+type TxMsgActionPayload struct {
+	OpID           string `json:"opId"`
+	Action         string `json:"action"`
+	JID            string `json:"jid"`
+	StanzaID       string `json:"stanzaId"`
+	Text           string `json:"text,omitempty"`
+	ParticipantJID string `json:"participantJid,omitempty"`
+	TimeoutMs      int    `json:"timeoutMs,omitempty"`
+}
+
 type Agent struct {
 	cfgMu sync.RWMutex
 	cfg   Config
@@ -191,6 +201,8 @@ type Agent struct {
 	runnerMu  sync.Mutex
 	runnerCmd *exec.Cmd
 	runnerPid atomic.Int64
+
+	eventQueue *EventQueue
 }
 
 type Tunnel struct {
@@ -235,9 +247,11 @@ func main() {
 		tunnels:      make(map[string]*Tunnel),
 		startedAt:    time.Now(),
 		reconnectNow: make(chan struct{}, 1),
+		eventQueue:   NewEventQueue(filepath.Join(filepath.Dir(cfg.DeviceIDPath), "events")),
 	}
 
 	a.startControlServer(cfgPath)
+	go a.eventQueue.Run(context.Background(), deviceID, a.getCfg)
 	a.runForever()
 }
 
@@ -546,57 +560,17 @@ func (a *Agent) startControlServer(cfgPath string) {
 			return
 		}
 		cfg := a.getCfg()
-		base := serverHTTPBase(cfg.ServerURL)
-		if base == "" {
-			writeJSON(w, http.StatusServiceUnavailable, map[string]any{"ok": false, "error": "serverUrl invalid"})
-			return
-		}
 		if strings.TrimSpace(cfg.DeviceSecret) == "" {
-			writeJSON(w, http.StatusServiceUnavailable, map[string]any{"ok": false, "error": "deviceSecret missing"})
-			return
+			writeJSON(w, http.StatusOK, map[string]any{"ok": true, "queued": true, "warning": "deviceSecret missing"})
 		}
 		body, err := io.ReadAll(io.LimitReader(r.Body, 16<<20))
 		if err != nil || len(body) == 0 {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "invalid body"})
 			return
 		}
-		target := fmt.Sprintf("%s/api/device/%s/events", base, url.PathEscape(a.deviceID))
-		ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
-		defer cancel()
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, target, bytes.NewReader(body))
-		if err != nil {
-			writeJSON(w, http.StatusBadGateway, map[string]any{"ok": false, "error": err.Error()})
-			return
-		}
-		req.Header.Set("X-Device-Id", a.deviceID)
-		req.Header.Set("X-Device-Secret", cfg.DeviceSecret)
-		ct := strings.TrimSpace(r.Header.Get("Content-Type"))
-		if ct == "" {
-			ct = "application/json"
-		}
-		req.Header.Set("Content-Type", ct)
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			writeJSON(w, http.StatusBadGateway, map[string]any{"ok": false, "error": err.Error()})
-			return
-		}
-		defer resp.Body.Close()
-		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-		if resp.StatusCode != http.StatusOK {
-			msg := strings.TrimSpace(string(respBody))
-			if msg == "" {
-				msg = resp.Status
-			}
-			writeJSON(w, resp.StatusCode, map[string]any{"ok": false, "error": msg})
-			return
-		}
-		var out any
-		if err := json.Unmarshal(respBody, &out); err != nil {
-			writeJSON(w, http.StatusBadGateway, map[string]any{"ok": false, "error": "invalid json"})
-			return
-		}
 		a.scriptLastEventTS.Store(time.Now().UnixMilli())
-		writeJSON(w, http.StatusOK, out)
+		a.eventQueue.Enqueue(body)
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "queued": true})
 	})
 
 	mux.HandleFunc("/script/status", func(w http.ResponseWriter, r *http.Request) {
@@ -1240,6 +1214,8 @@ func (a *Agent) readLoop(ctx context.Context, ws *websocket.Conn, sessionID stri
 			go a.handleDbSyncStart(in)
 		case "tx_send":
 			go a.handleTxSend(in)
+		case "tx_msg_action":
+			go a.handleTxMsgAction(in)
 		}
 	}
 }
@@ -1302,6 +1278,64 @@ func (a *Agent) handleTxSend(in Envelope) {
 		return
 	}
 	a.logf("tx_send: dispatched opId=%s kind=%s jid=%s", p.OpID, p.Kind, p.JID)
+}
+
+func (a *Agent) handleTxMsgAction(in Envelope) {
+	var p TxMsgActionPayload
+	if err := json.Unmarshal(in.Payload, &p); err != nil {
+		a.logf("tx_msg_action: invalid payload: %v", err)
+		return
+	}
+	p.OpID = strings.TrimSpace(p.OpID)
+	p.Action = strings.TrimSpace(p.Action)
+	p.JID = strings.TrimSpace(p.JID)
+	p.StanzaID = strings.TrimSpace(p.StanzaID)
+	p.Text = strings.TrimSpace(p.Text)
+	p.ParticipantJID = strings.TrimSpace(p.ParticipantJID)
+	if p.OpID == "" || p.Action == "" || p.JID == "" || p.StanzaID == "" {
+		a.logf("tx_msg_action: missing opId/action/jid/stanzaId")
+		return
+	}
+	if p.TimeoutMs <= 0 {
+		p.TimeoutMs = 20_000
+	}
+	if a.runnerPid.Load() == 0 {
+		_ = a.startRunner()
+	}
+	rpcURL := "http://127.0.0.1:17172/rpc/msg/action"
+	body, _ := json.Marshal(map[string]any{
+		"opId":           p.OpID,
+		"action":         p.Action,
+		"jid":            p.JID,
+		"stanzaId":       p.StanzaID,
+		"text":           p.Text,
+		"participantJid": p.ParticipantJID,
+		"timeoutMs":      p.TimeoutMs,
+	})
+	cctx, cancel := context.WithTimeout(context.Background(), time.Duration(p.TimeoutMs+3000)*time.Millisecond)
+	defer cancel()
+	req, err := http.NewRequestWithContext(cctx, http.MethodPost, rpcURL, bytes.NewReader(body))
+	if err != nil {
+		a.logf("tx_msg_action: build request failed: %v", err)
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		a.logf("tx_msg_action: rpc failed: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		bs, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		msg := strings.TrimSpace(string(bs))
+		if msg == "" {
+			msg = resp.Status
+		}
+		a.logf("tx_msg_action: rpc status=%d err=%s", resp.StatusCode, msg)
+		return
+	}
+	a.logf("tx_msg_action: dispatched opId=%s action=%s jid=%s stanzaId=%s", p.OpID, p.Action, p.JID, p.StanzaID)
 }
 
 func (a *Agent) handleDbSyncStart(in Envelope) {

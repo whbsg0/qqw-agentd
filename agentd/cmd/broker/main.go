@@ -85,6 +85,16 @@ type TxSendPayload struct {
 	TimeoutMs          int    `json:"timeoutMs,omitempty"`
 }
 
+type TxMsgActionPayload struct {
+	OpID           string `json:"opId"`
+	Action         string `json:"action"`
+	JID            string `json:"jid"`
+	StanzaID       string `json:"stanzaId"`
+	Text           string `json:"text,omitempty"`
+	ParticipantJID string `json:"participantJid,omitempty"`
+	TimeoutMs      int    `json:"timeoutMs,omitempty"`
+}
+
 type AgentSession struct {
 	deviceID string
 	session  string
@@ -621,6 +631,56 @@ on conflict (device_id) do update set
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 		return
 	}
+	if len(parts) == 3 && parts[1] == "tx" && parts[2] == "msg_action" {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		deviceID := strings.TrimSpace(parts[0])
+		if deviceID == "" {
+			http.Error(w, "deviceId required", http.StatusBadRequest)
+			return
+		}
+		sess := b.getSession(deviceID)
+		if sess == nil {
+			http.Error(w, "device offline", http.StatusNotFound)
+			return
+		}
+		var req TxMsgActionPayload
+		if err := readJSON(r, &req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		req.OpID = strings.TrimSpace(req.OpID)
+		req.Action = strings.TrimSpace(req.Action)
+		req.JID = strings.TrimSpace(req.JID)
+		req.StanzaID = strings.TrimSpace(req.StanzaID)
+		req.Text = strings.TrimSpace(req.Text)
+		req.ParticipantJID = strings.TrimSpace(req.ParticipantJID)
+		if req.OpID == "" || req.Action == "" || req.JID == "" || req.StanzaID == "" {
+			http.Error(w, "opId/action/jid/stanzaId required", http.StatusBadRequest)
+			return
+		}
+		if req.TimeoutMs <= 0 {
+			req.TimeoutMs = 20_000
+		}
+		payload, _ := json.Marshal(req)
+		env := Envelope{
+			V:        1,
+			Type:     "tx_msg_action",
+			DeviceID: deviceID,
+			Session:  sess.session,
+			TS:       time.Now().UnixMilli(),
+			Payload:  payload,
+		}
+		if err := sess.send(r.Context(), env); err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		logJSON("tx_msg_action_dispatched", map[string]any{"deviceId": deviceID, "opId": req.OpID, "action": req.Action, "jid": req.JID, "stanzaId": req.StanzaID})
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+		return
+	}
 	http.Error(w, "not found", http.StatusNotFound)
 }
 
@@ -804,6 +864,9 @@ func (b *Broker) handleDeviceUpload(w http.ResponseWriter, r *http.Request) {
 	req.Header.Set("Authorization", "Bearer "+b.brokerAdminToken)
 	if ct := r.Header.Get("Content-Type"); ct != "" {
 		req.Header.Set("Content-Type", ct)
+	}
+	if ce := r.Header.Get("Content-Encoding"); ce != "" {
+		req.Header.Set("Content-Encoding", ce)
 	}
 
 	resp, err := http.DefaultClient.Do(req)

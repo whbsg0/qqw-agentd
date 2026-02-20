@@ -1297,6 +1297,7 @@ function _txEmitResult(opId, kind, jid, res, extraErr) {
       build: SCRIPT_BUILD_ID,
       ts: Date.now(),
       op_id: String(opId || ""),
+      opId: String(opId || ""),
       kind: String(kind || ""),
       jid: String(jid || ""),
       ok: ok,
@@ -1350,6 +1351,63 @@ function _txLoop() {
 }
 
 try { setImmediate(_txLoop); } catch (_) {}
+
+function _msgEmitResult(opId, action, jid, stanzaId, res, extraErr) {
+  try {
+    const ok = !!(res && res.ok);
+    const err = ok ? "" : String((res && res.error) ? res.error : (extraErr ? extraErr : "failed"));
+    send({
+      type: "wa.tx.msg_action.result",
+      build: SCRIPT_BUILD_ID,
+      ts: Date.now(),
+      op_id: String(opId || ""),
+      opId: String(opId || ""),
+      action: String(action || ""),
+      jid: String(jid || ""),
+      stanzaId: String(stanzaId || ""),
+      ok: ok,
+      error: err
+    });
+  } catch (_) {}
+}
+
+function _msgHandle(message) {
+  const p = message && message.payload ? message.payload : (message || {});
+  const opId = String(p.opId || p.op_id || "");
+  const action = String(p.action || "");
+  const jid = String(p.jid || p.chatJid || "");
+  const stanzaId = String(p.stanzaId || p.targetStanzaId || "");
+  const text = String(p.text || "");
+  if (!opId || !action || !jid || !stanzaId) {
+    _msgEmitResult(opId, action, jid, stanzaId, { ok: false, error: "missing opId/action/jid/stanzaId" }, null);
+    return;
+  }
+  try { waitready(); } catch (_) {}
+  try {
+    let res = null;
+    if (action === "edit") {
+      res = { ok: false, error: "not_implemented" };
+    } else if (action === "delete") {
+      res = { ok: false, error: "not_implemented" };
+    } else if (action === "revoke") {
+      res = { ok: false, error: "not_implemented" };
+    } else {
+      res = { ok: false, error: "unknown action" };
+    }
+    _msgEmitResult(opId, action, jid, stanzaId, res, null);
+  } catch (e) {
+    _msgEmitResult(opId, action, jid, stanzaId, { ok: false, error: String(e) }, null);
+  }
+}
+
+function _msgLoop() {
+  recv("qqw.msg_action", function (message) {
+    try { _msgHandle(message); } catch (_) {}
+    _msgLoop();
+  }).wait();
+}
+
+try { setImmediate(_msgLoop); } catch (_) {}
 
 const RX_STATE = { installed: false, error: null, installedAt: null, waVersion: null };
 const RX_SAMPLE = { enabled: false, msg_kind: "unknown", quoted_kind: "none", quoted_stanza_id: "" };
