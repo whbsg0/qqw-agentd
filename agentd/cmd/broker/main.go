@@ -95,6 +95,18 @@ type TxMsgActionPayload struct {
 	TimeoutMs      int    `json:"timeoutMs,omitempty"`
 }
 
+type TxAvatarURLPayload struct {
+	OpID      string `json:"opId"`
+	JID       string `json:"jid"`
+	FullSize  bool   `json:"fullSize,omitempty"`
+	TimeoutMs int    `json:"timeoutMs,omitempty"`
+}
+
+type TxSelfCardPayload struct {
+	OpID      string `json:"opId"`
+	TimeoutMs int    `json:"timeoutMs,omitempty"`
+}
+
 type AgentSession struct {
 	deviceID string
 	session  string
@@ -678,6 +690,97 @@ on conflict (device_id) do update set
 			return
 		}
 		logJSON("tx_msg_action_dispatched", map[string]any{"deviceId": deviceID, "opId": req.OpID, "action": req.Action, "jid": req.JID, "stanzaId": req.StanzaID})
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+		return
+	}
+	if len(parts) == 3 && parts[1] == "tx" && parts[2] == "avatar_url" {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		deviceID := strings.TrimSpace(parts[0])
+		if deviceID == "" {
+			http.Error(w, "deviceId required", http.StatusBadRequest)
+			return
+		}
+		sess := b.getSession(deviceID)
+		if sess == nil {
+			http.Error(w, "device offline", http.StatusNotFound)
+			return
+		}
+		var req TxAvatarURLPayload
+		if err := readJSON(r, &req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		req.OpID = strings.TrimSpace(req.OpID)
+		req.JID = strings.TrimSpace(req.JID)
+		if req.OpID == "" || req.JID == "" {
+			http.Error(w, "opId/jid required", http.StatusBadRequest)
+			return
+		}
+		if req.TimeoutMs <= 0 {
+			req.TimeoutMs = 20_000
+		}
+		payload, _ := json.Marshal(req)
+		env := Envelope{
+			V:        1,
+			Type:     "tx_avatar_url",
+			DeviceID: deviceID,
+			Session:  sess.session,
+			TS:       time.Now().UnixMilli(),
+			Payload:  payload,
+		}
+		if err := sess.send(r.Context(), env); err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		logJSON("tx_avatar_url_dispatched", map[string]any{"deviceId": deviceID, "opId": req.OpID, "jid": req.JID})
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+		return
+	}
+	if len(parts) == 3 && parts[1] == "tx" && parts[2] == "self_card" {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		deviceID := strings.TrimSpace(parts[0])
+		if deviceID == "" {
+			http.Error(w, "deviceId required", http.StatusBadRequest)
+			return
+		}
+		sess := b.getSession(deviceID)
+		if sess == nil {
+			http.Error(w, "device offline", http.StatusNotFound)
+			return
+		}
+		var req TxSelfCardPayload
+		if err := readJSON(r, &req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		req.OpID = strings.TrimSpace(req.OpID)
+		if req.OpID == "" {
+			http.Error(w, "opId required", http.StatusBadRequest)
+			return
+		}
+		if req.TimeoutMs <= 0 {
+			req.TimeoutMs = 20_000
+		}
+		payload, _ := json.Marshal(req)
+		env := Envelope{
+			V:        1,
+			Type:     "tx_self_card",
+			DeviceID: deviceID,
+			Session:  sess.session,
+			TS:       time.Now().UnixMilli(),
+			Payload:  payload,
+		}
+		if err := sess.send(r.Context(), env); err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		logJSON("tx_self_card_dispatched", map[string]any{"deviceId": deviceID, "opId": req.OpID})
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 		return
 	}

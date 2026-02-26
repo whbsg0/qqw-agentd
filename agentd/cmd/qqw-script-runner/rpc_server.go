@@ -30,6 +30,18 @@ type msgActionRPCReq struct {
 	TimeoutMs      int    `json:"timeoutMs,omitempty"`
 }
 
+type avatarURLRPCReq struct {
+	OpID      string `json:"opId"`
+	JID       string `json:"jid"`
+	FullSize  bool   `json:"fullSize,omitempty"`
+	TimeoutMs int    `json:"timeoutMs,omitempty"`
+}
+
+type selfCardRPCReq struct {
+	OpID      string `json:"opId"`
+	TimeoutMs int    `json:"timeoutMs,omitempty"`
+}
+
 func startRPCServer(addr string) {
 	addr = strings.TrimSpace(addr)
 	if addr == "" {
@@ -44,6 +56,8 @@ func startRPCServer(addr string) {
 	mux.HandleFunc("/rpc/tx/send", handleRPCTxSend)
 	mux.HandleFunc("/rpc/tx/status", handleRPCTxStatus)
 	mux.HandleFunc("/rpc/msg/action", handleRPCMsgAction)
+	mux.HandleFunc("/rpc/avatar/url", handleRPCAvatarURL)
+	mux.HandleFunc("/rpc/self/card", handleRPCSelfCard)
 	srv := &http.Server{
 		Addr:              addr,
 		Handler:           mux,
@@ -166,6 +180,83 @@ func handleRPCMsgAction(w http.ResponseWriter, r *http.Request) {
 			"text":           req.Text,
 			"participantJid": req.ParticipantJID,
 			"timeoutMs":      req.TimeoutMs,
+		},
+	}
+	b, _ := json.Marshal(msg)
+	if err := postToScriptJSON(string(b)); err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func handleRPCAvatarURL(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req avatarURLRPCReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+	req.OpID = strings.TrimSpace(req.OpID)
+	req.JID = strings.TrimSpace(req.JID)
+	if req.OpID == "" || req.JID == "" {
+		http.Error(w, "opId/jid required", http.StatusBadRequest)
+		return
+	}
+	if req.TimeoutMs <= 0 {
+		req.TimeoutMs = 20_000
+	}
+	if !scriptReady() {
+		http.Error(w, "script not ready", http.StatusServiceUnavailable)
+		return
+	}
+	msg := map[string]any{
+		"type": "qqw.avatar_url",
+		"payload": map[string]any{
+			"opId":      req.OpID,
+			"jid":       req.JID,
+			"fullSize":  req.FullSize,
+			"timeoutMs": req.TimeoutMs,
+		},
+	}
+	b, _ := json.Marshal(msg)
+	if err := postToScriptJSON(string(b)); err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func handleRPCSelfCard(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req selfCardRPCReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+	req.OpID = strings.TrimSpace(req.OpID)
+	if req.OpID == "" {
+		http.Error(w, "opId required", http.StatusBadRequest)
+		return
+	}
+	if req.TimeoutMs <= 0 {
+		req.TimeoutMs = 20_000
+	}
+	if !scriptReady() {
+		http.Error(w, "script not ready", http.StatusServiceUnavailable)
+		return
+	}
+	msg := map[string]any{
+		"type": "qqw.self_card",
+		"payload": map[string]any{
+			"opId":      req.OpID,
+			"timeoutMs": req.TimeoutMs,
 		},
 	}
 	b, _ := json.Marshal(msg)

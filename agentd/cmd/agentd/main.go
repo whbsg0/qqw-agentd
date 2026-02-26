@@ -162,6 +162,18 @@ type TxMsgActionPayload struct {
 	TimeoutMs      int    `json:"timeoutMs,omitempty"`
 }
 
+type TxAvatarURLPayload struct {
+	OpID      string `json:"opId"`
+	JID       string `json:"jid"`
+	FullSize  bool   `json:"fullSize,omitempty"`
+	TimeoutMs int    `json:"timeoutMs,omitempty"`
+}
+
+type TxSelfCardPayload struct {
+	OpID      string `json:"opId"`
+	TimeoutMs int    `json:"timeoutMs,omitempty"`
+}
+
 type Agent struct {
 	cfgMu sync.RWMutex
 	cfg   Config
@@ -1216,6 +1228,10 @@ func (a *Agent) readLoop(ctx context.Context, ws *websocket.Conn, sessionID stri
 			go a.handleTxSend(in)
 		case "tx_msg_action":
 			go a.handleTxMsgAction(in)
+		case "tx_avatar_url":
+			go a.handleTxAvatarURL(in)
+		case "tx_self_card":
+			go a.handleTxSelfCard(in)
 		}
 	}
 }
@@ -1336,6 +1352,105 @@ func (a *Agent) handleTxMsgAction(in Envelope) {
 		return
 	}
 	a.logf("tx_msg_action: dispatched opId=%s action=%s jid=%s stanzaId=%s", p.OpID, p.Action, p.JID, p.StanzaID)
+}
+
+func (a *Agent) handleTxAvatarURL(in Envelope) {
+	var p TxAvatarURLPayload
+	if err := json.Unmarshal(in.Payload, &p); err != nil {
+		a.logf("tx_avatar_url: invalid payload: %v", err)
+		return
+	}
+	p.OpID = strings.TrimSpace(p.OpID)
+	p.JID = strings.TrimSpace(p.JID)
+	if p.OpID == "" || p.JID == "" {
+		a.logf("tx_avatar_url: missing opId/jid")
+		return
+	}
+	if p.TimeoutMs <= 0 {
+		p.TimeoutMs = 20_000
+	}
+	if a.runnerPid.Load() == 0 {
+		_ = a.startRunner()
+	}
+	rpcURL := "http://127.0.0.1:17172/rpc/avatar/url"
+	body, _ := json.Marshal(map[string]any{
+		"opId":      p.OpID,
+		"jid":       p.JID,
+		"fullSize":  p.FullSize,
+		"timeoutMs": p.TimeoutMs,
+	})
+	cctx, cancel := context.WithTimeout(context.Background(), time.Duration(p.TimeoutMs+3000)*time.Millisecond)
+	defer cancel()
+	req, err := http.NewRequestWithContext(cctx, http.MethodPost, rpcURL, bytes.NewReader(body))
+	if err != nil {
+		a.logf("tx_avatar_url: build request failed: %v", err)
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		a.logf("tx_avatar_url: rpc failed: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		bs, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		msg := strings.TrimSpace(string(bs))
+		if msg == "" {
+			msg = resp.Status
+		}
+		a.logf("tx_avatar_url: rpc status=%d err=%s", resp.StatusCode, msg)
+		return
+	}
+	a.logf("tx_avatar_url: dispatched opId=%s jid=%s", p.OpID, p.JID)
+}
+
+func (a *Agent) handleTxSelfCard(in Envelope) {
+	var p TxSelfCardPayload
+	if err := json.Unmarshal(in.Payload, &p); err != nil {
+		a.logf("tx_self_card: invalid payload: %v", err)
+		return
+	}
+	p.OpID = strings.TrimSpace(p.OpID)
+	if p.OpID == "" {
+		a.logf("tx_self_card: missing opId")
+		return
+	}
+	if p.TimeoutMs <= 0 {
+		p.TimeoutMs = 20_000
+	}
+	if a.runnerPid.Load() == 0 {
+		_ = a.startRunner()
+	}
+	rpcURL := "http://127.0.0.1:17172/rpc/self/card"
+	body, _ := json.Marshal(map[string]any{
+		"opId":      p.OpID,
+		"timeoutMs": p.TimeoutMs,
+	})
+	cctx, cancel := context.WithTimeout(context.Background(), time.Duration(p.TimeoutMs+3000)*time.Millisecond)
+	defer cancel()
+	req, err := http.NewRequestWithContext(cctx, http.MethodPost, rpcURL, bytes.NewReader(body))
+	if err != nil {
+		a.logf("tx_self_card: build request failed: %v", err)
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		a.logf("tx_self_card: rpc failed: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		bs, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		msg := strings.TrimSpace(string(bs))
+		if msg == "" {
+			msg = resp.Status
+		}
+		a.logf("tx_self_card: rpc status=%d err=%s", resp.StatusCode, msg)
+		return
+	}
+	a.logf("tx_self_card: dispatched opId=%s", p.OpID)
 }
 
 func (a *Agent) handleDbSyncStart(in Envelope) {

@@ -1243,6 +1243,9 @@ rpc.exports = {
   sendimage,
   sendvideo,
   sendaudio,
+  avatarurl,
+  selfnameactive,
+  selfcard,
   fileput_begin,
   fileput_chunk,
   fileput_end,
@@ -1306,6 +1309,337 @@ function _txEmitResult(opId, kind, jid, res, extraErr) {
     });
   } catch (_) {}
 }
+
+function _toUrlString(obj) {
+  try {
+    if (obj === null || obj === undefined) return "";
+    const o = obj && obj.handle ? obj : _safeObj(obj);
+    if (!o) return "";
+    try {
+      const s1 = String(o["- absoluteString"] ? o["- absoluteString"]() : "").trim();
+      if (s1.startsWith("http://") || s1.startsWith("https://")) return s1;
+    } catch (_) {}
+    try {
+      const s2 = String(o).trim();
+      if (s2.startsWith("http://") || s2.startsWith("https://")) return s2;
+      return s2;
+    } catch (_) {
+      return "";
+    }
+  } catch (_) {
+    return "";
+  }
+}
+
+function _getProfilePictureManagerFromCtx(ctxMain) {
+  try {
+    const ctx = ctxMain && ctxMain.handle ? ctxMain : _safeObj(ctxMain);
+    if (!ctx) return null;
+    if (_objcCanCall(ctx, "- profilePictureManager")) {
+      const v = _safeObj(ctx["- profilePictureManager"]());
+      if (v) return v;
+    }
+    try {
+      if (ctx.$ivars) {
+        const keys = Object.keys(ctx.$ivars || {});
+        for (let i = 0; i < keys.length; i++) {
+          const k = keys[i];
+          const kl = String(k || "").toLowerCase();
+          if (kl.indexOf("profilepicture") === -1 && kl.indexOf("profile_picture") === -1) continue;
+          const v = _safeObj(ctx.$ivars[k]);
+          if (v) return v;
+        }
+      }
+    } catch (_) {}
+  } catch (_) {}
+  return null;
+}
+
+function _makeAnyJIDFromString(jidStr) {
+  const s = String(jidStr || "").trim();
+  if (!s || s.indexOf("@") === -1) return null;
+  const ns = _ns(s);
+  if (!ns) return null;
+  try {
+    const WAJID = ObjC.classes.WAJID;
+    if (WAJID && _objcCanCall(WAJID, "+ ifValidWithStringRepresentation:")) {
+      const r = _safeObj(WAJID["+ ifValidWithStringRepresentation:"](ns));
+      if (r) return r;
+    }
+  } catch (_) {}
+  try {
+    const isLid = s.indexOf("@lid") !== -1;
+    const cls = isLid ? ObjC.classes.WALIDUserJID : ObjC.classes.WAUserJID;
+    if (cls && _objcCanCall(cls, "+ ifValidWithStringRepresentation:")) {
+      const r = _safeObj(cls["+ ifValidWithStringRepresentation:"](ns));
+      if (r) return r;
+    }
+  } catch (_) {}
+  return null;
+}
+
+function avatarurl(jid, fullSize) {
+  if (!ObjC.available) return { ok: false, build: SCRIPT_BUILD_ID, jid: String(jid || "").trim(), url: "", error: "objc_unavailable" };
+  const target = String(jid || "").trim();
+  if (!target) return { ok: false, build: SCRIPT_BUILD_ID, jid: "", url: "", error: "jid required" };
+  const core = _runOnMainQueueSync(() => _resolveCoreFixed(), 2500);
+  if (!core || !core.ok) return { ok: false, build: SCRIPT_BUILD_ID, jid: target, url: "", error: core ? core.error : "no context" };
+  const ppm = _getProfilePictureManagerFromCtx(core.ctxMain);
+  if (!ppm) return { ok: false, build: SCRIPT_BUILD_ID, jid: target, url: "", error: "profilePictureManager nil" };
+  const jidObj = _makeAnyJIDFromString(target);
+  if (!jidObj) return { ok: false, build: SCRIPT_BUILD_ID, jid: target, url: "", error: "invalid jid" };
+  const isFullSized = !!fullSize;
+  let urlObj = null;
+  try {
+    const sel = "- bestAvailablePictureURLForIdentifierProviding:isFullSized:";
+    if (_objcCanCall(ppm, sel)) {
+      urlObj = _safeObj(ppm[sel](jidObj, isFullSized));
+    }
+  } catch (_) {
+    urlObj = null;
+  }
+  const url = _toUrlString(urlObj).trim();
+  if (!url) return { ok: false, build: SCRIPT_BUILD_ID, jid: target, url: "", error: "no url" };
+  return { ok: true, build: SCRIPT_BUILD_ID, jid: target, url: url, fullSize: isFullSized };
+}
+
+function _extractDigits(s) {
+  try {
+    const x = String(s || "");
+    let out = "";
+    for (let i = 0; i < x.length; i++) {
+      const c = x.charCodeAt(i);
+      if (c >= 48 && c <= 57) out += x[i];
+    }
+    return out;
+  } catch (_) {
+    return "";
+  }
+}
+
+function _derivePhoneFromJid(jid) {
+  try {
+    const s = String(jid || "").trim();
+    if (!s) return "";
+    const at = s.indexOf("@");
+    const left = at >= 0 ? s.slice(0, at) : s;
+    if (!left) return "";
+    if (left.startsWith("a_")) return _extractDigits(left.slice(2));
+    const d = _extractDigits(left);
+    return d.length >= 8 ? d : "";
+  } catch (_) {
+    return "";
+  }
+}
+
+function _extractJidStringFromMaybeObj(v) {
+  try {
+    if (v === null || v === undefined) return "";
+    const s = String(v || "").trim();
+    if (s.indexOf("@") !== -1 && s.length < 128) return s;
+    return "";
+  } catch (_) {
+    return "";
+  }
+}
+
+function selfnameactive() {
+  if (!ObjC.available) return { ok: false, build: SCRIPT_BUILD_ID, selfJid: "", selfName: "", selfUsername: "", phone: "", error: "objc_unavailable" };
+  const core = _runOnMainQueueSync(() => _resolveCoreFixed(), 2500);
+  if (!core || !core.ok) return { ok: false, build: SCRIPT_BUILD_ID, selfJid: "", selfName: "", selfUsername: "", phone: "", error: core ? core.error : "no context" };
+  const ctx = core.ctxMain;
+  let selfName = "";
+  try {
+    const helpers = ObjC.classes.WAProfileNameHelpers;
+    const sel = "currentProfileNameWithUseDeviceNameIfNeeded:userContext:";
+    if (helpers && helpers["+ " + sel]) {
+      selfName = String(helpers["+ " + sel](1, ctx) || "").trim();
+    }
+  } catch (_) {}
+  let selfJid = "";
+  let selfUsername = "";
+  try {
+    const probes = [ctx];
+    try {
+      if (ctx && ctx["- accountProvider"]) {
+        const ap = _safeObj(ctx["- accountProvider"]());
+        if (ap) probes.push(ap);
+      }
+    } catch (_) {}
+    try {
+      if (ctx && ctx["- accountService"]) {
+        const as = _safeObj(ctx["- accountService"]());
+        if (as) probes.push(as);
+      }
+    } catch (_) {}
+    const jidSelectors = ["ownUserJID", "userJID", "currentUserJID", "myUserJID", "deviceJID"];
+    const usernameSelectors = ["currentUserUsername", "username", "currentUsername", "userName"];
+    for (let pi = 0; pi < probes.length; pi++) {
+      const o = probes[pi];
+      if (!o) continue;
+      try {
+        if (!selfJid && o.$ivars) {
+          const keys = Object.keys(o.$ivars || {});
+          for (let i = 0; i < keys.length; i++) {
+            const k = keys[i];
+            const kl = String(k || "").toLowerCase();
+            const v = o.$ivars[k];
+            if (!selfJid && (kl.indexOf("jid") !== -1 || kl.indexOf("userjid") !== -1)) {
+              const s = _extractJidStringFromMaybeObj(v);
+              if (s) selfJid = s;
+            }
+            if (!selfUsername && kl.indexOf("username") !== -1) {
+              const u = String(v || "").trim();
+              if (u && u.length <= 64) selfUsername = u;
+            }
+            if (selfJid && selfUsername) break;
+          }
+        }
+      } catch (_) {}
+      try {
+        if (!selfJid) {
+          for (let si = 0; si < jidSelectors.length; si++) {
+            const sel = jidSelectors[si];
+            if (!_objcCanCall(o, sel)) continue;
+            const v = o[sel]();
+            const s = _extractJidStringFromMaybeObj(v);
+            if (s) {
+              selfJid = s;
+              break;
+            }
+          }
+        }
+      } catch (_) {}
+      try {
+        if (!selfUsername) {
+          for (let si = 0; si < usernameSelectors.length; si++) {
+            const sel = usernameSelectors[si];
+            if (!_objcCanCall(o, sel)) continue;
+            const u = String(o[sel]() || "").trim();
+            if (u && u.length <= 64) {
+              selfUsername = u;
+              break;
+            }
+          }
+        }
+      } catch (_) {}
+      if (selfJid && selfUsername) break;
+    }
+  } catch (_) {}
+  const phone = _derivePhoneFromJid(selfJid);
+  return { ok: true, build: SCRIPT_BUILD_ID, selfJid: selfJid, selfName: selfName, selfUsername: selfUsername, phone: phone };
+}
+
+function selfcard() {
+  const h = selfnameactive();
+  if (!h || !h.ok) return { ok: false, build: SCRIPT_BUILD_ID, selfCard: null, error: h && h.error ? String(h.error) : "selfname failed" };
+  const selfJid = String(h.selfJid || "").trim();
+  if (!selfJid) return { ok: false, build: SCRIPT_BUILD_ID, selfCard: null, error: "selfJid empty" };
+  const a = avatarurl(selfJid, false);
+  const avatarUrl = a && a.ok ? String(a.url || "").trim() : "";
+  const err = (a && !a.ok) ? String(a.error || "avatarurl failed") : "";
+  return {
+    ok: true,
+    build: SCRIPT_BUILD_ID,
+    selfCard: {
+      selfJid: selfJid,
+      selfName: String(h.selfName || "").trim(),
+      selfUsername: String(h.selfUsername || "").trim(),
+      phone: String(h.phone || "").trim(),
+      avatarUrl: avatarUrl
+    },
+    error: err
+  };
+}
+
+function _avatarEmitResult(opId, jid, res, extraErr) {
+  try {
+    const ok = !!(res && res.ok);
+    const url = res && res.url ? String(res.url) : "";
+    const err = ok ? "" : String((res && res.error) ? res.error : (extraErr ? extraErr : "failed"));
+    send({
+      type: "wa.tx.avatar_url.result",
+      build: SCRIPT_BUILD_ID,
+      ts: Date.now(),
+      op_id: String(opId || ""),
+      opId: String(opId || ""),
+      jid: String(jid || ""),
+      ok: ok,
+      avatarUrl: url,
+      error: err
+    });
+  } catch (_) {}
+}
+
+function _avatarHandleMsg(message) {
+  const p = message && message.payload ? message.payload : (message || {});
+  const opId = String(p.opId || p.op_id || "");
+  const jid = String(p.jid || p.chatJid || "");
+  const fullSize = !!(p.fullSize || p.fullsize || p.isFullSized || p.full);
+  if (!opId || !jid) {
+    _avatarEmitResult(opId, jid, { ok: false, url: "", error: "missing opId/jid" }, null);
+    return;
+  }
+  try { waitready(); } catch (_) {}
+  try {
+    const res = avatarurl(jid, fullSize);
+    _avatarEmitResult(opId, jid, res, null);
+  } catch (e) {
+    _avatarEmitResult(opId, jid, { ok: false, url: "", error: String(e) }, null);
+  }
+}
+
+function _avatarLoop() {
+  recv("qqw.avatar_url", function (message) {
+    try { _avatarHandleMsg(message); } catch (_) {}
+    _avatarLoop();
+  }).wait();
+}
+
+try { setImmediate(_avatarLoop); } catch (_) {}
+
+function _selfCardEmitResult(opId, res, extraErr) {
+  try {
+    const ok = !!(res && res.ok);
+    const selfCard = (res && res.selfCard) ? res.selfCard : null;
+    const err = ok ? "" : String((res && res.error) ? res.error : (extraErr ? extraErr : "failed"));
+    send({
+      type: "wa.tx.self_card.result",
+      build: SCRIPT_BUILD_ID,
+      ts: Date.now(),
+      op_id: String(opId || ""),
+      opId: String(opId || ""),
+      ok: ok,
+      selfCard: selfCard,
+      error: err
+    });
+  } catch (_) {}
+}
+
+function _selfCardHandleMsg(message) {
+  const p = message && message.payload ? message.payload : (message || {});
+  const opId = String(p.opId || p.op_id || "");
+  if (!opId) {
+    _selfCardEmitResult(opId, { ok: false, selfCard: null, error: "missing opId" }, null);
+    return;
+  }
+  try { waitready(); } catch (_) {}
+  try {
+    const res = selfcard();
+    _selfCardEmitResult(opId, res, null);
+  } catch (e) {
+    _selfCardEmitResult(opId, { ok: false, selfCard: null, error: String(e) }, null);
+  }
+}
+
+function _selfCardLoop() {
+  recv("qqw.self_card", function (message) {
+    try { _selfCardHandleMsg(message); } catch (_) {}
+    _selfCardLoop();
+  }).wait();
+}
+
+try { setImmediate(_selfCardLoop); } catch (_) {}
 
 function _txHandleMsg(message) {
   const p = message && message.payload ? message.payload : (message || {});
