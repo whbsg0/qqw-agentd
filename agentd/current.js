@@ -4,7 +4,7 @@
   来源：wa_txrx_stable_unified_pinned.js（发送/接收全功能脚本）
   目标：不更改功能与逻辑，仅把“接收侧 send() 输出”改为长期稳定事件格式（与 qqw-contracts/device-events.md 对齐）
 */
-const SCRIPT_BUILD_ID = "2026-02-12.txrx.stable_unified_pinned.output_v1";
+const SCRIPT_BUILD_ID = "2026-02-26.txrx.stable_unified_pinned.output_v1";
 
 function _tid() {
   try { return Process.getCurrentThreadId(); } catch (_) { return 0; }
@@ -1295,6 +1295,8 @@ function _txEmitResult(opId, kind, jid, res, extraErr) {
     const ok = !!(res && res.ok);
     const stanzaId = res && res.stanzaId ? String(res.stanzaId) : "";
     const err = ok ? "" : String((res && res.error) ? res.error : (extraErr ? extraErr : "failed"));
+    const retryable = !!(res && res.retryable);
+    const errorCode = res && res.errorCode ? String(res.errorCode) : "";
     send({
       type: "wa.tx.send.result",
       build: SCRIPT_BUILD_ID,
@@ -1305,7 +1307,9 @@ function _txEmitResult(opId, kind, jid, res, extraErr) {
       jid: String(jid || ""),
       ok: ok,
       stanzaId: stanzaId,
-      error: err
+      error: err,
+      retryable: retryable,
+      errorCode: errorCode
     });
   } catch (_) {}
 }
@@ -1316,7 +1320,7 @@ function _toUrlString(obj) {
     const o = obj && obj.handle ? obj : _safeObj(obj);
     if (!o) return "";
     try {
-      const s1 = String(o["- absoluteString"] ? o["- absoluteString"]() : "").trim();
+      const s1 = String(o["absoluteString"] ? o["absoluteString"]() : (o["- absoluteString"] ? o["- absoluteString"]() : "")).trim();
       if (s1.startsWith("http://") || s1.startsWith("https://")) return s1;
     } catch (_) {}
     try {
@@ -1335,8 +1339,8 @@ function _getProfilePictureManagerFromCtx(ctxMain) {
   try {
     const ctx = ctxMain && ctxMain.handle ? ctxMain : _safeObj(ctxMain);
     if (!ctx) return null;
-    if (_objcCanCall(ctx, "- profilePictureManager")) {
-      const v = _safeObj(ctx["- profilePictureManager"]());
+    if (_objcCanCall(ctx, "profilePictureManager")) {
+      const v = _safeObj(ctx["profilePictureManager"]());
       if (v) return v;
     }
     try {
@@ -1361,6 +1365,31 @@ function _makeAnyJIDFromString(jidStr) {
   const ns = _ns(s);
   if (!ns) return null;
   try {
+    const WAUserJID = ObjC.classes.WAUserJID;
+    if (WAUserJID) {
+      if (WAUserJID["+ jidOrLIDWithString:"]) {
+        const r0 = _safeObj(WAUserJID.jidOrLIDWithString_(ns));
+        if (r0) return r0;
+      }
+      if (WAUserJID["+ withString:"]) {
+        const r1 = _safeObj(WAUserJID.withString_(ns));
+        if (r1) return r1;
+      }
+      if (WAUserJID["+ withJIDString:"]) {
+        const r2 = _safeObj(WAUserJID.withJIDString_(ns));
+        if (r2) return r2;
+      }
+      if (WAUserJID["+ userJIDWithString:"]) {
+        const r3 = _safeObj(WAUserJID.userJIDWithString_(ns));
+        if (r3) return r3;
+      }
+      if (WAUserJID["+ jidWithString:"]) {
+        const r4 = _safeObj(WAUserJID.jidWithString_(ns));
+        if (r4) return r4;
+      }
+    }
+  } catch (_) {}
+  try {
     const WAJID = ObjC.classes.WAJID;
     if (WAJID && _objcCanCall(WAJID, "+ ifValidWithStringRepresentation:")) {
       const r = _safeObj(WAJID["+ ifValidWithStringRepresentation:"](ns));
@@ -1378,29 +1407,89 @@ function _makeAnyJIDFromString(jidStr) {
   return null;
 }
 
-function avatarurl(jid, fullSize) {
+function avatarurl(jid, fullSize, timeoutMsOpt) {
   if (!ObjC.available) return { ok: false, build: SCRIPT_BUILD_ID, jid: String(jid || "").trim(), url: "", error: "objc_unavailable" };
   const target = String(jid || "").trim();
   if (!target) return { ok: false, build: SCRIPT_BUILD_ID, jid: "", url: "", error: "jid required" };
+  const timeoutMs = Number.isFinite(timeoutMsOpt) ? (timeoutMsOpt | 0) : 20000;
+  const deadlineMs = Date.now() + Math.max(1500, timeoutMs);
   const core = _runOnMainQueueSync(() => _resolveCoreFixed(), 2500);
   if (!core || !core.ok) return { ok: false, build: SCRIPT_BUILD_ID, jid: target, url: "", error: core ? core.error : "no context" };
   const ppm = _getProfilePictureManagerFromCtx(core.ctxMain);
   if (!ppm) return { ok: false, build: SCRIPT_BUILD_ID, jid: target, url: "", error: "profilePictureManager nil" };
   const jidObj = _makeAnyJIDFromString(target);
   if (!jidObj) return { ok: false, build: SCRIPT_BUILD_ID, jid: target, url: "", error: "invalid jid" };
-  const isFullSized = !!fullSize;
-  let urlObj = null;
+  let idpObj = jidObj;
   try {
-    const sel = "- bestAvailablePictureURLForIdentifierProviding:isFullSized:";
-    if (_objcCanCall(ppm, sel)) {
-      urlObj = _safeObj(ppm[sel](jidObj, isFullSized));
+    if (_objcHasSelector(jidObj, "profilePictureJID")) {
+      const pjid = _objcCallNoArg(jidObj, "profilePictureJID");
+      if (pjid) idpObj = pjid;
     }
-  } catch (_) {
-    urlObj = null;
+  } catch (_) {}
+
+  const selDirectPath = "MAIN_APP_requestBusinessProfilePictureDirectPathForIdentifierProviding:completion:";
+  let directPath = "";
+  let invokeErr = "";
+  let done = false;
+
+  let completion = null;
+  try {
+    completion = new ObjC.Block({
+      retType: "void",
+      argTypes: ["pointer", "pointer"],
+      implementation: function (p0, _p1) {
+        try {
+          let s = "";
+          try { if (p0 && !p0.isNull()) s = String(new ObjC.Object(p0)); } catch (_) { s = ""; }
+          directPath = String(s || "").trim();
+          done = true;
+        } catch (_) {
+          done = true;
+        }
+      }
+    });
+  } catch (e) {
+    return { ok: false, build: SCRIPT_BUILD_ID, jid: target, url: "", error: "ObjC.Block unavailable: " + String(e) };
   }
-  const url = _toUrlString(urlObj).trim();
-  if (!url) return { ok: false, build: SCRIPT_BUILD_ID, jid: target, url: "", error: "no url" };
-  return { ok: true, build: SCRIPT_BUILD_ID, jid: target, url: url, fullSize: isFullSized };
+
+  try {
+    _runOnMainQueueSync(() => {
+      try {
+        const f = ppm[selDirectPath];
+        if (typeof f === "function") {
+          f.call(ppm, idpObj, completion);
+          return true;
+        }
+        const pMsg = Module.findExportByName(null, "objc_msgSend");
+        const pSelReg = Module.findExportByName("libobjc.A.dylib", "sel_registerName") || Module.findExportByName(null, "sel_registerName");
+        if (!pMsg || !pSelReg) {
+          invokeErr = "objc_msgSend/sel_registerName not found";
+          return true;
+        }
+        const msgSend = new NativeFunction(pMsg, "void", ["pointer", "pointer", "pointer", "pointer"]);
+        const selRegisterName = new NativeFunction(pSelReg, "pointer", ["pointer"]);
+        const sel = selRegisterName(Memory.allocUtf8String(selDirectPath));
+        const a1 = idpObj && idpObj.handle ? idpObj.handle : idpObj;
+        const a2 = completion && completion.handle ? completion.handle : completion;
+        msgSend(ppm.handle, sel, a1, a2);
+        return true;
+      } catch (e) {
+        invokeErr = String(e);
+        return true;
+      }
+    }, 2500);
+  } catch (e) {
+    invokeErr = String(e);
+  }
+
+  if (invokeErr) return { ok: false, build: SCRIPT_BUILD_ID, jid: target, url: "", error: "directPath invoke error: " + invokeErr };
+
+  while (!done && Date.now() < deadlineMs) {
+    Thread.sleep(0.03);
+  }
+  if (!directPath) return { ok: false, build: SCRIPT_BUILD_ID, jid: target, url: "", error: done ? "directPath empty" : "directPath timeout" };
+  const url = directPath.startsWith("http://") || directPath.startsWith("https://") ? directPath : ("https://pps.whatsapp.net" + (directPath.startsWith("/") ? directPath : ("/" + directPath)));
+  return { ok: true, build: SCRIPT_BUILD_ID, jid: target, url: url, fullSize: !!fullSize };
 }
 
 function _extractDigits(s) {
@@ -1432,15 +1521,184 @@ function _derivePhoneFromJid(jid) {
   }
 }
 
-function _extractJidStringFromMaybeObj(v) {
+function _objcHasSelector(o, sel) {
   try {
-    if (v === null || v === undefined) return "";
-    const s = String(v || "").trim();
-    if (s.indexOf("@") !== -1 && s.length < 128) return s;
-    return "";
+    if (!ObjC.available || !o) return false;
+    const s = String(sel || "").trim();
+    if (!s) return false;
+    return _objcCanCall(o, s) || _objcCanCall(o, "- " + s) || _objcCanCall(o, "+ " + s);
+  } catch (_) {
+    return false;
+  }
+}
+
+function _objcCallNoArg(o, sel) {
+  try {
+    if (!ObjC.available || !o) return null;
+    const s = String(sel || "").trim();
+    if (!s) return null;
+    if (_objcCanCall(o, s)) return _safeObj(o[s]());
+    if (_objcCanCall(o, "- " + s)) return _safeObj(o["- " + s]());
+    if (_objcCanCall(o, "+ " + s)) return _safeObj(o["+ " + s]());
+  } catch (_) {}
+  return null;
+}
+
+function _objcCallNoArgString(o, sel) {
+  try {
+    const v = _objcCallNoArg(o, sel);
+    return String(v || "").trim();
   } catch (_) {
     return "";
   }
+}
+
+function _normalizeJidString(s) {
+  try {
+    let v = String(s || "").trim();
+    if (!v) return "";
+    if (v[0] === "<" && v[v.length - 1] === ">") v = v.slice(1, -1).trim();
+    if (!v) return "";
+    if (v.indexOf("*") !== -1) return "";
+    if (v.indexOf("@") === -1) return "";
+    if (v.length > 128) return "";
+    return v;
+  } catch (_) {
+    return "";
+  }
+}
+
+function _extractJidStringFromMaybeObj(x) {
+  try {
+    if (x === null || x === undefined) return "";
+    if (!ObjC.available) return _normalizeJidString(String(x || ""));
+    const o = x instanceof ObjC.Object ? x : new ObjC.Object(x);
+    if (!o) return "";
+    try {
+      const uj = _objcCallNoArg(o, "userJID");
+      if (uj) {
+        const s0 = _objcCallNoArgString(uj instanceof ObjC.Object ? uj : new ObjC.Object(uj), "stringRepresentation");
+        const n0 = _normalizeJidString(s0);
+        if (n0) return n0;
+      }
+    } catch (_) {}
+    try {
+      const dj = _objcCallNoArg(o, "deviceJID");
+      if (dj) {
+        const djObj = dj instanceof ObjC.Object ? dj : new ObjC.Object(dj);
+        const uj = _objcCallNoArg(djObj, "userJID");
+        if (uj) {
+          const s0 = _objcCallNoArgString(uj instanceof ObjC.Object ? uj : new ObjC.Object(uj), "stringRepresentation");
+          const n0 = _normalizeJidString(s0);
+          if (n0) return n0;
+        }
+      }
+    } catch (_) {}
+    const s1 = _normalizeJidString(_objcCallNoArgString(o, "stringRepresentation"));
+    if (s1) return s1;
+    const sJid = _normalizeJidString(_objcCallNoArgString(o, "jid"));
+    if (sJid) return sJid;
+    const sJid2 = _normalizeJidString(_objcCallNoArgString(o, "jidString"));
+    if (sJid2) return sJid2;
+    const s2 = _normalizeJidString(String(o).trim());
+    return s2;
+  } catch (_) {
+    try { return _normalizeJidString(String(x || "").trim()); } catch (_) { return ""; }
+  }
+}
+
+function _isLikelyUsername(s) {
+  try {
+    const v = String(s || "").trim();
+    if (!v) return false;
+    if (v.length > 64) return false;
+    if (v[0] === "<" && v.indexOf("0x") !== -1) return false;
+    if (v.indexOf(" ") !== -1) return false;
+    for (let i = 0; i < v.length; i++) {
+      const c = v.charCodeAt(i);
+      const ok =
+        (c >= 48 && c <= 57) ||
+        (c >= 65 && c <= 90) ||
+        (c >= 97 && c <= 122) ||
+        v[i] === "_" ||
+        v[i] === "." ||
+        v[i] === "-";
+      if (!ok) return false;
+    }
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+function _cleanMaybeUsername(v) {
+  try {
+    const s = String(v || "").trim();
+    if (_isLikelyUsername(s)) return s;
+  } catch (_) {}
+  return "";
+}
+
+function _extractPhoneFromMaybeObj(x) {
+  try {
+    if (x === null || x === undefined) return "";
+    const s0 = String(x).trim();
+    const d0 = _extractDigits(s0);
+    if (d0.length >= 8) return d0;
+    if (!ObjC.available) return "";
+    const o = x instanceof ObjC.Object ? x : new ObjC.Object(x);
+    if (!o) return "";
+    const cands = ["phoneNumber", "rawPhoneNumber", "nationalNumber", "number"];
+    for (let i = 0; i < cands.length; i++) {
+      const sel = cands[i];
+      if (!_objcHasSelector(o, sel)) continue;
+      const v = _objcCallNoArgString(o, sel);
+      const d = _extractDigits(v);
+      if (d.length >= 8) return d;
+    }
+  } catch (_) {}
+  return "";
+}
+
+function _scanIvarsForHints(obj, tags) {
+  const out = { jid: "", phone: "", username: "", name: "" };
+  try {
+    if (!ObjC.available || !obj || !obj.$ivars) return out;
+    const keys = Object.keys(obj.$ivars || {});
+    for (let i = 0; i < keys.length; i++) {
+      const k = keys[i];
+      if (!k) continue;
+      const kl = String(k).toLowerCase();
+      if (tags && tags.length) {
+        let ok = false;
+        for (let j = 0; j < tags.length; j++) {
+          if (kl.indexOf(tags[j]) !== -1) { ok = true; break; }
+        }
+        if (!ok) continue;
+      }
+      let v = null;
+      try { v = obj.$ivars[k]; } catch (_) { v = null; }
+      if (!v) continue;
+      if (!out.jid && (kl.indexOf("jid") !== -1 || kl.indexOf("userjid") !== -1)) {
+        const s = _extractJidStringFromMaybeObj(v);
+        if (s) out.jid = s;
+      }
+      if (!out.phone && (kl.indexOf("phone") !== -1 || kl.indexOf("msisdn") !== -1)) {
+        const p = _extractPhoneFromMaybeObj(v);
+        if (p) out.phone = p;
+      }
+      if (!out.username && kl.indexOf("username") !== -1) {
+        const u = _cleanMaybeUsername(v);
+        if (u) out.username = u;
+      }
+      if (!out.name && (kl.indexOf("name") !== -1 || kl.indexOf("profilename") !== -1)) {
+        const n = String(v).trim();
+        if (n && n.length <= 64) out.name = n;
+      }
+      if (out.jid && out.phone && out.username && out.name) break;
+    }
+  } catch (_) {}
+  return out;
 }
 
 function selfnameactive() {
@@ -1458,75 +1716,106 @@ function selfnameactive() {
   } catch (_) {}
   let selfJid = "";
   let selfUsername = "";
+  let phone = "";
   try {
-    const probes = [ctx];
-    try {
-      if (ctx && ctx["- accountProvider"]) {
-        const ap = _safeObj(ctx["- accountProvider"]());
-        if (ap) probes.push(ap);
+    if (!selfJid || !phone || !selfUsername) {
+      const h = _scanIvarsForHints(ctx, ["jid", "userjid", "phone", "msisdn", "username"]);
+      if (!selfJid && h.jid) {
+        selfJid = h.jid;
+        phone = _derivePhoneFromJid(selfJid) || phone;
       }
-    } catch (_) {}
-    try {
-      if (ctx && ctx["- accountService"]) {
-        const as = _safeObj(ctx["- accountService"]());
-        if (as) probes.push(as);
-      }
-    } catch (_) {}
-    const jidSelectors = ["ownUserJID", "userJID", "currentUserJID", "myUserJID", "deviceJID"];
-    const usernameSelectors = ["currentUserUsername", "username", "currentUsername", "userName"];
-    for (let pi = 0; pi < probes.length; pi++) {
-      const o = probes[pi];
-      if (!o) continue;
-      try {
-        if (!selfJid && o.$ivars) {
-          const keys = Object.keys(o.$ivars || {});
-          for (let i = 0; i < keys.length; i++) {
-            const k = keys[i];
-            const kl = String(k || "").toLowerCase();
-            const v = o.$ivars[k];
-            if (!selfJid && (kl.indexOf("jid") !== -1 || kl.indexOf("userjid") !== -1)) {
-              const s = _extractJidStringFromMaybeObj(v);
-              if (s) selfJid = s;
-            }
-            if (!selfUsername && kl.indexOf("username") !== -1) {
-              const u = String(v || "").trim();
-              if (u && u.length <= 64) selfUsername = u;
-            }
-            if (selfJid && selfUsername) break;
-          }
-        }
-      } catch (_) {}
-      try {
-        if (!selfJid) {
-          for (let si = 0; si < jidSelectors.length; si++) {
-            const sel = jidSelectors[si];
-            if (!_objcCanCall(o, sel)) continue;
-            const v = o[sel]();
-            const s = _extractJidStringFromMaybeObj(v);
-            if (s) {
-              selfJid = s;
-              break;
-            }
-          }
-        }
-      } catch (_) {}
-      try {
-        if (!selfUsername) {
-          for (let si = 0; si < usernameSelectors.length; si++) {
-            const sel = usernameSelectors[si];
-            if (!_objcCanCall(o, sel)) continue;
-            const u = String(o[sel]() || "").trim();
-            if (u && u.length <= 64) {
-              selfUsername = u;
-              break;
-            }
-          }
-        }
-      } catch (_) {}
-      if (selfJid && selfUsername) break;
+      if (!phone && h.phone) phone = h.phone;
+      if (!selfUsername && h.username) selfUsername = h.username;
+      if (!selfName && h.name) selfName = h.name;
     }
   } catch (_) {}
-  const phone = _derivePhoneFromJid(selfJid);
+  const probes = [];
+  probes.push({ obj: ctx, tag: "ctx" });
+  try {
+    if (_objcHasSelector(ctx, "messageSender")) {
+      const sender = _objcCallNoArg(ctx, "messageSender");
+      if (sender) probes.push({ obj: sender, tag: "messageSender" });
+    }
+  } catch (_) {}
+  try {
+    if (_objcHasSelector(ctx, "accountService")) {
+      const as = _objcCallNoArg(ctx, "accountService");
+      if (as) probes.push({ obj: as, tag: "accountService" });
+    }
+  } catch (_) {}
+  try {
+    if (_objcHasSelector(ctx, "accountProvider")) {
+      const ap = _objcCallNoArg(ctx, "accountProvider");
+      if (ap) probes.push({ obj: ap, tag: "accountProvider" });
+    }
+  } catch (_) {}
+  try {
+    if (_objcHasSelector(ctx, "ownUserJIDFetcher")) {
+      const f = _objcCallNoArg(ctx, "ownUserJIDFetcher");
+      if (f) probes.push({ obj: f, tag: "ownUserJIDFetcher" });
+    }
+  } catch (_) {}
+  const jidSelectors = ["ownUserJID", "userJID", "currentUserJID", "myUserJID", "deviceJID"];
+  const nameSelectors = ["currentUserName", "currentProfileName", "profileName", "displayName", "pushName", "name"];
+  const usernameSelectors = ["currentUserUsername", "username", "currentUsername", "userName"];
+  for (let pi = 0; pi < probes.length; pi++) {
+    const o = probes[pi].obj;
+    if (!o) continue;
+    try {
+      if (!selfJid || !phone || !selfUsername) {
+        const h = _scanIvarsForHints(o, ["jid", "userjid", "phone", "msisdn", "username"]);
+        if (!selfJid && h.jid) {
+          selfJid = h.jid;
+          phone = _derivePhoneFromJid(selfJid) || phone;
+        }
+        if (!phone && h.phone) phone = h.phone;
+        if (!selfUsername && h.username) selfUsername = h.username;
+        if (!selfName && h.name) selfName = h.name;
+      }
+    } catch (_) {}
+    try {
+      if (!selfJid) {
+        for (let si = 0; si < jidSelectors.length; si++) {
+          const sel = jidSelectors[si];
+          if (!_objcHasSelector(o, sel)) continue;
+          const jidStr = _extractJidStringFromMaybeObj(_objcCallNoArg(o, sel));
+          if (jidStr) {
+            selfJid = jidStr;
+            phone = _derivePhoneFromJid(jidStr) || phone;
+            break;
+          }
+        }
+      }
+    } catch (_) {}
+    try {
+      if (!selfUsername) {
+        for (let si = 0; si < usernameSelectors.length; si++) {
+          const sel = usernameSelectors[si];
+          if (!_objcHasSelector(o, sel)) continue;
+          const v = _cleanMaybeUsername(_objcCallNoArgString(o, sel));
+          if (v) {
+            selfUsername = v;
+            break;
+          }
+        }
+      }
+    } catch (_) {}
+    try {
+      if (!selfName) {
+        for (let si = 0; si < nameSelectors.length; si++) {
+          const sel = nameSelectors[si];
+          if (!_objcHasSelector(o, sel)) continue;
+          const v = String(_objcCallNoArgString(o, sel) || "").trim();
+          if (v) {
+            selfName = v;
+            break;
+          }
+        }
+      }
+    } catch (_) {}
+    if (selfJid && phone && selfName && selfUsername) break;
+  }
+  if (!phone) phone = _derivePhoneFromJid(selfJid);
   return { ok: true, build: SCRIPT_BUILD_ID, selfJid: selfJid, selfName: selfName, selfUsername: selfUsername, phone: phone };
 }
 
@@ -1535,16 +1824,17 @@ function selfcard() {
   if (!h || !h.ok) return { ok: false, build: SCRIPT_BUILD_ID, selfCard: null, error: h && h.error ? String(h.error) : "selfname failed" };
   const selfJid = String(h.selfJid || "").trim();
   if (!selfJid) return { ok: false, build: SCRIPT_BUILD_ID, selfCard: null, error: "selfJid empty" };
-  const a = avatarurl(selfJid, false);
+  const a = avatarurl(selfJid, false, 20000);
   const avatarUrl = a && a.ok ? String(a.url || "").trim() : "";
   const err = (a && !a.ok) ? String(a.error || "avatarurl failed") : "";
+  const selfUsername = _cleanMaybeUsername(String(h.selfUsername || "").trim());
   return {
     ok: true,
     build: SCRIPT_BUILD_ID,
     selfCard: {
       selfJid: selfJid,
       selfName: String(h.selfName || "").trim(),
-      selfUsername: String(h.selfUsername || "").trim(),
+      selfUsername: selfUsername,
       phone: String(h.phone || "").trim(),
       avatarUrl: avatarUrl
     },
@@ -1582,7 +1872,8 @@ function _avatarHandleMsg(message) {
   }
   try { waitready(); } catch (_) {}
   try {
-    const res = avatarurl(jid, fullSize);
+    const timeoutMs = Number(p.timeoutMs || 20000) | 0;
+    const res = avatarurl(jid, fullSize, timeoutMs);
     _avatarEmitResult(opId, jid, res, null);
   } catch (e) {
     _avatarEmitResult(opId, jid, { ok: false, url: "", error: String(e) }, null);
@@ -1602,7 +1893,7 @@ function _selfCardEmitResult(opId, res, extraErr) {
   try {
     const ok = !!(res && res.ok);
     const selfCard = (res && res.selfCard) ? res.selfCard : null;
-    const err = ok ? "" : String((res && res.error) ? res.error : (extraErr ? extraErr : "failed"));
+    const err = String((res && res.error) ? res.error : (extraErr ? extraErr : ""));
     send({
       type: "wa.tx.self_card.result",
       build: SCRIPT_BUILD_ID,
@@ -1665,9 +1956,9 @@ function _txHandleMsg(message) {
     } else if (kind === "image") {
       res = sendimage(jid, String(p.caption || ""), String(p.path || p.imagePath || ""), messageOrigin);
     } else if (kind === "video") {
-      res = sendvideo(jid, String(p.caption || ""), String(p.path || p.videoPath || ""), messageOrigin);
+      res = sendvideo(jid, String(p.caption || ""), String(p.path || p.videoPath || ""), String(p.thumbnailPath || ""), messageOrigin);
     } else if (kind === "audio") {
-      res = sendaudio(jid, String(p.path || p.audioPath || ""), messageOrigin);
+      res = sendaudio(jid, String(p.path || p.audioPath || ""), Number(p.durationSec || 0), messageOrigin);
     } else {
       res = { ok: false, stanzaId: "", error: "unknown kind" };
     }
@@ -2335,6 +2626,72 @@ const RX_CONFIG = {
   protobuf: { hardCapBytes: 256 * 1024, alwaysEmitB64: true },
 };
 
+const RX_AUTO_READ = { enabled: true, minIntervalMs: 3000, lastByChat: new Map() };
+
+function RX_shouldAutoRead(chatJid, senderJid, isGroup, fromMe) {
+  try {
+    const cj = String(chatJid || "").trim();
+    if (!cj) return false;
+    if (cj === "status@broadcast") return false;
+    if (cj.indexOf("@broadcast") !== -1) return false;
+    if (isGroup === true) return false;
+    if (fromMe === true) return false;
+    const sj = String(senderJid || "").trim();
+    if (!sj || sj === "status@broadcast") return false;
+    if (sj.indexOf("@") === -1) return false;
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+function RX_markChatRead(chatJidStr) {
+  try {
+    const core = _resolveCoreFixed();
+    if (!core || !core.ok) return { ok: false, error: core && core.error ? String(core.error) : "no context" };
+    const ctxMain = core.ctxMain;
+    const storage = core.storage;
+    let chatManager = null;
+    try { if (_objcCanCall(ctxMain, "- chatManager")) chatManager = _safeObj(ctxMain["- chatManager"]()); } catch (_) { chatManager = null; }
+    if (!chatManager) return { ok: false, error: "ctxMain.chatManager nil" };
+    const sel = "- markChatSessions:read:sendReadReceipts:isMarkedByUser:error:";
+    if (!_objcCanCall(chatManager, sel)) return { ok: false, error: "WAChatManager selector missing" };
+    const chatJid = _makeWAChatJIDFromString(chatJidStr);
+    if (!chatJid) return { ok: false, error: "invalid chatJid" };
+    const cs = _fetchChatSession(storage, chatJid);
+    if (!cs) return { ok: false, error: "fetchChatSession failed" };
+    const NSArray = ObjC.classes.NSArray;
+    if (!NSArray || !NSArray["+ arrayWithObject:"]) return { ok: false, error: "NSArray unavailable" };
+    const sessions = NSArray.arrayWithObject_(cs);
+    const errPtr = Memory.alloc(Process.pointerSize);
+    Memory.writePointer(errPtr, ptr("0x0"));
+    const ok = chatManager[sel](sessions, true, true, true, errPtr);
+    if (!!ok) return { ok: true, used: "WAChatManager.markChatSessions:read:sendReadReceipts:isMarkedByUser:error:" };
+    let errText = "";
+    try {
+      const ep = Memory.readPointer(errPtr);
+      const eo = ep && !ep.isNull() ? _safeObj(ep) : null;
+      if (eo) errText = String(eo);
+    } catch (_) {}
+    return { ok: false, used: "WAChatManager.markChatSessions:read:sendReadReceipts:isMarkedByUser:error:", error: errText || "failed" };
+  } catch (e) {
+    return { ok: false, error: String(e) };
+  }
+}
+
+function RX_scheduleAutoRead(chatJid, stanzaId, senderJid, isGroup, fromMe) {
+  try {
+    if (!RX_AUTO_READ.enabled) return;
+    if (!RX_shouldAutoRead(chatJid, senderJid, isGroup, fromMe)) return;
+    const key = String(chatJid || "").trim();
+    const now = Date.now();
+    const last = RX_AUTO_READ.lastByChat.get(key) || 0;
+    if (now - last < RX_AUTO_READ.minIntervalMs) return;
+    RX_AUTO_READ.lastByChat.set(key, now);
+    _scheduleOnMainQueue(() => { try { RX_markChatRead(key); } catch (_) {} });
+  } catch (_) {}
+}
+
 function RX_install() {
   try {
     if (!RX_objcAvailable()) throw new Error("ObjC unavailable");
@@ -2408,6 +2765,7 @@ function RX_install() {
               const fromMe = (stanza.isFromMe === true || stanza.isFromMe === false) ? stanza.isFromMe : null;
               const uniqueKey = stanza.uniqueKey ? String(stanza.uniqueKey) : "";
 
+              try { RX_scheduleAutoRead(chatJID, stanzaId, senderJID, isGroup, fromMe); } catch (_) {}
               send({
                 type: "wa.recv.update",
                 build: SCRIPT_BUILD_ID,
@@ -2473,3 +2831,17 @@ function RX_install() {
 setImmediate(() => {
   try { RX_install(); } catch (_) {}
 });
+
+setInterval(() => {
+  try {
+    send({
+      type: "qqw.pong",
+      build: SCRIPT_BUILD_ID,
+      ts: Date.now(),
+      ok: true,
+      rxInstalled: !!RX_STATE.installed,
+      rxErr: RX_STATE.error ? String(RX_STATE.error) : "",
+      waVersion: RX_STATE.waVersion ? String(RX_STATE.waVersion) : "",
+    });
+  } catch (_) {}
+}, 15000);

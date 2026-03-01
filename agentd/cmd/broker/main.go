@@ -367,13 +367,16 @@ func (b *Broker) handleAgentWS(w http.ResponseWriter, r *http.Request) {
 			_ = s.send(ctx, ack)
 			b.maybeUpdateAssetEgressIP(s.deviceID, s.remoteIP)
 		case "ping":
-			var pp PingPayload
+			var pp *PingPayload
 			if len(in.Payload) > 0 {
-				_ = json.Unmarshal(in.Payload, &pp)
+				var tmp PingPayload
+				if err := json.Unmarshal(in.Payload, &tmp); err == nil {
+					pp = &tmp
+				}
 			}
 			if sess != nil {
 				sess.lastSeen = time.Now()
-				b.recordSessionSeen(sess.deviceID, sess.session, sess.remoteIP, &pp)
+				b.recordSessionSeen(sess.deviceID, sess.session, sess.remoteIP, pp)
 				b.maybeUpdateAssetEgressIP(sess.deviceID, sess.remoteIP)
 			}
 			pong := Envelope{
