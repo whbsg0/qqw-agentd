@@ -2628,12 +2628,14 @@ const RX_CONFIG = {
 
 const RX_AUTO_READ = { enabled: true, minIntervalMs: 3000, lastByChat: new Map() };
 
-function RX_shouldAutoRead(chatJid, senderJid, isGroup, fromMe) {
+function RX_shouldAutoRead(chatJid, stanzaId, senderJid, isGroup, fromMe) {
   try {
     const cj = String(chatJid || "").trim();
     if (!cj) return false;
     if (cj === "status@broadcast") return false;
     if (cj.indexOf("@broadcast") !== -1) return false;
+    const sid = String(stanzaId || "").trim();
+    if (!sid) return false;
     if (isGroup === true) return false;
     if (fromMe === true) return false;
     const sj = String(senderJid || "").trim();
@@ -2645,7 +2647,7 @@ function RX_shouldAutoRead(chatJid, senderJid, isGroup, fromMe) {
   }
 }
 
-function RX_markChatRead(chatJidStr) {
+function RX_markMessageReadByStanzaId(chatJidStr, stanzaIdStr, participantJidStr) {
   try {
     const core = _resolveCoreFixed();
     if (!core || !core.ok) return { ok: false, error: core && core.error ? String(core.error) : "no context" };
@@ -2654,26 +2656,47 @@ function RX_markChatRead(chatJidStr) {
     let chatManager = null;
     try { if (_objcCanCall(ctxMain, "- chatManager")) chatManager = _safeObj(ctxMain["- chatManager"]()); } catch (_) { chatManager = null; }
     if (!chatManager) return { ok: false, error: "ctxMain.chatManager nil" };
-    const sel = "- markChatSessions:read:sendReadReceipts:isMarkedByUser:error:";
-    if (!_objcCanCall(chatManager, sel)) return { ok: false, error: "WAChatManager selector missing" };
+    const sid = String(stanzaIdStr || "").trim();
+    if (!sid) return { ok: false, error: "missing stanzaId" };
     const chatJid = _makeWAChatJIDFromString(chatJidStr);
     if (!chatJid) return { ok: false, error: "invalid chatJid" };
     const cs = _fetchChatSession(storage, chatJid);
     if (!cs) return { ok: false, error: "fetchChatSession failed" };
+    const mcs = _getMutableChatSession(cs);
+    if (!mcs) return { ok: false, error: "mutableChatSession missing" };
+    const pj = String(participantJidStr || "").trim();
+    const msg = _fetchMessageByStanzaId(mcs, sid, pj);
+    if (!msg) return { ok: false, error: "message not found by stanzaId" };
     const NSArray = ObjC.classes.NSArray;
     if (!NSArray || !NSArray["+ arrayWithObject:"]) return { ok: false, error: "NSArray unavailable" };
     const sessions = NSArray.arrayWithObject_(cs);
-    const errPtr = Memory.alloc(Process.pointerSize);
-    Memory.writePointer(errPtr, ptr("0x0"));
-    const ok = chatManager[sel](sessions, true, true, true, errPtr);
-    if (!!ok) return { ok: true, used: "WAChatManager.markChatSessions:read:sendReadReceipts:isMarkedByUser:error:" };
-    let errText = "";
-    try {
-      const ep = Memory.readPointer(errPtr);
-      const eo = ep && !ep.isNull() ? _safeObj(ep) : null;
-      if (eo) errText = String(eo);
-    } catch (_) {}
-    return { ok: false, used: "WAChatManager.markChatSessions:read:sendReadReceipts:isMarkedByUser:error:", error: errText || "failed" };
+    const actions = [];
+    const selMark = "- markChatSessions:read:sendReadReceipts:isMarkedByUser:error:";
+    if (_objcCanCall(chatManager, selMark)) {
+      const errPtr = Memory.alloc(Process.pointerSize);
+      Memory.writePointer(errPtr, ptr("0x0"));
+      const ok = chatManager[selMark](sessions, true, true, true, errPtr);
+      let errText = "";
+      try {
+        const ep = Memory.readPointer(errPtr);
+        const eo = ep && !ep.isNull() ? _safeObj(ep) : null;
+        if (eo) errText = String(eo);
+      } catch (_) {}
+      actions.push("WAChatManager.markChatSessions:read:sendReadReceipts:isMarkedByUser:error:");
+      return { ok: !!ok, used: actions.join(","), error: errText };
+    }
+    const selRR = "- sendReadReceiptsForMessagesBeforeAndIncludingMessage:inChatSession:isMarkedByUser:";
+    if (_objcCanCall(chatManager, selRR)) {
+      chatManager[selRR](msg, cs, true);
+      actions.push("WAChatManager.sendReadReceiptsForMessagesBeforeAndIncludingMessage:inChatSession:isMarkedByUser:");
+    }
+    const selAsRead = "- markChatSessionsAsRead:";
+    if (_objcCanCall(chatManager, selAsRead)) {
+      chatManager[selAsRead](sessions);
+      actions.push("WAChatManager.markChatSessionsAsRead:");
+      return { ok: true, used: actions.join(",") };
+    }
+    return { ok: false, error: "WAChatManager read selectors missing" };
   } catch (e) {
     return { ok: false, error: String(e) };
   }
@@ -2682,13 +2705,15 @@ function RX_markChatRead(chatJidStr) {
 function RX_scheduleAutoRead(chatJid, stanzaId, senderJid, isGroup, fromMe) {
   try {
     if (!RX_AUTO_READ.enabled) return;
-    if (!RX_shouldAutoRead(chatJid, senderJid, isGroup, fromMe)) return;
+    if (!RX_shouldAutoRead(chatJid, stanzaId, senderJid, isGroup, fromMe)) return;
     const key = String(chatJid || "").trim();
     const now = Date.now();
     const last = RX_AUTO_READ.lastByChat.get(key) || 0;
     if (now - last < RX_AUTO_READ.minIntervalMs) return;
     RX_AUTO_READ.lastByChat.set(key, now);
-    _scheduleOnMainQueue(() => { try { RX_markChatRead(key); } catch (_) {} });
+    const sid = String(stanzaId || "").trim();
+    const pj = String(senderJid || "").trim();
+    _scheduleOnMainQueue(() => { try { RX_markMessageReadByStanzaId(key, sid, pj); } catch (_) {} });
   } catch (_) {}
 }
 
