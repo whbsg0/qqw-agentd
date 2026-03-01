@@ -51,6 +51,31 @@ type HelloAckPayload struct {
 	HeartbeatSec int    `json:"heartbeatSec,omitempty"`
 }
 
+type RunnerHealthPayload struct {
+	Pid            int64  `json:"pid,omitempty"`
+	RpcOk          bool   `json:"rpcOk,omitempty"`
+	ScriptReady    bool   `json:"scriptReady,omitempty"`
+	ScriptPath     string `json:"scriptPath,omitempty"`
+	ScriptSha256   string `json:"scriptSha256,omitempty"`
+	ScriptBuild    string `json:"scriptBuild,omitempty"`
+	StartedAtMs    int64  `json:"startedAtMs,omitempty"`
+	LastHealthAtMs int64  `json:"lastHealthAtMs,omitempty"`
+	LastHealthErr  string `json:"lastHealthErr,omitempty"`
+}
+
+type ScriptHealthPayload struct {
+	InstalledPath string `json:"installedPath,omitempty"`
+	UpdatedAtMs   int64  `json:"updatedAtMs,omitempty"`
+	LastEventTsMs int64  `json:"lastEventTsMs,omitempty"`
+	LastPongTsMs  int64  `json:"lastPongTsMs,omitempty"`
+	LastError     string `json:"lastError,omitempty"`
+}
+
+type PingPayload struct {
+	Runner RunnerHealthPayload `json:"runner"`
+	Script ScriptHealthPayload `json:"script"`
+}
+
 type OpenTunnelPayload struct {
 	Target string `json:"target"`
 }
@@ -342,9 +367,13 @@ func (b *Broker) handleAgentWS(w http.ResponseWriter, r *http.Request) {
 			_ = s.send(ctx, ack)
 			b.maybeUpdateAssetEgressIP(s.deviceID, s.remoteIP)
 		case "ping":
+			var pp PingPayload
+			if len(in.Payload) > 0 {
+				_ = json.Unmarshal(in.Payload, &pp)
+			}
 			if sess != nil {
 				sess.lastSeen = time.Now()
-				b.recordSessionSeen(sess.deviceID, sess.session, sess.remoteIP)
+				b.recordSessionSeen(sess.deviceID, sess.session, sess.remoteIP, &pp)
 				b.maybeUpdateAssetEgressIP(sess.deviceID, sess.remoteIP)
 			}
 			pong := Envelope{
@@ -590,6 +619,37 @@ on conflict (device_id) do update set
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return
 		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+		return
+	}
+	if len(parts) == 3 && parts[1] == "script" && (parts[2] == "start" || parts[2] == "stop" || parts[2] == "update" || parts[2] == "uninstall") {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		deviceID := strings.TrimSpace(parts[0])
+		if deviceID == "" {
+			http.Error(w, "deviceId required", http.StatusBadRequest)
+			return
+		}
+		sess := b.getSession(deviceID)
+		if sess == nil {
+			http.Error(w, "device offline", http.StatusNotFound)
+			return
+		}
+		kind := "script_" + parts[2]
+		env := Envelope{
+			V:        1,
+			Type:     kind,
+			DeviceID: deviceID,
+			Session:  sess.session,
+			TS:       time.Now().UnixMilli(),
+		}
+		if err := sess.send(r.Context(), env); err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		logJSON(kind+"_dispatched", map[string]any{"deviceId": deviceID})
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 		return
 	}
@@ -1400,7 +1460,7 @@ on conflict (device_id, session_id) do update set
 	}
 }
 
-func (b *Broker) recordSessionSeen(deviceID, sessionID, ip string) {
+func (b *Broker) recordSessionSeen(deviceID, sessionID, ip string, health *PingPayload) {
 	if b.db == nil {
 		return
 	}
@@ -1417,7 +1477,59 @@ func (b *Broker) recordSessionSeen(deviceID, sessionID, ip string) {
 			logJSON("db_write_failed", map[string]any{"op": "devices_touch", "deviceId": deviceID, "err": err.Error()})
 		}
 	}
-	if _, err := b.db.ExecContext(ctx, `update agent_sessions set last_seen_at=now(), last_ip=nullif($3,'')::inet where device_id=$1 and session_id=$2 and disconnected_at is null`, deviceID, sessionID, ip); err != nil {
+	var runnerPid sql.NullInt64
+	var runnerStartedAt sql.NullInt64
+	var runnerLastHealthAt sql.NullInt64
+	var runnerRpcOk sql.NullBool
+	var runnerScriptReady sql.NullBool
+	var runnerScriptBuild sql.NullString
+	var runnerScriptSha sql.NullString
+	var runnerLastHealthErr sql.NullString
+	var scriptPath sql.NullString
+	var scriptUpdatedAt sql.NullInt64
+	var scriptLastEventTs sql.NullInt64
+	var scriptLastPongTs sql.NullInt64
+	var scriptLastErr sql.NullString
+
+	if health != nil {
+		runnerPid = sql.NullInt64{Valid: true, Int64: health.Runner.Pid}
+		runnerStartedAt = sql.NullInt64{Valid: true, Int64: health.Runner.StartedAtMs}
+		runnerLastHealthAt = sql.NullInt64{Valid: true, Int64: health.Runner.LastHealthAtMs}
+		runnerRpcOk = sql.NullBool{Valid: true, Bool: health.Runner.RpcOk}
+		runnerScriptReady = sql.NullBool{Valid: true, Bool: health.Runner.ScriptReady}
+		runnerScriptBuild = sql.NullString{Valid: strings.TrimSpace(health.Runner.ScriptBuild) != "", String: strings.TrimSpace(health.Runner.ScriptBuild)}
+		runnerScriptSha = sql.NullString{Valid: strings.TrimSpace(health.Runner.ScriptSha256) != "", String: strings.TrimSpace(health.Runner.ScriptSha256)}
+		runnerLastHealthErr = sql.NullString{Valid: strings.TrimSpace(health.Runner.LastHealthErr) != "", String: strings.TrimSpace(health.Runner.LastHealthErr)}
+		scriptPath = sql.NullString{Valid: strings.TrimSpace(health.Script.InstalledPath) != "", String: strings.TrimSpace(health.Script.InstalledPath)}
+		scriptUpdatedAt = sql.NullInt64{Valid: true, Int64: health.Script.UpdatedAtMs}
+		scriptLastEventTs = sql.NullInt64{Valid: true, Int64: health.Script.LastEventTsMs}
+		scriptLastPongTs = sql.NullInt64{Valid: true, Int64: health.Script.LastPongTsMs}
+		scriptLastErr = sql.NullString{Valid: strings.TrimSpace(health.Script.LastError) != "", String: strings.TrimSpace(health.Script.LastError)}
+	}
+
+	if _, err := b.db.ExecContext(ctx, `
+update agent_sessions set
+  last_seen_at=now(),
+  last_ip=nullif($3,'')::inet,
+  runner_pid=coalesce($4, runner_pid),
+  runner_rpc_ok=coalesce($5, runner_rpc_ok),
+  runner_script_ready=coalesce($6, runner_script_ready),
+  runner_script_build=coalesce(nullif($7,''), runner_script_build),
+  runner_script_sha256=coalesce(nullif($8,''), runner_script_sha256),
+  runner_started_at_ms=coalesce($9, runner_started_at_ms),
+  runner_last_health_at_ms=coalesce($10, runner_last_health_at_ms),
+  runner_last_health_err=coalesce(nullif($11,''), runner_last_health_err),
+  script_path=coalesce(nullif($12,''), script_path),
+  script_updated_at_ms=coalesce($13, script_updated_at_ms),
+  script_last_event_ts_ms=coalesce($14, script_last_event_ts_ms),
+  script_last_pong_ts_ms=coalesce($15, script_last_pong_ts_ms),
+  script_last_error=coalesce(nullif($16,''), script_last_error)
+where device_id=$1 and session_id=$2 and disconnected_at is null
+`, deviceID, sessionID, ip,
+		runnerPid, runnerRpcOk, runnerScriptReady, runnerScriptBuild, runnerScriptSha,
+		runnerStartedAt, runnerLastHealthAt, runnerLastHealthErr,
+		scriptPath, scriptUpdatedAt, scriptLastEventTs, scriptLastPongTs, scriptLastErr,
+	); err != nil {
 		if b.shouldLogDBErr(deviceID) {
 			logJSON("db_write_failed", map[string]any{"op": "agent_sessions_ping", "deviceId": deviceID, "sessionId": sessionID, "err": err.Error()})
 		}

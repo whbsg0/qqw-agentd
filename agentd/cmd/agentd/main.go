@@ -141,15 +141,28 @@ type SetDeviceSecretPayload struct {
 }
 
 type TxSendPayload struct {
-	OpID               string `json:"opId"`
-	Kind               string `json:"kind"`
-	JID                string `json:"jid"`
-	Text               string `json:"text,omitempty"`
-	QuoteStanzaID      string `json:"quoteStanzaId,omitempty"`
-	ParticipantJID     string `json:"participantJid,omitempty"`
-	MessageOrigin      int    `json:"messageOrigin,omitempty"`
-	CreationEntryPoint int    `json:"creationEntryPoint,omitempty"`
-	TimeoutMs          int    `json:"timeoutMs,omitempty"`
+	OpID               string              `json:"opId"`
+	Kind               string              `json:"kind"`
+	JID                string              `json:"jid"`
+	Text               string              `json:"text,omitempty"`
+	QuoteStanzaID      string              `json:"quoteStanzaId,omitempty"`
+	ParticipantJID     string              `json:"participantJid,omitempty"`
+	MessageOrigin      int                 `json:"messageOrigin,omitempty"`
+	CreationEntryPoint int                 `json:"creationEntryPoint,omitempty"`
+	TimeoutMs          int                 `json:"timeoutMs,omitempty"`
+	Media              *TxSendMediaPayload `json:"media,omitempty"`
+}
+
+type TxSendMediaPayload struct {
+	Source     string `json:"source,omitempty"`
+	URL        string `json:"url,omitempty"`
+	Base64     string `json:"base64,omitempty"`
+	DevicePath string `json:"devicePath,omitempty"`
+	Mime       string `json:"mime,omitempty"`
+	Filename   string `json:"filename,omitempty"`
+	Caption    string `json:"caption,omitempty"`
+	SizeBytes  int64  `json:"sizeBytes,omitempty"`
+	Sha256     string `json:"sha256,omitempty"`
 }
 
 type TxMsgActionPayload struct {
@@ -209,6 +222,7 @@ type Agent struct {
 	scriptUpdatedAtTS atomic.Int64
 	scriptLastError   atomic.Value
 	scriptLastEventTS atomic.Int64
+	scriptLastPongTS  atomic.Int64
 
 	runnerMu  sync.Mutex
 	runnerCmd *exec.Cmd
@@ -454,6 +468,7 @@ func (a *Agent) startControlServer(cfgPath string) {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 		go func() {
 			time.Sleep(200 * time.Millisecond)
+			_ = a.stopRunnerIfRunning()
 			os.Exit(0)
 		}()
 	})
@@ -580,7 +595,14 @@ func (a *Agent) startControlServer(cfgPath string) {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "invalid body"})
 			return
 		}
-		a.scriptLastEventTS.Store(time.Now().UnixMilli())
+		now := time.Now().UnixMilli()
+		a.scriptLastEventTS.Store(now)
+		var m map[string]any
+		if err := json.Unmarshal(body, &m); err == nil {
+			if t, ok := m["type"].(string); ok && strings.TrimSpace(t) == "qqw.pong" {
+				a.scriptLastPongTS.Store(now)
+			}
+		}
 		a.eventQueue.Enqueue(body)
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "queued": true})
 	})
@@ -606,6 +628,7 @@ func (a *Agent) startControlServer(cfgPath string) {
 			"updatedAtTsMs": a.scriptUpdatedAtTS.Load(),
 			"lastError":     strings.TrimSpace(lastErr),
 			"lastEventTsMs": a.scriptLastEventTS.Load(),
+			"lastPongTsMs":  a.scriptLastPongTS.Load(),
 		})
 	})
 
@@ -644,6 +667,23 @@ func (a *Agent) startControlServer(cfgPath string) {
 		a.scriptLastError.Store("")
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 	})
+	mux.HandleFunc("/script/uninstall", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		if !authOK(r) {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		_ = a.stopRunnerIfRunning()
+		_ = os.Remove(a.scriptPath)
+		a.scriptUpdatedAtTS.Store(0)
+		a.scriptLastError.Store("")
+		a.scriptLastEventTS.Store(0)
+		a.scriptLastPongTS.Store(0)
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	})
 
 	mux.HandleFunc("/script/update", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -654,66 +694,14 @@ func (a *Agent) startControlServer(cfgPath string) {
 			w.WriteHeader(http.StatusUnauthorized)
 			return
 		}
-		cfg := a.getCfg()
-		base := serverHTTPBase(cfg.ServerURL)
-		if base == "" {
-			a.scriptLastError.Store("serverUrl invalid")
-			writeJSON(w, http.StatusServiceUnavailable, map[string]any{"ok": false, "error": "serverUrl invalid"})
-			return
-		}
-		downloadURL := base + "/downloads/scripts/current.js"
-
-		ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
-		defer cancel()
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, downloadURL, nil)
+		downloadURL, updatedAt, err := a.updateScriptAndRestart()
 		if err != nil {
 			a.scriptLastError.Store(err.Error())
 			writeJSON(w, http.StatusBadGateway, map[string]any{"ok": false, "error": err.Error()})
 			return
 		}
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			a.scriptLastError.Store(err.Error())
-			writeJSON(w, http.StatusBadGateway, map[string]any{"ok": false, "error": err.Error()})
-			return
-		}
-		defer resp.Body.Close()
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
-		if resp.StatusCode != http.StatusOK {
-			msg := strings.TrimSpace(string(body))
-			if msg == "" {
-				msg = resp.Status
-			}
-			a.scriptLastError.Store(msg)
-			writeJSON(w, resp.StatusCode, map[string]any{"ok": false, "error": msg})
-			return
-		}
-		if len(body) == 0 {
-			a.scriptLastError.Store("empty script")
-			writeJSON(w, http.StatusBadGateway, map[string]any{"ok": false, "error": "empty script"})
-			return
-		}
-
-		_ = os.MkdirAll(filepath.Dir(a.scriptPath), 0o755)
-		if err := os.WriteFile(a.scriptPath, body, 0o644); err != nil {
-			a.scriptLastError.Store(err.Error())
-			writeJSON(w, http.StatusInternalServerError, map[string]any{"ok": false, "error": err.Error()})
-			return
-		}
-		now := time.Now().UnixMilli()
-		a.scriptUpdatedAtTS.Store(now)
 		a.scriptLastError.Store("")
-		if err := a.stopRunnerIfRunning(); err != nil {
-			a.scriptLastError.Store(err.Error())
-			writeJSON(w, http.StatusBadGateway, map[string]any{"ok": false, "error": err.Error()})
-			return
-		}
-		if err := a.startRunner(); err != nil {
-			a.scriptLastError.Store(err.Error())
-			writeJSON(w, http.StatusBadGateway, map[string]any{"ok": false, "error": err.Error()})
-			return
-		}
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "downloadUrl": downloadURL, "updatedAtTsMs": now})
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "downloadUrl": downloadURL, "updatedAtTsMs": updatedAt})
 	})
 
 	mux.HandleFunc("/updater/run", func(w http.ResponseWriter, r *http.Request) {
@@ -1183,15 +1171,107 @@ func (a *Agent) hello(ctx context.Context, ws *websocket.Conn) (string, error) {
 }
 
 func (a *Agent) sendPing(ctx context.Context, ws *websocket.Conn, sessionID string) error {
+	type runnerHealth struct {
+		Pid           int64  `json:"pid"`
+		RpcOk         bool   `json:"rpcOk"`
+		ScriptReady   bool   `json:"scriptReady"`
+		ScriptPath    string `json:"scriptPath,omitempty"`
+		ScriptSha256  string `json:"scriptSha256,omitempty"`
+		ScriptBuild   string `json:"scriptBuild,omitempty"`
+		StartedAtMs   int64  `json:"startedAtMs,omitempty"`
+		LastHealthAt  int64  `json:"lastHealthAtMs,omitempty"`
+		LastHealthErr string `json:"lastHealthErr,omitempty"`
+	}
+	type scriptHealth struct {
+		InstalledPath string `json:"installedPath,omitempty"`
+		UpdatedAtMs   int64  `json:"updatedAtMs,omitempty"`
+		LastEventTsMs int64  `json:"lastEventTsMs,omitempty"`
+		LastPongTsMs  int64  `json:"lastPongTsMs,omitempty"`
+		LastError     string `json:"lastError,omitempty"`
+	}
+	type pingPayload struct {
+		Runner runnerHealth `json:"runner"`
+		Script scriptHealth `json:"script"`
+	}
+
+	now := time.Now().UnixMilli()
+	rh := runnerHealth{Pid: a.runnerPid.Load(), LastHealthAt: now}
+	if rh.Pid > 0 {
+		h, err := a.getRunnerRPCHealth()
+		if err != nil {
+			rh.RpcOk = false
+			rh.LastHealthErr = err.Error()
+		} else {
+			rh.RpcOk = true
+			rh.ScriptReady = h.ScriptReady
+			rh.ScriptPath = strings.TrimSpace(h.ScriptPath)
+			rh.ScriptSha256 = strings.TrimSpace(h.ScriptSha256)
+			rh.ScriptBuild = strings.TrimSpace(h.ScriptBuild)
+			rh.StartedAtMs = h.StartedAtMs
+		}
+	}
+	lastErr, _ := a.scriptLastError.Load().(string)
+	payload := pingPayload{
+		Runner: rh,
+		Script: scriptHealth{
+			InstalledPath: strings.TrimSpace(a.scriptPath),
+			UpdatedAtMs:   a.scriptUpdatedAtTS.Load(),
+			LastEventTsMs: a.scriptLastEventTS.Load(),
+			LastPongTsMs:  a.scriptLastPongTS.Load(),
+			LastError:     strings.TrimSpace(lastErr),
+		},
+	}
+	pb, _ := json.Marshal(payload)
 	env := Envelope{
 		V:        1,
 		Type:     "ping",
 		DeviceID: a.deviceID,
 		Session:  sessionID,
 		Seq:      atomic.AddUint64(&a.seq, 1),
-		TS:       time.Now().UnixMilli(),
+		TS:       now,
+		Payload:  pb,
 	}
 	return a.sendJSON(ctx, ws, env)
+}
+
+type runnerRPCHealthResp struct {
+	Ok           bool   `json:"ok"`
+	Ts           int64  `json:"ts"`
+	StartedAtMs  int64  `json:"startedAtMs"`
+	ScriptReady  bool   `json:"scriptReady"`
+	ScriptPath   string `json:"scriptPath"`
+	ScriptSha256 string `json:"scriptSha256"`
+	ScriptBuild  string `json:"scriptBuild"`
+}
+
+func (a *Agent) getRunnerRPCHealth() (runnerRPCHealthResp, error) {
+	var out runnerRPCHealthResp
+	ctx, cancel := context.WithTimeout(context.Background(), 800*time.Millisecond)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://127.0.0.1:17172/rpc/health", nil)
+	if err != nil {
+		return out, err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return out, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		bs, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		msg := strings.TrimSpace(string(bs))
+		if msg == "" {
+			msg = resp.Status
+		}
+		return out, fmt.Errorf("runner rpc health status=%d err=%s", resp.StatusCode, msg)
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 64<<10)).Decode(&out); err != nil {
+		return out, err
+	}
+	if !out.Ok {
+		return out, fmt.Errorf("runner rpc health not ok")
+	}
+	return out, nil
 }
 
 func (a *Agent) readLoop(ctx context.Context, ws *websocket.Conn, sessionID string) error {
@@ -1224,6 +1304,14 @@ func (a *Agent) readLoop(ctx context.Context, ws *websocket.Conn, sessionID stri
 			a.logf("deviceSecret updated")
 		case "dbsync_start":
 			go a.handleDbSyncStart(in)
+		case "script_start":
+			go a.handleScriptStart()
+		case "script_stop":
+			go a.handleScriptStop()
+		case "script_update":
+			go a.handleScriptUpdate()
+		case "script_uninstall":
+			go a.handleScriptUninstall()
 		case "tx_send":
 			go a.handleTxSend(in)
 		case "tx_msg_action":
@@ -1234,6 +1322,84 @@ func (a *Agent) readLoop(ctx context.Context, ws *websocket.Conn, sessionID stri
 			go a.handleTxSelfCard(in)
 		}
 	}
+}
+
+func (a *Agent) handleScriptStart() {
+	if err := a.startRunner(); err != nil {
+		a.scriptLastError.Store(err.Error())
+		return
+	}
+	a.scriptLastError.Store("")
+}
+
+func (a *Agent) handleScriptStop() {
+	if err := a.stopRunnerIfRunning(); err != nil {
+		a.scriptLastError.Store(err.Error())
+		return
+	}
+	a.scriptLastError.Store("")
+}
+
+func (a *Agent) handleScriptUpdate() {
+	_, _, err := a.updateScriptAndRestart()
+	if err != nil {
+		a.scriptLastError.Store(err.Error())
+		return
+	}
+	a.scriptLastError.Store("")
+}
+
+func (a *Agent) handleScriptUninstall() {
+	_ = a.stopRunnerIfRunning()
+	_ = os.Remove(a.scriptPath)
+	a.scriptUpdatedAtTS.Store(0)
+	a.scriptLastError.Store("")
+	a.scriptLastEventTS.Store(0)
+	a.scriptLastPongTS.Store(0)
+}
+
+func (a *Agent) updateScriptAndRestart() (string, int64, error) {
+	cfg := a.getCfg()
+	base := serverHTTPBase(cfg.ServerURL)
+	if base == "" {
+		return "", 0, fmt.Errorf("serverUrl invalid")
+	}
+	downloadURL := base + "/downloads/scripts/current.js"
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, downloadURL, nil)
+	if err != nil {
+		return downloadURL, 0, err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return downloadURL, 0, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	if resp.StatusCode != http.StatusOK {
+		msg := strings.TrimSpace(string(body))
+		if msg == "" {
+			msg = resp.Status
+		}
+		return downloadURL, 0, fmt.Errorf("%s", msg)
+	}
+	if len(body) == 0 {
+		return downloadURL, 0, fmt.Errorf("empty script")
+	}
+	_ = os.MkdirAll(filepath.Dir(a.scriptPath), 0o755)
+	if err := os.WriteFile(a.scriptPath, body, 0o644); err != nil {
+		return downloadURL, 0, err
+	}
+	now := time.Now().UnixMilli()
+	a.scriptUpdatedAtTS.Store(now)
+	if err := a.stopRunnerIfRunning(); err != nil {
+		return downloadURL, now, err
+	}
+	if err := a.startRunner(); err != nil {
+		return downloadURL, now, err
+	}
+	return downloadURL, now, nil
 }
 
 func (a *Agent) handleTxSend(in Envelope) {
@@ -1259,7 +1425,7 @@ func (a *Agent) handleTxSend(in Envelope) {
 		_ = a.startRunner()
 	}
 	rpcURL := "http://127.0.0.1:17172/rpc/tx/send"
-	body, _ := json.Marshal(map[string]any{
+	out := map[string]any{
 		"opId":               p.OpID,
 		"kind":               p.Kind,
 		"jid":                p.JID,
@@ -1269,7 +1435,27 @@ func (a *Agent) handleTxSend(in Envelope) {
 		"messageOrigin":      p.MessageOrigin,
 		"creationEntryPoint": p.CreationEntryPoint,
 		"timeoutMs":          p.TimeoutMs,
-	})
+	}
+	if p.Media != nil && (p.Kind == "image" || p.Kind == "video" || p.Kind == "audio") {
+		path, caption, err := a.materializeTxMedia(p.OpID, p.Kind, p.Text, p.Media)
+		if err != nil {
+			a.logf("tx_send: media prep failed: %v", err)
+			return
+		}
+		if strings.TrimSpace(path) != "" {
+			out["path"] = path
+		}
+		if strings.TrimSpace(caption) != "" {
+			out["caption"] = caption
+		}
+		if strings.TrimSpace(p.Media.Mime) != "" {
+			out["mime"] = strings.TrimSpace(p.Media.Mime)
+		}
+		if strings.TrimSpace(p.Media.Filename) != "" {
+			out["filename"] = strings.TrimSpace(p.Media.Filename)
+		}
+	}
+	body, _ := json.Marshal(out)
 	cctx, cancel := context.WithTimeout(context.Background(), time.Duration(p.TimeoutMs+3000)*time.Millisecond)
 	defer cancel()
 	req, err := http.NewRequestWithContext(cctx, http.MethodPost, rpcURL, bytes.NewReader(body))
@@ -1294,6 +1480,149 @@ func (a *Agent) handleTxSend(in Envelope) {
 		return
 	}
 	a.logf("tx_send: dispatched opId=%s kind=%s jid=%s", p.OpID, p.Kind, p.JID)
+}
+
+func (a *Agent) materializeTxMedia(opId string, kind string, text string, media *TxSendMediaPayload) (string, string, error) {
+	opId = strings.TrimSpace(opId)
+	kind = strings.TrimSpace(kind)
+	if media == nil {
+		return "", "", fmt.Errorf("media missing")
+	}
+	src := strings.TrimSpace(media.Source)
+	urlStr := strings.TrimSpace(media.URL)
+	b64 := strings.TrimSpace(media.Base64)
+	devPath := strings.TrimSpace(media.DevicePath)
+	filename := strings.TrimSpace(media.Filename)
+	caption := strings.TrimSpace(media.Caption)
+	if caption == "" && (kind == "image" || kind == "video") {
+		caption = strings.TrimSpace(text)
+	}
+	if src == "" {
+		if devPath != "" {
+			src = "devicePath"
+		} else if urlStr != "" {
+			src = "url"
+		} else if b64 != "" {
+			src = "base64"
+		}
+	}
+	if src == "devicePath" {
+		if devPath == "" {
+			return "", caption, fmt.Errorf("devicePath missing")
+		}
+		return devPath, caption, nil
+	}
+	dir := filepath.Join(filepath.Dir(a.scriptPath), "media", "tx")
+	_ = os.MkdirAll(dir, 0o755)
+	ext := strings.TrimSpace(filepath.Ext(filename))
+	if ext == "" {
+		if kind == "image" {
+			ext = ".jpg"
+		} else if kind == "video" {
+			ext = ".mp4"
+		} else if kind == "audio" {
+			ext = ".m4a"
+		} else {
+			ext = ".bin"
+		}
+	}
+	baseName := strings.TrimSpace(opId)
+	if baseName == "" {
+		baseName = fmt.Sprintf("%d", time.Now().UnixMilli())
+	}
+	outPath := filepath.Join(dir, baseName+ext)
+	maxBytes := int64(50 << 20)
+
+	if src == "url" {
+		if urlStr == "" {
+			return "", caption, fmt.Errorf("url missing")
+		}
+		if err := downloadToFile(urlStr, outPath, maxBytes); err != nil {
+			return "", caption, err
+		}
+		return outPath, caption, nil
+	}
+	if src == "base64" {
+		if b64 == "" {
+			return "", caption, fmt.Errorf("base64 missing")
+		}
+		if idx := strings.Index(b64, "base64,"); idx >= 0 {
+			b64 = b64[idx+len("base64,"):]
+		}
+		dec, err := base64.StdEncoding.DecodeString(b64)
+		if err != nil {
+			return "", caption, err
+		}
+		if int64(len(dec)) > maxBytes {
+			return "", caption, fmt.Errorf("media too large")
+		}
+		if err := os.WriteFile(outPath, dec, 0o644); err != nil {
+			return "", caption, err
+		}
+		return outPath, caption, nil
+	}
+	if src == "url_or_base64" {
+		if urlStr != "" {
+			if err := downloadToFile(urlStr, outPath, maxBytes); err == nil {
+				return outPath, caption, nil
+			}
+		}
+		if b64 != "" {
+			if idx := strings.Index(b64, "base64,"); idx >= 0 {
+				b64 = b64[idx+len("base64,"):]
+			}
+			dec, err := base64.StdEncoding.DecodeString(b64)
+			if err != nil {
+				return "", caption, err
+			}
+			if int64(len(dec)) > maxBytes {
+				return "", caption, fmt.Errorf("media too large")
+			}
+			if err := os.WriteFile(outPath, dec, 0o644); err != nil {
+				return "", caption, err
+			}
+			return outPath, caption, nil
+		}
+		return "", caption, fmt.Errorf("no media source")
+	}
+	return "", caption, fmt.Errorf("unknown media source")
+}
+
+func downloadToFile(urlStr string, outPath string, maxBytes int64) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, urlStr, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		bs, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		msg := strings.TrimSpace(string(bs))
+		if msg == "" {
+			msg = resp.Status
+		}
+		return fmt.Errorf("download status=%d err=%s", resp.StatusCode, msg)
+	}
+	f, err := os.Create(outPath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	lr := io.LimitReader(resp.Body, maxBytes+1)
+	n, err := io.Copy(f, lr)
+	if err != nil {
+		return err
+	}
+	if n > maxBytes {
+		_ = os.Remove(outPath)
+		return fmt.Errorf("download too large")
+	}
+	return nil
 }
 
 func (a *Agent) handleTxMsgAction(in Envelope) {
