@@ -677,8 +677,6 @@ func (a *Agent) startControlServer(cfgPath string) {
 			return
 		}
 		_ = a.stopRunnerIfRunning()
-		_ = os.Remove(a.scriptPath)
-		a.scriptUpdatedAtTS.Store(0)
 		a.scriptLastError.Store("")
 		a.scriptLastEventTS.Store(0)
 		a.scriptLastPongTS.Store(0)
