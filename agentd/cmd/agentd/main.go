@@ -1509,6 +1509,10 @@ func (a *Agent) materializeTxMedia(opId string, kind string, text string, media 
 		return devPath, caption, nil
 	}
 	dir := filepath.Join(filepath.Dir(a.scriptPath), "media", "tx")
+	cfg := a.getCfg()
+	if cfg.WhatsApp.ChatStoragePath != "" {
+		dir = filepath.Join(filepath.Dir(strings.TrimSpace(cfg.WhatsApp.ChatStoragePath)), "QQwAgentMedia", "tx")
+	}
 	_ = os.MkdirAll(dir, 0o755)
 	ext := strings.TrimSpace(filepath.Ext(filename))
 	if ext == "" {
@@ -1528,6 +1532,10 @@ func (a *Agent) materializeTxMedia(opId string, kind string, text string, media 
 	}
 	outPath := filepath.Join(dir, baseName+ext)
 	maxBytes := int64(50 << 20)
+	finalize := func() {
+		_ = os.Chmod(outPath, 0o644)
+		_ = os.Chown(outPath, 501, 501)
+	}
 
 	if src == "url" {
 		if urlStr == "" {
@@ -1536,6 +1544,7 @@ func (a *Agent) materializeTxMedia(opId string, kind string, text string, media 
 		if err := downloadToFile(urlStr, outPath, maxBytes); err != nil {
 			return "", caption, err
 		}
+		finalize()
 		return outPath, caption, nil
 	}
 	if src == "base64" {
@@ -1555,11 +1564,13 @@ func (a *Agent) materializeTxMedia(opId string, kind string, text string, media 
 		if err := os.WriteFile(outPath, dec, 0o644); err != nil {
 			return "", caption, err
 		}
+		finalize()
 		return outPath, caption, nil
 	}
 	if src == "url_or_base64" {
 		if urlStr != "" {
 			if err := downloadToFile(urlStr, outPath, maxBytes); err == nil {
+				finalize()
 				return outPath, caption, nil
 			}
 		}
@@ -1577,6 +1588,7 @@ func (a *Agent) materializeTxMedia(opId string, kind string, text string, media 
 			if err := os.WriteFile(outPath, dec, 0o644); err != nil {
 				return "", caption, err
 			}
+			finalize()
 			return outPath, caption, nil
 		}
 		return "", caption, fmt.Errorf("no media source")
