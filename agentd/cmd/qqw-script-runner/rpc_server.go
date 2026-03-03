@@ -132,25 +132,30 @@ func handleRPCTxSend(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "script not ready", http.StatusServiceUnavailable)
 		return
 	}
+	payload := map[string]any{
+		"opId":           req.OpID,
+		"kind":           req.Kind,
+		"jid":            req.JID,
+		"text":           req.Text,
+		"quoteStanzaId":  req.QuoteStanzaID,
+		"participantJid": req.ParticipantJID,
+		"timeoutMs":      req.TimeoutMs,
+		"path":           req.Path,
+		"caption":        req.Caption,
+		"mime":           req.Mime,
+		"filename":       req.Filename,
+		"thumbnailPath":  req.ThumbnailPath,
+		"durationSec":    req.DurationSec,
+	}
+	if req.MessageOrigin > 0 {
+		payload["messageOrigin"] = req.MessageOrigin
+	}
+	if req.CreationEntryPoint > 0 {
+		payload["creationEntryPoint"] = req.CreationEntryPoint
+	}
 	msg := map[string]any{
-		"type": "qqw.tx_send",
-		"payload": map[string]any{
-			"opId":               req.OpID,
-			"kind":               req.Kind,
-			"jid":                req.JID,
-			"text":               req.Text,
-			"quoteStanzaId":      req.QuoteStanzaID,
-			"participantJid":     req.ParticipantJID,
-			"messageOrigin":      req.MessageOrigin,
-			"creationEntryPoint": req.CreationEntryPoint,
-			"timeoutMs":          req.TimeoutMs,
-			"path":               req.Path,
-			"caption":            req.Caption,
-			"mime":               req.Mime,
-			"filename":           req.Filename,
-			"thumbnailPath":      req.ThumbnailPath,
-			"durationSec":        req.DurationSec,
-		},
+		"type":    "qqw.tx_send",
+		"payload": payload,
 	}
 	b, _ := json.Marshal(msg)
 	if err := postToScriptJSON(string(b)); err != nil {

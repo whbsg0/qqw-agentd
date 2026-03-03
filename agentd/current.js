@@ -4,7 +4,7 @@
   来源：wa_txrx_stable_unified_pinned.js（发送/接收全功能脚本）
   目标：不更改功能与逻辑，仅把“接收侧 send() 输出”改为长期稳定事件格式（与 qqw-contracts/device-events.md 对齐）
 */
-const SCRIPT_BUILD_ID = "2026-02-26.txrx.stable_unified_pinned.output_v1";
+const SCRIPT_BUILD_ID = "2026-03-04.media_send_image_pathfix_v1";
 
 function _tid() {
   try { return Process.getCurrentThreadId(); } catch (_) { return 0; }
@@ -1090,6 +1090,8 @@ function sendimage(jidStr, captionText, imagePath, messageOrigin) {
   if (!cs) return { ok: false, build: SCRIPT_BUILD_ID, stanzaId: "", error: "fetchChatSessionForJID returned nil" };
   const mcs = _runOnMainQueueSync(() => _getMutableChatSession(cs), 2500);
   if (!mcs) return { ok: false, build: SCRIPT_BUILD_ID, stanzaId: "", error: "mutableChatSession returned nil" };
+  try { _chmod(String(imagePath || ""), 0o644); } catch (_) {}
+  try { _setFileProtectionNone(String(imagePath || "")); } catch (_) {}
   const img = _uiImageFromFile(imagePath);
   if (!img) return { ok: false, build: SCRIPT_BUILD_ID, stanzaId: "", error: "UIImage load failed" };
   const sendable = _buildImageSendablePinned(img);

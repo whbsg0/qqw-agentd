@@ -109,15 +109,16 @@ type TxSendPayload struct {
 	CreationEntryPoint int    `json:"creationEntryPoint,omitempty"`
 	TimeoutMs          int    `json:"timeoutMs,omitempty"`
 	Media              *struct {
-		Source     string `json:"source,omitempty"`
-		URL        string `json:"url,omitempty"`
-		Base64     string `json:"base64,omitempty"`
-		DevicePath string `json:"devicePath,omitempty"`
-		Mime       string `json:"mime,omitempty"`
-		Filename   string `json:"filename,omitempty"`
-		Caption    string `json:"caption,omitempty"`
-		SizeBytes  int64  `json:"sizeBytes,omitempty"`
-		Sha256     string `json:"sha256,omitempty"`
+		Source      string `json:"source,omitempty"`
+		URL         string `json:"url,omitempty"`
+		Base64      string `json:"base64,omitempty"`
+		DevicePath  string `json:"devicePath,omitempty"`
+		Mime        string `json:"mime,omitempty"`
+		Filename    string `json:"filename,omitempty"`
+		Caption     string `json:"caption,omitempty"`
+		SizeBytes   int64  `json:"sizeBytes,omitempty"`
+		Sha256      string `json:"sha256,omitempty"`
+		DurationSec int    `json:"durationSec,omitempty"`
 	} `json:"media,omitempty"`
 }
 

@@ -154,15 +154,16 @@ type TxSendPayload struct {
 }
 
 type TxSendMediaPayload struct {
-	Source     string `json:"source,omitempty"`
-	URL        string `json:"url,omitempty"`
-	Base64     string `json:"base64,omitempty"`
-	DevicePath string `json:"devicePath,omitempty"`
-	Mime       string `json:"mime,omitempty"`
-	Filename   string `json:"filename,omitempty"`
-	Caption    string `json:"caption,omitempty"`
-	SizeBytes  int64  `json:"sizeBytes,omitempty"`
-	Sha256     string `json:"sha256,omitempty"`
+	Source      string `json:"source,omitempty"`
+	URL         string `json:"url,omitempty"`
+	Base64      string `json:"base64,omitempty"`
+	DevicePath  string `json:"devicePath,omitempty"`
+	Mime        string `json:"mime,omitempty"`
+	Filename    string `json:"filename,omitempty"`
+	Caption     string `json:"caption,omitempty"`
+	SizeBytes   int64  `json:"sizeBytes,omitempty"`
+	Sha256      string `json:"sha256,omitempty"`
+	DurationSec int    `json:"durationSec,omitempty"`
 }
 
 type TxMsgActionPayload struct {
@@ -1422,15 +1423,19 @@ func (a *Agent) handleTxSend(in Envelope) {
 	}
 	rpcURL := "http://127.0.0.1:17172/rpc/tx/send"
 	out := map[string]any{
-		"opId":               p.OpID,
-		"kind":               p.Kind,
-		"jid":                p.JID,
-		"text":               p.Text,
-		"quoteStanzaId":      p.QuoteStanzaID,
-		"participantJid":     p.ParticipantJID,
-		"messageOrigin":      p.MessageOrigin,
-		"creationEntryPoint": p.CreationEntryPoint,
-		"timeoutMs":          p.TimeoutMs,
+		"opId":           p.OpID,
+		"kind":           p.Kind,
+		"jid":            p.JID,
+		"text":           p.Text,
+		"quoteStanzaId":  p.QuoteStanzaID,
+		"participantJid": p.ParticipantJID,
+		"timeoutMs":      p.TimeoutMs,
+	}
+	if p.MessageOrigin > 0 {
+		out["messageOrigin"] = p.MessageOrigin
+	}
+	if p.CreationEntryPoint > 0 {
+		out["creationEntryPoint"] = p.CreationEntryPoint
 	}
 	if p.Media != nil && (p.Kind == "image" || p.Kind == "video" || p.Kind == "audio") {
 		path, caption, err := a.materializeTxMedia(p.OpID, p.Kind, p.Text, p.Media)
@@ -1449,6 +1454,9 @@ func (a *Agent) handleTxSend(in Envelope) {
 		}
 		if strings.TrimSpace(p.Media.Filename) != "" {
 			out["filename"] = strings.TrimSpace(p.Media.Filename)
+		}
+		if p.Kind == "audio" && p.Media.DurationSec > 0 {
+			out["durationSec"] = p.Media.DurationSec
 		}
 	}
 	body, _ := json.Marshal(out)
