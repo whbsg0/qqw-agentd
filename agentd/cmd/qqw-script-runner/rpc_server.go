@@ -18,6 +18,12 @@ type txSendRPCReq struct {
 	MessageOrigin      int    `json:"messageOrigin,omitempty"`
 	CreationEntryPoint int    `json:"creationEntryPoint,omitempty"`
 	TimeoutMs          int    `json:"timeoutMs,omitempty"`
+	Path               string `json:"path,omitempty"`
+	Caption            string `json:"caption,omitempty"`
+	Mime               string `json:"mime,omitempty"`
+	Filename           string `json:"filename,omitempty"`
+	ThumbnailPath      string `json:"thumbnailPath,omitempty"`
+	DurationSec        int    `json:"durationSec,omitempty"`
 }
 
 type msgActionRPCReq struct {
@@ -110,6 +116,11 @@ func handleRPCTxSend(w http.ResponseWriter, r *http.Request) {
 	req.Text = strings.TrimSpace(req.Text)
 	req.QuoteStanzaID = strings.TrimSpace(req.QuoteStanzaID)
 	req.ParticipantJID = strings.TrimSpace(req.ParticipantJID)
+	req.Path = strings.TrimSpace(req.Path)
+	req.Caption = strings.TrimSpace(req.Caption)
+	req.Mime = strings.TrimSpace(req.Mime)
+	req.Filename = strings.TrimSpace(req.Filename)
+	req.ThumbnailPath = strings.TrimSpace(req.ThumbnailPath)
 	if req.OpID == "" || req.Kind == "" || req.JID == "" {
 		http.Error(w, "opId/kind/jid required", http.StatusBadRequest)
 		return
@@ -133,6 +144,12 @@ func handleRPCTxSend(w http.ResponseWriter, r *http.Request) {
 			"messageOrigin":      req.MessageOrigin,
 			"creationEntryPoint": req.CreationEntryPoint,
 			"timeoutMs":          req.TimeoutMs,
+			"path":               req.Path,
+			"caption":            req.Caption,
+			"mime":               req.Mime,
+			"filename":           req.Filename,
+			"thumbnailPath":      req.ThumbnailPath,
+			"durationSec":        req.DurationSec,
 		},
 	}
 	b, _ := json.Marshal(msg)

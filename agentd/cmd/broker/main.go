@@ -108,6 +108,17 @@ type TxSendPayload struct {
 	MessageOrigin      int    `json:"messageOrigin,omitempty"`
 	CreationEntryPoint int    `json:"creationEntryPoint,omitempty"`
 	TimeoutMs          int    `json:"timeoutMs,omitempty"`
+	Media              *struct {
+		Source     string `json:"source,omitempty"`
+		URL        string `json:"url,omitempty"`
+		Base64     string `json:"base64,omitempty"`
+		DevicePath string `json:"devicePath,omitempty"`
+		Mime       string `json:"mime,omitempty"`
+		Filename   string `json:"filename,omitempty"`
+		Caption    string `json:"caption,omitempty"`
+		SizeBytes  int64  `json:"sizeBytes,omitempty"`
+		Sha256     string `json:"sha256,omitempty"`
+	} `json:"media,omitempty"`
 }
 
 type TxMsgActionPayload struct {
@@ -172,6 +183,10 @@ type Broker struct {
 	dbErrMu        sync.Mutex
 	lastDBErrLogMs map[string]int64
 
+	presenceEmitMu      sync.Mutex
+	lastPresenceEmitMs  map[string]int64
+	lastPresenceEmitKey map[string]string
+
 	controlPlaneURL   string
 	controlPlaneProxy *httputil.ReverseProxy
 	brokerAdminToken  string
@@ -182,13 +197,15 @@ func main() {
 	addr := envOr("BROKER_ADDR", ":8080")
 	hb := 20
 	b := &Broker{
-		heartbeatSec:       hb,
-		deviceSecretHash:   make(map[string]string),
-		sessions:           make(map[string]*AgentSession),
-		lastEgressIP:       make(map[string]string),
-		lastEgressUpdateMs: make(map[string]int64),
-		tunnels:            make(map[string]*Tunnel),
-		lastDBErrLogMs:     make(map[string]int64),
+		heartbeatSec:        hb,
+		deviceSecretHash:    make(map[string]string),
+		sessions:            make(map[string]*AgentSession),
+		lastEgressIP:        make(map[string]string),
+		lastEgressUpdateMs:  make(map[string]int64),
+		tunnels:             make(map[string]*Tunnel),
+		lastDBErrLogMs:      make(map[string]int64),
+		lastPresenceEmitMs:  make(map[string]int64),
+		lastPresenceEmitKey: make(map[string]string),
 	}
 
 	if dsn := strings.TrimSpace(os.Getenv("DATABASE_URL")); dsn != "" {
@@ -1536,7 +1553,100 @@ where device_id=$1 and session_id=$2 and disconnected_at is null
 		if b.shouldLogDBErr(deviceID) {
 			logJSON("db_write_failed", map[string]any{"op": "agent_sessions_ping", "deviceId": deviceID, "sessionId": sessionID, "err": err.Error()})
 		}
+		return
 	}
+	if health != nil {
+		b.maybeEmitWaAccountPatched(deviceID, "online", time.Now().UnixMilli(), health)
+	}
+}
+
+func (b *Broker) maybeEmitWaAccountPatched(deviceID, status string, lastSeenMs int64, health *PingPayload) {
+	if b.db == nil {
+		return
+	}
+	deviceID = strings.TrimSpace(deviceID)
+	status = strings.TrimSpace(status)
+	if deviceID == "" {
+		return
+	}
+	if lastSeenMs <= 0 {
+		lastSeenMs = time.Now().UnixMilli()
+	}
+	scriptState := "offline"
+	if strings.EqualFold(status, "online") {
+		scriptState = "unknown"
+		if health != nil {
+			if health.Runner.Pid <= 0 || !health.Runner.RpcOk || !health.Runner.ScriptReady {
+				scriptState = "bad"
+			} else {
+				lastLive := health.Script.LastEventTsMs
+				if health.Script.LastPongTsMs > lastLive {
+					lastLive = health.Script.LastPongTsMs
+				}
+				if lastLive > 0 && lastSeenMs-lastLive <= 120*1000 {
+					scriptState = "ok"
+				} else {
+					scriptState = "idle"
+				}
+			}
+		}
+	}
+
+	key := status + "|" + scriptState
+	b.presenceEmitMu.Lock()
+	lastAt := b.lastPresenceEmitMs[deviceID]
+	lastKey := b.lastPresenceEmitKey[deviceID]
+	if key == lastKey && lastAt > 0 && lastSeenMs-lastAt < 5000 {
+		b.presenceEmitMu.Unlock()
+		return
+	}
+	if lastAt > 0 && lastSeenMs-lastAt < 1200 {
+		b.presenceEmitMu.Unlock()
+		return
+	}
+	b.lastPresenceEmitMs[deviceID] = lastSeenMs
+	b.lastPresenceEmitKey[deviceID] = key
+	b.presenceEmitMu.Unlock()
+
+	payload := map[string]any{
+		"deviceId":    deviceID,
+		"waAccountId": deviceID,
+		"status":      strings.ToLower(status),
+		"lastSeenMs":  lastSeenMs,
+		"scriptState": scriptState,
+	}
+	if health != nil {
+		payload["runnerPid"] = health.Runner.Pid
+		payload["runnerRpcOk"] = health.Runner.RpcOk
+		payload["runnerScriptReady"] = health.Runner.ScriptReady
+		payload["scriptUpdatedAtMs"] = health.Script.UpdatedAtMs
+		payload["scriptLastEventTsMs"] = health.Script.LastEventTsMs
+		payload["scriptLastPongTsMs"] = health.Script.LastPongTsMs
+		if strings.TrimSpace(health.Script.LastError) != "" {
+			payload["scriptLastError"] = strings.TrimSpace(health.Script.LastError)
+		}
+	}
+	bs, _ := json.Marshal(payload)
+	payloadText := "{}"
+	if len(bs) > 0 {
+		payloadText = string(bs)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	assetID := ""
+	tenantID := ""
+	_ = b.db.QueryRowContext(ctx, `select asset_id from assets where device_id=$1 limit 1`, deviceID).Scan(&assetID)
+	_ = b.db.QueryRowContext(ctx, `select tenant_id from devices where device_id=$1 limit 1`, deviceID).Scan(&tenantID)
+	if _, err := b.db.ExecContext(ctx, `
+insert into realtime_events(scope, type, tenant_id, device_id, asset_id, wa_account_id, chat_jid, stanza_id, op_id, ts_ms, payload)
+values ('employee', $1, nullif($2,''), $3, nullif($4,''), nullif($5,''), null, null, null, $6, $7::jsonb)
+`, "wa_account_patched", strings.TrimSpace(tenantID), deviceID, strings.TrimSpace(assetID), deviceID, lastSeenMs, payloadText); err != nil {
+		if b.shouldLogDBErr(deviceID) {
+			logJSON("db_write_failed", map[string]any{"op": "realtime_events_insert", "scope": "employee", "type": "wa_account_patched", "deviceId": deviceID, "err": err.Error()})
+		}
+		return
+	}
+	_, _ = b.db.ExecContext(ctx, `select pg_notify('qqw_events', 'employee')`)
 }
 
 func (b *Broker) recordSessionDisconnected(deviceID, sessionID string) {
@@ -1559,7 +1669,9 @@ func (b *Broker) recordSessionDisconnected(deviceID, sessionID string) {
 		if b.shouldLogDBErr(deviceID) {
 			logJSON("db_write_failed", map[string]any{"op": "agent_sessions_disconnect", "deviceId": deviceID, "sessionId": sessionID, "err": err.Error()})
 		}
+		return
 	}
+	b.maybeEmitWaAccountPatched(deviceID, "offline", time.Now().UnixMilli(), nil)
 }
 
 func normalizeIP(v string) string {

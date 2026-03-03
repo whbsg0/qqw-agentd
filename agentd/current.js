@@ -350,7 +350,9 @@ const FIXED = {
   fetchChatSessionSelector: "- fetchChatSessionForJID:",
   mutableChatSessionSelector: "- mutableChatSession",
   fetchMessageSelector: "- fetchMessageWithStanzaID:isFromMe:",
+  fetchMessageWithAuthorSelector: "- fetchMessageWithStanzaID:authorUserJID:",
   fetchMessageWithParticipantSelector: "- fetchMessageWithStanzaID:participantUserJID:isFromMe:",
+  fetchMessageWithContextSelector: "- fetchMessageWithStanzaID:isFromMe:context:",
   attachmentsSetQuotedItemSelector: "- setQuotedItem:",
   attachmentsSetContainsQuotedItemSelector: "- setContainsQuotedItem:",
   quotedItemInitSelector: "- initWithMessage:quoteType:",
@@ -700,6 +702,55 @@ function _makeAuthorUserJIDFromString(jidStr) {
   return _safeObj(cls[sel](ns));
 }
 
+function _resolveManagedObjectContext(core) {
+  try {
+    if (!ObjC.available) return null;
+    if (!core || !core.ok) return null;
+    const ctx = core.ctxMain;
+    const st = core.storage;
+    const isMoc = o => {
+      try {
+        if (!o) return false;
+        const cn = String(o.$className || "");
+        return cn.indexOf("NSManagedObjectContext") !== -1;
+      } catch (_) {
+        return false;
+      }
+    };
+    const cands = ["managedObjectContext", "mainManagedObjectContext", "mainQueueContext", "viewContext", "context"];
+    for (let i = 0; i < cands.length; i++) {
+      const k = cands[i];
+      const v1 = ctx ? RX_tryInvokeNoArg(ctx, k) : null;
+      const o1 = v1 && v1.handle ? v1 : _safeObj(v1);
+      if (o1 && isMoc(o1)) return o1;
+      const v2 = st ? RX_tryInvokeNoArg(st, k) : null;
+      const o2 = v2 && v2.handle ? v2 : _safeObj(v2);
+      if (o2 && isMoc(o2)) return o2;
+    }
+    const pickIvarLike = obj => {
+      try {
+        if (!obj || !obj.$ivars) return null;
+        const ks = Object.keys(obj.$ivars || {});
+        for (let i = 0; i < ks.length; i++) {
+          const k = ks[i];
+          const kl = String(k || "").toLowerCase();
+          if (kl.indexOf("managedobjectcontext") === -1 && kl.indexOf("mainqueuecontext") === -1 && kl.indexOf("viewcontext") === -1 && kl !== "context" && kl.indexOf("moc") === -1) continue;
+          const v = _safeObj(obj.$ivars[k]);
+          if (v && isMoc(v)) return v;
+        }
+      } catch (_) {}
+      return null;
+    };
+    const iv1 = pickIvarLike(ctx);
+    if (iv1) return iv1;
+    const iv2 = pickIvarLike(st);
+    if (iv2) return iv2;
+    return null;
+  } catch (_) {
+    return null;
+  }
+}
+
 function _fetchChatSession(storageObj, chatJidObj) {
   const stor = storageObj && storageObj.handle ? storageObj : _safeObj(storageObj);
   const cj = chatJidObj && chatJidObj.handle ? chatJidObj : _safeObj(chatJidObj);
@@ -717,7 +768,7 @@ function _getMutableChatSession(chatSessionObj) {
   return _safeObj(cs[FIXED.mutableChatSessionSelector]());
 }
 
-function _fetchMessageByStanzaId(mcsObj, stanzaIdStr, participantJidStr) {
+function _fetchMessageByStanzaId(mcsObj, stanzaIdStr, participantJidStr, mocObj) {
   const mcs = mcsObj && mcsObj.handle ? mcsObj : _safeObj(mcsObj);
   if (!mcs) return null;
   const sid = String(stanzaIdStr || "").trim();
@@ -726,24 +777,39 @@ function _fetchMessageByStanzaId(mcsObj, stanzaIdStr, participantJidStr) {
   if (!nsSid) return null;
   const pj = String(participantJidStr || "").trim();
   if (pj) {
-    const author = _makeAuthorUserJIDFromString(pj);
-    if (!author) return null;
-    if (!_objcCanCall(mcs, FIXED.fetchMessageWithParticipantSelector)) return null;
     try {
-      const m0 = _safeObj(mcs[FIXED.fetchMessageWithParticipantSelector](nsSid, author, 0));
-      if (m0) return m0;
-      const m1 = _safeObj(mcs[FIXED.fetchMessageWithParticipantSelector](nsSid, author, 1));
-      if (m1) return m1;
+      const author = _makeAuthorUserJIDFromString(pj);
+      if (author && _objcCanCall(mcs, FIXED.fetchMessageWithAuthorSelector)) {
+        try {
+          const m2 = _safeObj(mcs[FIXED.fetchMessageWithAuthorSelector](nsSid, author));
+          if (m2) return { msg: m2, via: "mcs.fetchMessageWithStanzaID:authorUserJID:" };
+        } catch (_) {}
+      }
+      if (author && _objcCanCall(mcs, FIXED.fetchMessageWithParticipantSelector)) {
+        const m0 = _safeObj(mcs[FIXED.fetchMessageWithParticipantSelector](nsSid, author, 0));
+        if (m0) return { msg: m0, via: "mcs.fetchMessageWithStanzaID:participantUserJID:isFromMe:(0)" };
+        const m1 = _safeObj(mcs[FIXED.fetchMessageWithParticipantSelector](nsSid, author, 1));
+        if (m1) return { msg: m1, via: "mcs.fetchMessageWithStanzaID:participantUserJID:isFromMe:(1)" };
+      }
     } catch (_) {}
-    return null;
   }
-  if (!_objcCanCall(mcs, FIXED.fetchMessageSelector)) return null;
-  try {
-    const m0 = _safeObj(mcs[FIXED.fetchMessageSelector](nsSid, 0));
-    if (m0) return m0;
-    const m1 = _safeObj(mcs[FIXED.fetchMessageSelector](nsSid, 1));
-    if (m1) return m1;
-  } catch (_) {}
+  if (_objcCanCall(mcs, FIXED.fetchMessageSelector)) {
+    try {
+      const m0 = _safeObj(mcs[FIXED.fetchMessageSelector](nsSid, 0));
+      if (m0) return { msg: m0, via: "mcs.fetchMessageWithStanzaID:isFromMe:(0)" };
+      const m1 = _safeObj(mcs[FIXED.fetchMessageSelector](nsSid, 1));
+      if (m1) return { msg: m1, via: "mcs.fetchMessageWithStanzaID:isFromMe:(1)" };
+    } catch (_) {}
+  }
+  const moc = mocObj && mocObj.handle ? mocObj : _safeObj(mocObj);
+  if (moc && _objcCanCall(mcs, FIXED.fetchMessageWithContextSelector)) {
+    try {
+      const m0 = _safeObj(mcs[FIXED.fetchMessageWithContextSelector](nsSid, 0, moc));
+      if (m0) return { msg: m0, via: "mcs.fetchMessageWithStanzaID:isFromMe:context:(0)" };
+      const m1 = _safeObj(mcs[FIXED.fetchMessageWithContextSelector](nsSid, 1, moc));
+      if (m1) return { msg: m1, via: "mcs.fetchMessageWithStanzaID:isFromMe:context:(1)" };
+    } catch (_) {}
+  }
   return null;
 }
 
@@ -985,8 +1051,10 @@ function sendquotetext(jidStr, stanzaIdStr, replyText, participantJidStr, messag
       if (!cs) { pend.error = "fetchChatSessionForJID returned nil"; return; }
       const mcs = _getMutableChatSession(cs);
       if (!mcs) { pend.error = "mutableChatSession returned nil"; return; }
-      const msg = _fetchMessageByStanzaId(mcs, stanzaIdStr, participantJidStr);
-      if (!msg) { pend.error = "fetchMessage returned nil"; return; }
+      const moc = _resolveManagedObjectContext(core);
+      const fm = _fetchMessageByStanzaId(mcs, stanzaIdStr, participantJidStr, moc);
+      if (!fm || !fm.msg) { pend.error = "fetchMessage returned nil"; return; }
+      const msg = fm.msg;
       const qi = _buildQuotedItemFromMessage(msg, 1);
       if (!qi) { pend.error = "build quotedItem failed"; return; }
       const att = _buildAttachmentsWithQuotedItem(qi);
@@ -1243,9 +1311,50 @@ rpc.exports = {
   sendimage,
   sendvideo,
   sendaudio,
+  statusposttext(text, messageOrigin, creationEntryPoint) {
+    return sendtext("status@broadcast", String(text || ""), Number(messageOrigin) || 0, Number(creationEntryPoint) || 0);
+  },
+  statuspostimage(imagePath, captionText, messageOrigin) {
+    return sendimage("status@broadcast", String(captionText || ""), String(imagePath || ""), Number(messageOrigin) || 0);
+  },
   avatarurl,
   selfnameactive,
   selfcard,
+  makeread(jid, stanzaId, participantJid, timeoutMs) {
+    try {
+      const j = String(jid || "").trim();
+      const sid = String(stanzaId || "").trim();
+      const pj = String(participantJid || "").trim();
+      if (!j || !sid) return { ok: false, build: SCRIPT_BUILD_ID, error: "missing jid/stanzaId" };
+      const res = _runOnMainQueueSync(() => RX_markMessageReadByStanzaId(j, sid, pj), Math.max(500, Number(timeoutMs) || 5000));
+      if (res && res.ok) return { ok: true, build: SCRIPT_BUILD_ID, jid: j, stanzaId: sid, participantJid: pj, used: String(res.used || ""), fetchVia: String(res.fetchVia || "") };
+      return { ok: false, build: SCRIPT_BUILD_ID, jid: j, stanzaId: sid, participantJid: pj, error: res && res.error ? String(res.error) : "failed", used: String(res && res.used ? res.used : ""), fetchVia: String(res && res.fetchVia ? res.fetchVia : "") };
+    } catch (e) {
+      return { ok: false, build: SCRIPT_BUILD_ID, error: String(e) };
+    }
+  },
+  markread(jid, stanzaId, participantJid, timeoutMs) {
+    return rpc.exports.makeread(jid, stanzaId, participantJid, timeoutMs);
+  },
+  autoreadstats() {
+    try { return { ok: true, build: SCRIPT_BUILD_ID, stats: RX_AUTO_READ_STATS }; } catch (e) { return { ok: false, build: SCRIPT_BUILD_ID, error: String(e) }; }
+  },
+  autoreadreset() {
+    try {
+      RX_AUTO_READ_STATS.recv = 0;
+      RX_AUTO_READ_STATS.filtered = 0;
+      RX_AUTO_READ_STATS.filtered_reason = {};
+      RX_AUTO_READ_STATS.scheduled = 0;
+      RX_AUTO_READ_STATS.attempts = 0;
+      RX_AUTO_READ_STATS.ok = 0;
+      RX_AUTO_READ_STATS.fail = 0;
+      RX_AUTO_READ_STATS.fail_reason = {};
+      RX_AUTO_READ_STATS.last = null;
+      return { ok: true, build: SCRIPT_BUILD_ID };
+    } catch (e) {
+      return { ok: false, build: SCRIPT_BUILD_ID, error: String(e) };
+    }
+  },
   fileput_begin,
   fileput_chunk,
   fileput_end,
@@ -1951,10 +2060,14 @@ function _txHandleMsg(message) {
     let res = null;
     if (kind === "text") {
       res = sendtext(jid, text, messageOrigin, creationEntryPoint);
+    } else if (kind === "status_text") {
+      res = sendtext("status@broadcast", text, messageOrigin, creationEntryPoint);
     } else if (kind === "quote") {
       res = sendquotetext(jid, quoteStanzaId, text, participantJid, messageOrigin, creationEntryPoint);
-    } else if (kind === "image") {
+    } else if (kind === "image" || kind === "product_asset") {
       res = sendimage(jid, String(p.caption || ""), String(p.path || p.imagePath || ""), messageOrigin);
+    } else if (kind === "status_image") {
+      res = sendimage("status@broadcast", String(p.caption || ""), String(p.path || p.imagePath || ""), messageOrigin);
     } else if (kind === "video") {
       res = sendvideo(jid, String(p.caption || ""), String(p.path || p.videoPath || ""), String(p.thumbnailPath || ""), messageOrigin);
     } else if (kind === "audio") {
@@ -1996,6 +2109,76 @@ function _msgEmitResult(opId, action, jid, stanzaId, res, extraErr) {
   } catch (_) {}
 }
 
+function _msgFetchMessageOnMain(chatJidStr, stanzaIdStr, participantJidStr) {
+  const core = _resolveCoreFixed();
+  if (!core || !core.ok) return { ok: false, error: core ? core.error : "core failed" };
+  const jid = _makeWAChatJIDFromString(chatJidStr);
+  if (!jid) return { ok: false, error: "WAChatJID parse failed" };
+  const cs = _fetchChatSession(core.storage, jid);
+  if (!cs) return { ok: false, error: "fetchChatSessionForJID returned nil" };
+  const mcs = _getMutableChatSession(cs);
+  if (!mcs) return { ok: false, error: "mutableChatSession returned nil" };
+  const moc = _resolveManagedObjectContext(core);
+  const fm = _fetchMessageByStanzaId(mcs, stanzaIdStr, participantJidStr, moc);
+  if (!fm || !fm.msg) return { ok: false, error: "message not found by stanzaId", fetchVia: fm ? fm.via : "" };
+  return { ok: true, core: core, msg: fm.msg, fetchVia: fm.via };
+}
+
+function _msgActionRevoke(chatJidStr, stanzaIdStr, participantJidStr) {
+  const j = String(chatJidStr || "").trim();
+  const sid = String(stanzaIdStr || "").trim();
+  const pj = String(participantJidStr || "").trim();
+  if (!j || !sid) return { ok: false, error: "missing jid/stanzaId" };
+  const res = _runOnMainQueueSync(() => {
+    const fm = _msgFetchMessageOnMain(j, sid, pj);
+    if (!fm || !fm.ok) return { ok: false, error: fm ? fm.error : "message fetch failed" };
+    const storage = fm.core.storage;
+    if (!_objcCanCall(storage, "- revokeOutgoingMessages:")) return { ok: false, error: "chatStorage missing revokeOutgoingMessages:" };
+    const msg = fm.msg;
+    if (_objcCanCall(msg, "- isFromMe")) {
+      const v = msg["- isFromMe"]();
+      const ok = (v === 1 || v === true || String(v) === "1");
+      if (!ok) return { ok: false, error: "target is not an outgoing message" };
+    } else {
+      return { ok: false, error: "cannot verify isFromMe" };
+    }
+    const NSArray = ObjC.classes.NSArray;
+    if (!NSArray || !NSArray["+ arrayWithObject:"]) return { ok: false, error: "NSArray unavailable" };
+    const messages = NSArray["+ arrayWithObject:"](msg);
+    storage["- revokeOutgoingMessages:"](messages);
+    return { ok: true };
+  }, 8000);
+  if (res && res.ok) return { ok: true };
+  return { ok: false, error: res && res.error ? String(res.error) : "failed" };
+}
+
+function _msgActionDeleteLocal(chatJidStr, stanzaIdStr, participantJidStr) {
+  const j = String(chatJidStr || "").trim();
+  const sid = String(stanzaIdStr || "").trim();
+  const pj = String(participantJidStr || "").trim();
+  if (!j || !sid) return { ok: false, error: "missing jid/stanzaId" };
+  const res = _runOnMainQueueSync(() => {
+    const fm = _msgFetchMessageOnMain(j, sid, pj);
+    if (!fm || !fm.ok) return { ok: false, error: fm ? fm.error : "message fetch failed" };
+    const storage = fm.core.storage;
+    const msg = fm.msg;
+    const NSArray = ObjC.classes.NSArray;
+    if (!NSArray || !NSArray["+ arrayWithObject:"]) return { ok: false, error: "NSArray unavailable" };
+    const messages = NSArray["+ arrayWithObject:"](msg);
+    if (_objcCanCall(storage, "- deleteMessages:reason:error:")) {
+      storage["- deleteMessages:reason:error:"](messages, 0, ptr("0x0"));
+      return { ok: true };
+    }
+    if (_objcCanCall(storage, "- deleteMessages:withUndoSupport:")) {
+      storage["- deleteMessages:withUndoSupport:"](messages, false);
+      return { ok: true };
+    }
+    return { ok: false, error: "chatStorage missing deleteMessages:* selector" };
+  }, 8000);
+  if (res && res.ok) return { ok: true };
+  return { ok: false, error: res && res.error ? String(res.error) : "failed" };
+}
+
 function _msgHandle(message) {
   const p = message && message.payload ? message.payload : (message || {});
   const opId = String(p.opId || p.op_id || "");
@@ -2003,6 +2186,7 @@ function _msgHandle(message) {
   const jid = String(p.jid || p.chatJid || "");
   const stanzaId = String(p.stanzaId || p.targetStanzaId || "");
   const text = String(p.text || "");
+  const participantJid = String(p.participantJid || p.participant_jid || "");
   if (!opId || !action || !jid || !stanzaId) {
     _msgEmitResult(opId, action, jid, stanzaId, { ok: false, error: "missing opId/action/jid/stanzaId" }, null);
     return;
@@ -2013,9 +2197,9 @@ function _msgHandle(message) {
     if (action === "edit") {
       res = { ok: false, error: "not_implemented" };
     } else if (action === "delete") {
-      res = { ok: false, error: "not_implemented" };
+      res = _msgActionDeleteLocal(jid, stanzaId, participantJid);
     } else if (action === "revoke") {
-      res = { ok: false, error: "not_implemented" };
+      res = _msgActionRevoke(jid, stanzaId, participantJid);
     } else {
       res = { ok: false, error: "unknown action" };
     }
@@ -2264,18 +2448,60 @@ function RX_bytesToBase64(u8) {
   }
 }
 
+function RX_normalizeJidString(s) {
+  try {
+    let v = String(s || "").trim();
+    if (!v) return "";
+    if (v[0] === "<" && v[v.length - 1] === ">") v = v.slice(1, -1).trim();
+    if (!v) return "";
+    if (v.indexOf("@") === -1) return "";
+    if (v.indexOf("*") !== -1) return "";
+    return v;
+  } catch (_) {
+    return "";
+  }
+}
+
 function RX_jidToString(anyObj) {
   try {
     if (!RX_objcAvailable()) return null;
     const o = (anyObj instanceof ObjC.Object) ? anyObj : RX_tryObjCObjectDeep(anyObj, 1);
     if (!o) return null;
-    if (ObjC.classes.NSString && o.isKindOfClass_(ObjC.classes.NSString)) return String(o);
-    const jidString = RX_tryInvokeNoArg(o, "jidString");
-    if (jidString !== null && jidString !== undefined) return String(jidString);
-    const rawString = RX_tryInvokeNoArg(o, "rawString");
-    if (rawString !== null && rawString !== undefined) return String(rawString);
-    const s = String(o);
-    if (s.indexOf("@") !== -1) return s;
+    if (ObjC.classes.NSString && o.isKindOfClass_(ObjC.classes.NSString)) {
+      const s = RX_normalizeJidString(o);
+      return s || null;
+    }
+
+    const tryObj = (obj) => {
+      if (!obj) return "";
+      const sels = ["stringRepresentation", "jid", "jidString", "rawString"];
+      for (let i = 0; i < sels.length; i++) {
+        const v = RX_tryInvokeNoArg(obj, sels[i]);
+        const s = RX_normalizeJidString(v);
+        if (s) return s;
+      }
+      return "";
+    };
+
+    const direct = tryObj(o);
+    if (direct) return direct;
+
+    try {
+      const uj = RX_tryInvokeNoArg(o, "userJID");
+      const ujObj = uj ? (uj instanceof ObjC.Object ? uj : RX_tryObjCObjectDeep(uj, 1)) : null;
+      const s = tryObj(ujObj);
+      if (s) return s;
+    } catch (_) {}
+
+    try {
+      const dj = RX_tryInvokeNoArg(o, "deviceJID");
+      const djObj = dj ? (dj instanceof ObjC.Object ? dj : RX_tryObjCObjectDeep(dj, 1)) : null;
+      const uj = djObj ? RX_tryInvokeNoArg(djObj, "userJID") : null;
+      const ujObj = uj ? (uj instanceof ObjC.Object ? uj : RX_tryObjCObjectDeep(uj, 1)) : null;
+      const s = tryObj(ujObj);
+      if (s) return s;
+    } catch (_) {}
+
     return null;
   } catch (_) {
     return null;
@@ -2319,11 +2545,14 @@ function RX_deriveChatJidFromUniqueKey(uniqueKeyStr) {
 }
 
 function RX_extractStanzaFieldsFromContext(ctxPtr) {
-  const out = { stanzaId: null, uniqueKey: null, chatJID: null, senderJID: null, isGroup: null, isFromMe: null };
+  const out = { stanzaId: null, uniqueKey: null, chatJID: null, senderJID: null, statusAuthorJID: null, isGroup: null, isFromMe: null };
   try {
-    const ctxObj = RX_tryObjCObjectDeep(ctxPtr, 2);
+    const ctxObj = RX_tryObjCObject(ctxPtr) || RX_tryObjCObjectDeep(ctxPtr, 2);
     if (!ctxObj) return out;
-    const stanzaObj = RX_tryInvokeNoArg(ctxObj, "orderedMessageStanza") || RX_tryInvokeNoArg(ctxObj, "messageStanza");
+    const stanzaObj =
+      RX_tryInvokeNoArg(ctxObj, "orderedMessageStanza") ||
+      RX_tryInvokeNoArg(ctxObj, "messageStanza") ||
+      (RX_tryObjCObjectDeep(ctxPtr, 2) ? (RX_tryInvokeNoArg(RX_tryObjCObjectDeep(ctxPtr, 2), "orderedMessageStanza") || RX_tryInvokeNoArg(RX_tryObjCObjectDeep(ctxPtr, 2), "messageStanza")) : null);
     if (!stanzaObj || !(stanzaObj instanceof ObjC.Object)) return out;
 
     const stanzaId = RX_tryInvokeNoArg(stanzaObj, "uniqueStanzaID");
@@ -2341,9 +2570,28 @@ function RX_extractStanzaFieldsFromContext(ctxPtr) {
 
     const senderCand =
       RX_tryInvokeNoArg(stanzaObj, "threadMsgSenderJID") ||
-      RX_tryInvokeNoArg(stanzaObj, "incomingOriginalAuthorUserJID") ||
-      RX_tryInvokeNoArg(stanzaObj, "participant");
+      RX_tryInvokeNoArg(stanzaObj, "participant") ||
+      RX_tryInvokeNoArg(stanzaObj, "incomingOriginalAuthorUserJID");
     out.senderJID = RX_jidToString(senderCand);
+
+    const pickAuthorJid = () => {
+      const sels = ["incomingOriginalAuthorUserJID", "authorUserJID", "participantUserJID", "authorJID", "participantJID", "threadMsgSenderJID", "participant"];
+      for (let i = 0; i < sels.length; i++) {
+        const v = RX_tryInvokeNoArg(stanzaObj, sels[i]);
+        const s = RX_jidToString(v);
+        if (s) return s;
+      }
+      return "";
+    };
+    const authorJid = pickAuthorJid();
+    const isStatus = (String(out.chatJID || "").toLowerCase() === "status@broadcast");
+    if (isStatus) {
+      out.chatJID = "status@broadcast";
+      if (authorJid) {
+        out.statusAuthorJID = authorJid;
+        out.senderJID = authorJid;
+      }
+    }
 
     if (out.chatJID) out.isGroup = RX_isGroupJidString(out.chatJID);
     const isFromMe = RX_tryCallBoolNoArg(stanzaObj, "isFromMe");
@@ -2627,6 +2875,22 @@ const RX_CONFIG = {
 };
 
 const RX_AUTO_READ = { enabled: true, minIntervalMs: 3000, lastByChat: new Map() };
+const RX_AUTO_READ_INFLIGHT = new Map();
+const RX_AUTO_READ_WAIT = {
+  maxWaitMs: 7000,
+  stepsMs: [200, 400, 800, 1400, 2200, 3000],
+};
+const RX_AUTO_READ_STATS = {
+  recv: 0,
+  filtered: 0,
+  filtered_reason: {},
+  scheduled: 0,
+  attempts: 0,
+  ok: 0,
+  fail: 0,
+  fail_reason: {},
+  last: null,
+};
 
 function RX_shouldAutoRead(chatJid, stanzaId, senderJid, isGroup, fromMe) {
   try {
@@ -2639,8 +2903,8 @@ function RX_shouldAutoRead(chatJid, stanzaId, senderJid, isGroup, fromMe) {
     if (isGroup === true) return false;
     if (fromMe === true) return false;
     const sj = String(senderJid || "").trim();
-    if (!sj || sj === "status@broadcast") return false;
-    if (sj.indexOf("@") === -1) return false;
+    if (sj && sj === "status@broadcast") return false;
+    if (sj && sj.indexOf("@") === -1) return false;
     return true;
   } catch (_) {
     return false;
@@ -2665,55 +2929,159 @@ function RX_markMessageReadByStanzaId(chatJidStr, stanzaIdStr, participantJidStr
     const mcs = _getMutableChatSession(cs);
     if (!mcs) return { ok: false, error: "mutableChatSession missing" };
     const pj = String(participantJidStr || "").trim();
-    const msg = _fetchMessageByStanzaId(mcs, sid, pj);
-    if (!msg) return { ok: false, error: "message not found by stanzaId" };
+    const moc = _resolveManagedObjectContext(core);
+    const fm = _fetchMessageByStanzaId(mcs, sid, pj, moc);
+    if (!fm || !fm.msg) return { ok: false, error: "message not found by stanzaId" };
+    const msg = fm.msg;
+    const fetchVia = String(fm.via || "");
     const NSArray = ObjC.classes.NSArray;
     if (!NSArray || !NSArray["+ arrayWithObject:"]) return { ok: false, error: "NSArray unavailable" };
     const sessions = NSArray.arrayWithObject_(cs);
     const actions = [];
+    const selRR = "- sendReadReceiptsForMessagesBeforeAndIncludingMessage:inChatSession:isMarkedByUser:";
+    let rrOk = false;
+    if (_objcCanCall(chatManager, selRR)) {
+      try {
+        chatManager[selRR](msg, cs, true);
+        rrOk = true;
+        actions.push("WAChatManager.sendReadReceiptsForMessagesBeforeAndIncludingMessage:inChatSession:isMarkedByUser:");
+      } catch (_) {}
+    }
     const selMark = "- markChatSessions:read:sendReadReceipts:isMarkedByUser:error:";
     if (_objcCanCall(chatManager, selMark)) {
-      const errPtr = Memory.alloc(Process.pointerSize);
-      Memory.writePointer(errPtr, ptr("0x0"));
-      const ok = chatManager[selMark](sessions, true, true, true, errPtr);
-      let errText = "";
       try {
-        const ep = Memory.readPointer(errPtr);
-        const eo = ep && !ep.isNull() ? _safeObj(ep) : null;
-        if (eo) errText = String(eo);
+        const errPtr = Memory.alloc(Process.pointerSize);
+        Memory.writePointer(errPtr, ptr("0x0"));
+        const ok = chatManager[selMark](sessions, true, false, true, errPtr);
+        let errText = "";
+        try {
+          const ep = Memory.readPointer(errPtr);
+          const eo = ep && !ep.isNull() ? _safeObj(ep) : null;
+          if (eo) errText = String(eo);
+        } catch (_) {}
+        actions.push("WAChatManager.markChatSessions:read:sendReadReceipts:isMarkedByUser:error:");
+        if (!!ok || rrOk) return { ok: true, used: actions.join(","), error: errText, fetchVia: fetchVia };
       } catch (_) {}
-      actions.push("WAChatManager.markChatSessions:read:sendReadReceipts:isMarkedByUser:error:");
-      return { ok: !!ok, used: actions.join(","), error: errText };
-    }
-    const selRR = "- sendReadReceiptsForMessagesBeforeAndIncludingMessage:inChatSession:isMarkedByUser:";
-    if (_objcCanCall(chatManager, selRR)) {
-      chatManager[selRR](msg, cs, true);
-      actions.push("WAChatManager.sendReadReceiptsForMessagesBeforeAndIncludingMessage:inChatSession:isMarkedByUser:");
     }
     const selAsRead = "- markChatSessionsAsRead:";
     if (_objcCanCall(chatManager, selAsRead)) {
-      chatManager[selAsRead](sessions);
-      actions.push("WAChatManager.markChatSessionsAsRead:");
-      return { ok: true, used: actions.join(",") };
+      try {
+        chatManager[selAsRead](sessions);
+        actions.push("WAChatManager.markChatSessionsAsRead:");
+        if (rrOk) return { ok: true, used: actions.join(",") };
+      } catch (_) {}
     }
-    return { ok: false, error: "WAChatManager read selectors missing" };
+    if (rrOk) return { ok: true, used: actions.join(","), fetchVia: fetchVia };
+    return { ok: false, error: actions.length ? "read call failed" : "WAChatManager read selectors missing", used: actions.join(","), fetchVia: fetchVia };
   } catch (e) {
     return { ok: false, error: String(e) };
   }
 }
 
+function RX_recordStat(mapObj, key) {
+  try {
+    const k = String(key || "").trim() || "unknown";
+    mapObj[k] = (mapObj[k] || 0) + 1;
+  } catch (_) {}
+}
+
+function RX_tryAutoReadOnMain(chatJid, stanzaId, senderJid, attemptIdx) {
+  try {
+    const cj = String(chatJid || "").trim();
+    const sid = String(stanzaId || "").trim();
+    let sj = String(senderJid || "").trim();
+    if (!sj && cj && cj.indexOf("@") !== -1 && cj !== "status@broadcast" && cj.indexOf("@broadcast") === -1) {
+      sj = cj;
+    }
+    const inflightKey = cj + "|" + sid;
+    try {
+      const st = RX_AUTO_READ_INFLIGHT.get(inflightKey);
+      if (st && st.done === true) return { done: true, ok: true };
+    } catch (_) {}
+    RX_AUTO_READ_STATS.attempts += 1;
+    const res = RX_markMessageReadByStanzaId(cj, sid, sj);
+    if (res && res.ok) {
+      RX_AUTO_READ_STATS.ok += 1;
+      try {
+        const st = RX_AUTO_READ_INFLIGHT.get(inflightKey) || {};
+        st.done = true;
+        RX_AUTO_READ_INFLIGHT.set(inflightKey, st);
+      } catch (_) {}
+      RX_AUTO_READ_STATS.last = { ok: true, atMs: Date.now(), chatJid: cj, stanzaId: sid, senderJid: sj, attempt: attemptIdx, used: String(res.used || ""), fetchVia: String(res.fetchVia || "") };
+      return { done: true, ok: true };
+    }
+    const err = res && res.error ? String(res.error) : "failed";
+    RX_AUTO_READ_STATS.fail += 1;
+    RX_recordStat(RX_AUTO_READ_STATS.fail_reason, err);
+    RX_AUTO_READ_STATS.last = { ok: false, atMs: Date.now(), chatJid: cj, stanzaId: sid, senderJid: sj, attempt: attemptIdx, error: err, used: String(res && res.used ? res.used : ""), fetchVia: String(res && res.fetchVia ? res.fetchVia : "") };
+    const retryable = err.indexOf("message not found") !== -1 || err.indexOf("fetchChatSession failed") !== -1 || err.indexOf("mutableChatSession missing") !== -1;
+    return { done: !retryable, ok: false };
+  } catch (_) {
+    return { done: true, ok: false };
+  }
+}
+
 function RX_scheduleAutoRead(chatJid, stanzaId, senderJid, isGroup, fromMe) {
   try {
+    RX_AUTO_READ_STATS.recv += 1;
     if (!RX_AUTO_READ.enabled) return;
-    if (!RX_shouldAutoRead(chatJid, stanzaId, senderJid, isGroup, fromMe)) return;
+    if (!RX_shouldAutoRead(chatJid, stanzaId, senderJid, isGroup, fromMe)) {
+      RX_AUTO_READ_STATS.filtered += 1;
+      let reason = "unknown";
+      const cj = String(chatJid || "").trim();
+      const sid = String(stanzaId || "").trim();
+      const sj = String(senderJid || "").trim();
+      if (!cj) reason = "no_chat";
+      else if (!sid) reason = "no_stanza";
+      else if (isGroup === true) reason = "group";
+      else if (fromMe === true) reason = "from_me";
+      else if (!sj || sj.indexOf("@") === -1) reason = "no_sender";
+      else if (cj === "status@broadcast" || cj.indexOf("@broadcast") !== -1) reason = "broadcast";
+      RX_recordStat(RX_AUTO_READ_STATS.filtered_reason, reason);
+      RX_AUTO_READ_STATS.last = { ok: false, atMs: Date.now(), stage: "filtered", chatJid: cj, stanzaId: sid, senderJid: sj, reason: reason };
+      return;
+    }
     const key = String(chatJid || "").trim();
     const now = Date.now();
     const last = RX_AUTO_READ.lastByChat.get(key) || 0;
     if (now - last < RX_AUTO_READ.minIntervalMs) return;
     RX_AUTO_READ.lastByChat.set(key, now);
+    RX_AUTO_READ_STATS.scheduled += 1;
     const sid = String(stanzaId || "").trim();
     const pj = String(senderJid || "").trim();
-    _scheduleOnMainQueue(() => { try { RX_markMessageReadByStanzaId(key, sid, pj); } catch (_) {} });
+    const inflightKey = key + "|" + sid;
+    try {
+      const st = RX_AUTO_READ_INFLIGHT.get(inflightKey);
+      if (st && st.atMs && now - Number(st.atMs) < 120000) return;
+      RX_AUTO_READ_INFLIGHT.set(inflightKey, { atMs: now, done: false, tries: 0 });
+      setTimeout(() => { try { RX_AUTO_READ_INFLIGHT.delete(inflightKey); } catch (_) {} }, 180000);
+    } catch (_) {}
+    const fire = () => {
+      try {
+        const st = RX_AUTO_READ_INFLIGHT.get(inflightKey);
+        if (!st || st.done === true) return;
+        st.tries = (Number(st.tries) || 0) + 1;
+        RX_AUTO_READ_INFLIGHT.set(inflightKey, st);
+        const r = _runOnMainQueueSync(() => { try { return RX_tryAutoReadOnMain(key, sid, pj, st.tries - 1); } catch (_) { return null; } }, 1500);
+        const done = !!(r && r.done === true);
+        const ok = !!(r && r.ok === true);
+        if (done || ok) {
+          st.done = true;
+          RX_AUTO_READ_INFLIGHT.set(inflightKey, st);
+          return;
+        }
+        const elapsed = Date.now() - (Number(st.atMs) || now);
+        if (elapsed >= RX_AUTO_READ_WAIT.maxWaitMs) {
+          st.done = true;
+          RX_AUTO_READ_INFLIGHT.set(inflightKey, st);
+          return;
+        }
+        const idx = Math.min((Number(st.tries) || 1) - 1, RX_AUTO_READ_WAIT.stepsMs.length - 1);
+        const d = RX_AUTO_READ_WAIT.stepsMs[idx] || 3000;
+        setTimeout(fire, d);
+      } catch (_) {}
+    };
+    setTimeout(fire, RX_AUTO_READ_WAIT.stepsMs[0] || 3000);
   } catch (_) {}
 }
 
@@ -2738,7 +3106,7 @@ function RX_install() {
           if (maxEvents > 0 && events >= maxEvents) return;
           const tid = Process.getCurrentThreadId();
           if (reentry[tid]) return;
-          reentry[tid] = 1;
+          reentry[tid] = { tid: tid };
           events += 1;
 
           const now = Date.now();
@@ -2786,11 +3154,19 @@ function RX_install() {
               const chatJID = stanza.chatJID ? String(stanza.chatJID) : "";
               const stanzaId = stanza.stanzaId ? String(stanza.stanzaId) : "";
               const senderJID = stanza.senderJID ? String(stanza.senderJID) : "";
+              const statusAuthorJID = stanza.statusAuthorJID ? String(stanza.statusAuthorJID) : "";
               const isGroup = (stanza.isGroup === true || stanza.isGroup === false) ? stanza.isGroup : null;
               const fromMe = (stanza.isFromMe === true || stanza.isFromMe === false) ? stanza.isFromMe : null;
               const uniqueKey = stanza.uniqueKey ? String(stanza.uniqueKey) : "";
+              const isStatus = (chatJID || "").toLowerCase() === "status@broadcast";
+              const participantJID = isStatus ? statusAuthorJID : senderJID;
 
-              try { RX_scheduleAutoRead(chatJID, stanzaId, senderJID, isGroup, fromMe); } catch (_) {}
+              try {
+                const tid = Process.getCurrentThreadId();
+                if (reentry[tid] && typeof reentry[tid] === "object") {
+                  reentry[tid].autoRead = { chatJID: chatJID, stanzaId: stanzaId, senderJID: senderJID, isGroup: isGroup, fromMe: fromMe };
+                }
+              } catch (_) {}
               send({
                 type: "wa.recv.update",
                 build: SCRIPT_BUILD_ID,
@@ -2802,7 +3178,9 @@ function RX_install() {
                     via: "native_post_decrypt",
                     chatJID: chatJID,
                     remoteChat: chatJID,
-                    participantJID: senderJID,
+                    participantJID: participantJID,
+                    statusAuthorJID: statusAuthorJID,
+                    isStatus: isStatus,
                     fromMe: fromMe === true,
                     isGroup: isGroup,
                     uniqueKey: uniqueKey,
@@ -2839,6 +3217,13 @@ function RX_install() {
       onLeave() {
         try {
           const tid = Process.getCurrentThreadId();
+          const st = reentry[tid];
+          if (st && typeof st === "object" && st.autoRead) {
+            try {
+              const a = st.autoRead;
+              RX_scheduleAutoRead(a.chatJID, a.stanzaId, a.senderJID, a.isGroup, a.fromMe);
+            } catch (_) {}
+          }
           if (reentry[tid]) delete reentry[tid];
         } catch (_) {}
       },
@@ -2867,6 +3252,15 @@ setInterval(() => {
       rxInstalled: !!RX_STATE.installed,
       rxErr: RX_STATE.error ? String(RX_STATE.error) : "",
       waVersion: RX_STATE.waVersion ? String(RX_STATE.waVersion) : "",
+      autoRead: {
+        recv: RX_AUTO_READ_STATS.recv | 0,
+        filtered: RX_AUTO_READ_STATS.filtered | 0,
+        scheduled: RX_AUTO_READ_STATS.scheduled | 0,
+        attempts: RX_AUTO_READ_STATS.attempts | 0,
+        ok: RX_AUTO_READ_STATS.ok | 0,
+        fail: RX_AUTO_READ_STATS.fail | 0,
+        last: RX_AUTO_READ_STATS.last || null,
+      },
     });
   } catch (_) {}
 }, 15000);
