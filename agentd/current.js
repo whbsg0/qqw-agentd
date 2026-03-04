@@ -4,7 +4,7 @@
   来源：wa_txrx_stable_unified_pinned.js（发送/接收全功能脚本）
   目标：不更改功能与逻辑，仅把“接收侧 send() 输出”改为长期稳定事件格式（与 qqw-contracts/device-events.md 对齐）
 */
-const SCRIPT_BUILD_ID = "2026-03-04.media_send_image_pathfix_v1";
+const SCRIPT_BUILD_ID = "2026-03-04.product_asset_av_v1";
 
 function _tid() {
   try { return Process.getCurrentThreadId(); } catch (_) { return 0; }
@@ -1246,9 +1246,37 @@ function sendaudio(jidStr, audioPath, durationSec, messageOrigin) {
   if (!cs) return { ok: false, build: SCRIPT_BUILD_ID, stanzaId: "", error: "fetchChatSessionForJID returned nil" };
   const mcs = _runOnMainQueueSync(() => _getMutableChatSession(cs), 2500);
   if (!mcs) return { ok: false, build: SCRIPT_BUILD_ID, stanzaId: "", error: "mutableChatSession returned nil" };
-  try { _chmod(String(audioPath || ""), 0o644); } catch (_) {}
-  try { _setFileProtectionNone(String(audioPath || "")); } catch (_) {}
-  const nsPath = _ns(String(audioPath || ""));
+  let p0 = String(audioPath || "").trim();
+  try { _chmod(p0, 0o644); } catch (_) {}
+  try { _setFileProtectionNone(p0); } catch (_) {}
+  const ext0 = (function () { try { const s = p0.toLowerCase(); const i = s.lastIndexOf("."); return i >= 0 ? s.slice(i) : ""; } catch (_) { return ""; } })();
+  if (ext0 === ".ogg" || ext0 === ".opus") {
+    try {
+      const tmp = _tmpPathForBasename("qqw_voice_" + String(Date.now()) + ".ogg");
+      if (tmp) {
+        const ok = _runOnMainQueueSync(() => {
+          const NSFileManager = ObjC.classes.NSFileManager;
+          if (!NSFileManager || !NSFileManager.defaultManager) return { ok: false, error: "NSFileManager missing" };
+          const fm = NSFileManager.defaultManager();
+          if (!fm || !fm["- copyItemAtPath:toPath:error:"]) return { ok: false, error: "copyItemAtPath missing" };
+          const nsSrc = _ns(p0);
+          const nsDst = _ns(tmp);
+          if (!nsSrc || !nsDst) return { ok: false, error: "path->NSString failed" };
+          const errp = Memory.alloc(Process.pointerSize);
+          Memory.writePointer(errp, ptr("0x0"));
+          try { if (fm["- fileExistsAtPath:"](nsDst)) { fm["- removeItemAtPath:error:"](nsDst, errp); } } catch (_) {}
+          const r = !!fm["- copyItemAtPath:toPath:error:"](nsSrc, nsDst, errp);
+          return { ok: r };
+        }, 2500);
+        if (ok && ok.ok) {
+          p0 = String(tmp);
+          try { _chmod(p0, 0o644); } catch (_) {}
+          try { _setFileProtectionNone(p0); } catch (_) {}
+        }
+      }
+    } catch (_) {}
+  }
+  const nsPath = _ns(p0);
   if (!nsPath) return { ok: false, build: SCRIPT_BUILD_ID, stanzaId: "", error: "path->NSString failed" };
   const att = _buildAttachmentsEmpty();
   if (!att) return { ok: false, build: SCRIPT_BUILD_ID, stanzaId: "", error: "build attachments failed" };
@@ -1262,8 +1290,13 @@ function sendaudio(jidStr, audioPath, durationSec, messageOrigin) {
   if (!completion) return { ok: false, build: SCRIPT_BUILD_ID, stanzaId: "", error: "completion block create failed" };
   const mo = Number.isFinite(Number(messageOrigin)) ? Number(messageOrigin) : 1;
   let dur = Number.isFinite(Number(durationSec)) ? Number(durationSec) : 0;
-  if (!(dur > 0)) {
-    try { dur = _audioDurationSecondsFromOggOpus(String(audioPath || "")); } catch (_) { dur = 0; }
+  if (ext0 === ".ogg" || ext0 === ".opus") {
+    try {
+      const d2 = _audioDurationSecondsFromOggOpus(p0);
+      if (Number.isFinite(Number(d2)) && Number(d2) > 0) dur = Math.ceil(Number(d2));
+    } catch (_) {}
+  } else if (!(dur > 0)) {
+    try { dur = _audioDurationSecondsFromOggOpus(p0); } catch (_) { dur = 0; }
   }
   if (!_objcCanCall(core.sender, FIXED.sendAudioSelector)) return { ok: false, build: SCRIPT_BUILD_ID, stanzaId: "", error: "send audio selector missing" };
   pend._block_keep = [audience, completion];
@@ -2051,8 +2084,10 @@ function _txHandleMsg(message) {
   const text = String(p.text || "");
   const quoteStanzaId = String(p.quoteStanzaId || p.quote_stanza_id || "");
   const participantJid = String(p.participantJid || p.participant_jid || "");
-  const messageOrigin = Number.isFinite(p.messageOrigin) ? p.messageOrigin : 0;
-  const creationEntryPoint = Number.isFinite(p.creationEntryPoint) ? p.creationEntryPoint : 0;
+  let messageOrigin = Number.isFinite(p.messageOrigin) ? Number(p.messageOrigin) : 1;
+  let creationEntryPoint = Number.isFinite(p.creationEntryPoint) ? Number(p.creationEntryPoint) : 1;
+  if (!(messageOrigin > 0)) messageOrigin = 1;
+  if (!(creationEntryPoint > 0)) creationEntryPoint = 1;
   if (!opId || !kind || !jid) {
     _txEmitResult(opId, kind, jid, { ok: false, stanzaId: "", error: "missing opId/kind/jid" }, null);
     return;
@@ -2066,7 +2101,7 @@ function _txHandleMsg(message) {
       res = sendtext("status@broadcast", text, messageOrigin, creationEntryPoint);
     } else if (kind === "quote") {
       res = sendquotetext(jid, quoteStanzaId, text, participantJid, messageOrigin, creationEntryPoint);
-    } else if (kind === "image" || kind === "product_asset") {
+    } else if (kind === "image") {
       res = sendimage(jid, String(p.caption || ""), String(p.path || p.imagePath || ""), messageOrigin);
     } else if (kind === "status_image") {
       res = sendimage("status@broadcast", String(p.caption || ""), String(p.path || p.imagePath || ""), messageOrigin);
@@ -2074,6 +2109,20 @@ function _txHandleMsg(message) {
       res = sendvideo(jid, String(p.caption || ""), String(p.path || p.videoPath || ""), String(p.thumbnailPath || ""), messageOrigin);
     } else if (kind === "audio") {
       res = sendaudio(jid, String(p.path || p.audioPath || ""), Number(p.durationSec || 0), messageOrigin);
+    } else if (kind === "product_asset") {
+      const pth = String(p.path || p.imagePath || p.videoPath || p.audioPath || "");
+      const pthLower = String(pth || "").toLowerCase();
+      const dot = pthLower.lastIndexOf(".");
+      const ext = dot >= 0 ? pthLower.slice(dot) : "";
+      const isVideo = (ext === ".mp4" || ext === ".mov" || ext === ".m4v");
+      const isAudio = (ext === ".ogg" || ext === ".opus" || ext === ".m4a" || ext === ".aac" || ext === ".mp3" || ext === ".wav" || ext === ".amr");
+      if (isVideo) {
+        res = sendvideo(jid, String(p.caption || ""), pth, String(p.thumbnailPath || ""), messageOrigin);
+      } else if (isAudio) {
+        res = sendaudio(jid, pth, Number(p.durationSec || 0), messageOrigin);
+      } else {
+        res = sendimage(jid, String(p.caption || ""), pth, messageOrigin);
+      }
     } else {
       res = { ok: false, stanzaId: "", error: "unknown kind" };
     }

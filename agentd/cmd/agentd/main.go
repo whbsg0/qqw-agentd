@@ -150,6 +150,7 @@ type TxSendPayload struct {
 	MessageOrigin      int                 `json:"messageOrigin,omitempty"`
 	CreationEntryPoint int                 `json:"creationEntryPoint,omitempty"`
 	TimeoutMs          int                 `json:"timeoutMs,omitempty"`
+	ProductCode        string              `json:"productCode,omitempty"`
 	Media              *TxSendMediaPayload `json:"media,omitempty"`
 }
 
@@ -164,6 +165,24 @@ type TxSendMediaPayload struct {
 	SizeBytes   int64  `json:"sizeBytes,omitempty"`
 	Sha256      string `json:"sha256,omitempty"`
 	DurationSec int    `json:"durationSec,omitempty"`
+}
+
+type TxAssetPrefetchItem struct {
+	ProductCode string `json:"productCode"`
+	Version     string `json:"version,omitempty"`
+	Sha256      string `json:"sha256,omitempty"`
+	Mime        string `json:"mime,omitempty"`
+	SizeBytes   int64  `json:"sizeBytes,omitempty"`
+	URL         string `json:"url"`
+	Filename    string `json:"filename,omitempty"`
+}
+
+type TxAssetPrefetchPayload struct {
+	OpID         string                `json:"opId"`
+	Version      string                `json:"version,omitempty"`
+	ProductCodes []string              `json:"productCodes,omitempty"`
+	Items        []TxAssetPrefetchItem `json:"items,omitempty"`
+	TimeoutMs    int                   `json:"timeoutMs,omitempty"`
 }
 
 type TxMsgActionPayload struct {
@@ -1313,6 +1332,8 @@ func (a *Agent) readLoop(ctx context.Context, ws *websocket.Conn, sessionID stri
 			go a.handleScriptUninstall()
 		case "tx_send":
 			go a.handleTxSend(in)
+		case "tx_asset_prefetch":
+			go a.handleTxAssetPrefetch(in)
 		case "tx_msg_action":
 			go a.handleTxMsgAction(in)
 		case "tx_avatar_url":
@@ -1411,6 +1432,7 @@ func (a *Agent) handleTxSend(in Envelope) {
 	p.Text = strings.TrimSpace(p.Text)
 	p.QuoteStanzaID = strings.TrimSpace(p.QuoteStanzaID)
 	p.ParticipantJID = strings.TrimSpace(p.ParticipantJID)
+	p.ProductCode = strings.TrimSpace(p.ProductCode)
 	if p.OpID == "" || p.Kind == "" || p.JID == "" {
 		a.logf("tx_send: missing opId/kind/jid")
 		return
@@ -1437,7 +1459,19 @@ func (a *Agent) handleTxSend(in Envelope) {
 	if p.CreationEntryPoint > 0 {
 		out["creationEntryPoint"] = p.CreationEntryPoint
 	}
-	if p.Media != nil && (p.Kind == "image" || p.Kind == "video" || p.Kind == "audio") {
+	if p.Kind == "product_asset" && p.ProductCode != "" {
+		path := strings.TrimSpace(a.lookupProductAssetPath(p.ProductCode))
+		if path == "" {
+			a.emitTxSendResult(p.OpID, p.Kind, p.JID, false, "", "asset_missing", "asset_missing", true)
+			a.logf("tx_send: product asset missing opId=%s productCode=%s", p.OpID, p.ProductCode)
+			return
+		}
+		out["path"] = path
+		if strings.TrimSpace(p.Text) != "" {
+			out["caption"] = strings.TrimSpace(p.Text)
+		}
+		out["filename"] = strings.TrimSpace(p.ProductCode) + filepath.Ext(path)
+	} else if p.Media != nil && (p.Kind == "image" || p.Kind == "video" || p.Kind == "audio" || p.Kind == "product_asset") {
 		path, caption, err := a.materializeTxMedia(p.OpID, p.Kind, p.Text, p.Media)
 		if err != nil {
 			a.logf("tx_send: media prep failed: %v", err)
@@ -1484,6 +1518,217 @@ func (a *Agent) handleTxSend(in Envelope) {
 		return
 	}
 	a.logf("tx_send: dispatched opId=%s kind=%s jid=%s", p.OpID, p.Kind, p.JID)
+}
+
+func (a *Agent) emitTxSendResult(opId string, kind string, jid string, ok bool, stanzaId string, errMsg string, errorCode string, retryable bool) {
+	opId = strings.TrimSpace(opId)
+	kind = strings.TrimSpace(kind)
+	jid = strings.TrimSpace(jid)
+	if opId == "" || kind == "" || jid == "" {
+		return
+	}
+	ev := map[string]any{
+		"type":      "wa.tx.send.result",
+		"op_id":     opId,
+		"kind":      kind,
+		"jid":       jid,
+		"ok":        ok,
+		"stanzaId":  strings.TrimSpace(stanzaId),
+		"error":     strings.TrimSpace(errMsg),
+		"errorCode": strings.TrimSpace(errorCode),
+		"retryable": retryable,
+		"ts":        time.Now().UnixMilli(),
+	}
+	b, _ := json.Marshal(ev)
+	a.eventQueue.Enqueue(b)
+}
+
+type productAssetsManifestEntry struct {
+	ProductCode string `json:"productCode"`
+	Version     string `json:"version,omitempty"`
+	Sha256      string `json:"sha256,omitempty"`
+	LocalPath   string `json:"localPath"`
+	SizeBytes   int64  `json:"sizeBytes,omitempty"`
+	UpdatedAtMs int64  `json:"updatedAtMs,omitempty"`
+}
+
+type productAssetsManifest struct {
+	Items map[string]productAssetsManifestEntry `json:"items"`
+}
+
+func (a *Agent) productAssetsRoot() string {
+	cfg := a.getCfg()
+	if strings.TrimSpace(cfg.WhatsApp.ChatStoragePath) != "" {
+		return filepath.Join(filepath.Dir(strings.TrimSpace(cfg.WhatsApp.ChatStoragePath)), "QQwAgentMedia", "product_assets")
+	}
+	return filepath.Join(filepath.Dir(a.scriptPath), "media", "product_assets")
+}
+
+func (a *Agent) loadProductAssetsManifest() productAssetsManifest {
+	root := a.productAssetsRoot()
+	p := filepath.Join(root, "manifest.json")
+	b, err := os.ReadFile(p)
+	if err != nil {
+		return productAssetsManifest{Items: map[string]productAssetsManifestEntry{}}
+	}
+	var m productAssetsManifest
+	if err := json.Unmarshal(b, &m); err != nil || m.Items == nil {
+		return productAssetsManifest{Items: map[string]productAssetsManifestEntry{}}
+	}
+	return m
+}
+
+func (a *Agent) saveProductAssetsManifest(m productAssetsManifest) {
+	if m.Items == nil {
+		m.Items = map[string]productAssetsManifestEntry{}
+	}
+	root := a.productAssetsRoot()
+	_ = os.MkdirAll(root, 0o755)
+	p := filepath.Join(root, "manifest.json")
+	tmp := p + ".tmp"
+	b, _ := json.Marshal(m)
+	_ = os.WriteFile(tmp, b, 0o644)
+	_ = os.Rename(tmp, p)
+}
+
+func (a *Agent) lookupProductAssetPath(productCode string) string {
+	pc := strings.TrimSpace(productCode)
+	if pc == "" {
+		return ""
+	}
+	m := a.loadProductAssetsManifest()
+	it, ok := m.Items[pc]
+	if !ok {
+		return ""
+	}
+	lp := strings.TrimSpace(it.LocalPath)
+	if lp == "" {
+		return ""
+	}
+	if st, err := os.Stat(lp); err == nil && st != nil && st.Size() > 0 {
+		return lp
+	}
+	return ""
+}
+
+func (a *Agent) handleTxAssetPrefetch(in Envelope) {
+	var p TxAssetPrefetchPayload
+	if err := json.Unmarshal(in.Payload, &p); err != nil {
+		a.logf("tx_asset_prefetch: invalid payload: %v", err)
+		return
+	}
+	p.OpID = strings.TrimSpace(p.OpID)
+	p.Version = strings.TrimSpace(p.Version)
+	if p.OpID == "" || len(p.Items) == 0 {
+		a.logf("tx_asset_prefetch: missing opId/items")
+		return
+	}
+	if p.TimeoutMs <= 0 {
+		p.TimeoutMs = 60_000
+	}
+	start := time.Now()
+	root := a.productAssetsRoot()
+	objDir := filepath.Join(root, "objects")
+	_ = os.MkdirAll(objDir, 0o755)
+	m := a.loadProductAssetsManifest()
+	downloaded := 0
+	skipped := 0
+	totalBytes := int64(0)
+	okAll := true
+	errMsg := ""
+	errCode := ""
+	results := make([]map[string]any, 0, len(p.Items))
+	for _, it := range p.Items {
+		pc := strings.TrimSpace(it.ProductCode)
+		if pc == "" {
+			continue
+		}
+		urlStr := strings.TrimSpace(it.URL)
+		if urlStr == "" {
+			okAll = false
+			errMsg = "url missing"
+			errCode = "download_failed"
+			results = append(results, map[string]any{"productCode": pc, "ok": false, "errorCode": "download_failed"})
+			continue
+		}
+		ext := strings.TrimSpace(filepath.Ext(strings.TrimSpace(it.Filename)))
+		if ext == "" {
+			mm := strings.ToLower(strings.TrimSpace(it.Mime))
+			if strings.Contains(mm, "jpeg") {
+				ext = ".jpg"
+			} else if strings.Contains(mm, "png") {
+				ext = ".png"
+			} else if strings.Contains(mm, "webp") {
+				ext = ".webp"
+			} else if strings.Contains(mm, "gif") {
+				ext = ".gif"
+			} else if strings.Contains(mm, "mp4") {
+				ext = ".mp4"
+			} else if strings.Contains(mm, "ogg") {
+				ext = ".ogg"
+			} else {
+				ext = ".bin"
+			}
+		}
+		key := strings.TrimSpace(it.Sha256)
+		if key == "" {
+			key = pc
+		}
+		outPath := filepath.Join(objDir, key+ext)
+		cur, has := m.Items[pc]
+		if has && strings.TrimSpace(cur.Sha256) != "" && strings.TrimSpace(cur.Sha256) == strings.TrimSpace(it.Sha256) {
+			if st, err := os.Stat(strings.TrimSpace(cur.LocalPath)); err == nil && st != nil && st.Size() > 0 {
+				skipped++
+				results = append(results, map[string]any{"productCode": pc, "ok": true, "skipped": true, "sha256": strings.TrimSpace(it.Sha256), "version": strings.TrimSpace(it.Version)})
+				continue
+			}
+		}
+		if err := downloadToFile(urlStr, outPath, 100<<20); err != nil {
+			okAll = false
+			if errMsg == "" {
+				errMsg = err.Error()
+				errCode = "download_failed"
+			}
+			results = append(results, map[string]any{"productCode": pc, "ok": false, "error": err.Error(), "errorCode": "download_failed"})
+			continue
+		}
+		if st, err := os.Stat(outPath); err == nil && st != nil {
+			totalBytes += st.Size()
+		}
+		_ = os.Chmod(outPath, 0o644)
+		_ = os.Chown(outPath, 501, 501)
+		downloaded++
+		m.Items[pc] = productAssetsManifestEntry{
+			ProductCode: pc,
+			Version:     strings.TrimSpace(it.Version),
+			Sha256:      strings.TrimSpace(it.Sha256),
+			LocalPath:   outPath,
+			SizeBytes:   it.SizeBytes,
+			UpdatedAtMs: time.Now().UnixMilli(),
+		}
+		results = append(results, map[string]any{"productCode": pc, "ok": true, "sha256": strings.TrimSpace(it.Sha256), "version": strings.TrimSpace(it.Version)})
+	}
+	a.saveProductAssetsManifest(m)
+	durMs := time.Since(start).Milliseconds()
+	ev := map[string]any{
+		"type":            "wa.tx.asset_prefetch.result",
+		"op_id":           p.OpID,
+		"waAccountId":     a.deviceID,
+		"ok":              okAll,
+		"downloadedCount": downloaded,
+		"skippedCount":    skipped,
+		"bytes":           totalBytes,
+		"durationMs":      durMs,
+		"version":         p.Version,
+		"items":           results,
+		"error":           strings.TrimSpace(errMsg),
+		"errorCode":       strings.TrimSpace(errCode),
+		"retryable":       !okAll,
+		"ts":              time.Now().UnixMilli(),
+	}
+	b, _ := json.Marshal(ev)
+	a.eventQueue.Enqueue(b)
+	a.logf("tx_asset_prefetch: done opId=%s ok=%v downloaded=%d skipped=%d bytes=%d", p.OpID, okAll, downloaded, skipped, totalBytes)
 }
 
 func (a *Agent) materializeTxMedia(opId string, kind string, text string, media *TxSendMediaPayload) (string, string, error) {

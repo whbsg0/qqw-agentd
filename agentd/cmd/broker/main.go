@@ -108,6 +108,7 @@ type TxSendPayload struct {
 	MessageOrigin      int    `json:"messageOrigin,omitempty"`
 	CreationEntryPoint int    `json:"creationEntryPoint,omitempty"`
 	TimeoutMs          int    `json:"timeoutMs,omitempty"`
+	ProductCode        string `json:"productCode,omitempty"`
 	Media              *struct {
 		Source      string `json:"source,omitempty"`
 		URL         string `json:"url,omitempty"`
@@ -120,6 +121,24 @@ type TxSendPayload struct {
 		Sha256      string `json:"sha256,omitempty"`
 		DurationSec int    `json:"durationSec,omitempty"`
 	} `json:"media,omitempty"`
+}
+
+type TxAssetPrefetchItem struct {
+	ProductCode string `json:"productCode"`
+	Version     string `json:"version,omitempty"`
+	Sha256      string `json:"sha256,omitempty"`
+	Mime        string `json:"mime,omitempty"`
+	SizeBytes   int64  `json:"sizeBytes,omitempty"`
+	URL         string `json:"url"`
+	Filename    string `json:"filename,omitempty"`
+}
+
+type TxAssetPrefetchPayload struct {
+	OpID         string                `json:"opId"`
+	Version      string                `json:"version,omitempty"`
+	ProductCodes []string              `json:"productCodes,omitempty"`
+	Items        []TxAssetPrefetchItem `json:"items,omitempty"`
+	TimeoutMs    int                   `json:"timeoutMs,omitempty"`
 }
 
 type TxMsgActionPayload struct {
@@ -721,6 +740,52 @@ on conflict (device_id) do update set
 			return
 		}
 		logJSON("tx_send_dispatched", map[string]any{"deviceId": deviceID, "opId": req.OpID, "kind": req.Kind, "jid": req.JID})
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+		return
+	}
+	if len(parts) == 3 && parts[1] == "tx" && parts[2] == "asset_prefetch" {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		deviceID := strings.TrimSpace(parts[0])
+		if deviceID == "" {
+			http.Error(w, "deviceId required", http.StatusBadRequest)
+			return
+		}
+		sess := b.getSession(deviceID)
+		if sess == nil {
+			http.Error(w, "device offline", http.StatusNotFound)
+			return
+		}
+		var req TxAssetPrefetchPayload
+		if err := readJSON(r, &req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		req.OpID = strings.TrimSpace(req.OpID)
+		req.Version = strings.TrimSpace(req.Version)
+		if req.OpID == "" || len(req.Items) == 0 {
+			http.Error(w, "opId/items required", http.StatusBadRequest)
+			return
+		}
+		if req.TimeoutMs <= 0 {
+			req.TimeoutMs = 60_000
+		}
+		payload, _ := json.Marshal(req)
+		env := Envelope{
+			V:        1,
+			Type:     "tx_asset_prefetch",
+			DeviceID: deviceID,
+			Session:  sess.session,
+			TS:       time.Now().UnixMilli(),
+			Payload:  payload,
+		}
+		if err := sess.send(r.Context(), env); err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		logJSON("tx_asset_prefetch_dispatched", map[string]any{"deviceId": deviceID, "opId": req.OpID, "count": len(req.Items)})
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 		return
 	}
