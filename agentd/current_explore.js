@@ -7639,6 +7639,7 @@ function _buildAttachmentsEmptyExplore() {
 const STATUS_FIXED = {
   sendTextSelector: "- sendMessageWithText:multicast:attachments:messageOrigin:creationEntryPoint:inChatSession:statusContentOriginInfo:statusDistributionInfo:statusResharePolicy:statusNotificationInfo:statusCreativeToolsUsageInfo:hasTextFromURL:openedFromURL:smbAutomated:statusMentionsJIDs:statusMentionsChatSessions:isQuestion:fromViewController:beforeSendCallback:completion:",
   sendImageSelector: "- sendMessageWithImage:thumbnail:caption:statusMentionsJIDs:statusMentionsChatSessions:productDescriptor:attachments:messageOrigin:inChatSession:statusContentOriginInfo:statusDistributionInfo:statusResharePolicy:statusNotificationInfo:statusCreativeToolsUsageInfo:isViewOnce:scanLengths:optimisticUploadIdentifier:interactiveAnnotations:mediaPickerOrigin:mediaTranscodeConfig:transcodeLoggingInfo:imageSourceType:statusSourceType:accessibilityLabel:pairedMediaInfo:isPremiumMessage:isQuestion:assetIdentifier:mediaSourceMetadata:completion:",
+  sendVideoSelector: "- sendVideoAtURL:thumbnail:videoType:isViewOnce:isQuestion:contentProvider:caption:statusMentionsJIDs:statusMentionsChatSessions:mediaCachingInfo:attachments:messageOrigin:inChatSession:statusContentOriginInfo:statusDistributionInfo:statusResharePolicy:statusNotificationInfo:statusCreativeToolsUsageInfo:openedFromURL:interactiveAnnotations:mediaPickerOrigin:mediaTranscodeConfig:transcodeLoggingInfo:statusSourceType:videoSourceType:accessibilityLabel:pairedMediaInfo:assetIdentifier:mediaSourceMetadata:completion:",
   fetchChatSessionSelector: "- fetchChatSessionForJID:",
   mutableChatSessionSelector: "- mutableChatSession",
   msgIdInitUsingStanzaIdSelector: "- initWithMessage:usingStanzaID:",
@@ -8046,6 +8047,21 @@ function _statusUIImageFromFile(pathStr) {
   }
 }
 
+function _statusNSURLFromFile(pathStr) {
+  try {
+    const p = String(pathStr || "").trim();
+    if (!p) return null;
+    const ns = nsString(p);
+    if (!ns) return null;
+    const NSURL = ObjC.classes.NSURL;
+    if (!NSURL || !NSURL.fileURLWithPath_) return null;
+    const u = NSURL.fileURLWithPath_(ns);
+    return u ? _safeObj(u) : null;
+  } catch (_) {
+    return null;
+  }
+}
+
 function _statusBuildImageSendable(imgObj) {
   try {
     const img = imgObj instanceof ObjC.Object ? imgObj : _safeObj(imgObj);
@@ -8184,6 +8200,100 @@ function statuspostimage(imagePath, captionText, messageOrigin) {
       }
     });
     const w = _statusWaitStanzaId(pend);
+    if (pend.messagePtr) delete STATUS_POST.pendByMsgPtr[pend.messagePtr];
+    return { ok: !!(w && w.ok), build: SCRIPT_BUILD_ID, stanzaId: w && w.ok ? String(w.stanzaId || "") : "", error: w && !w.ok ? String(w.error || "") : (pend.error ? String(pend.error) : null) };
+  } catch (e) {
+    return { ok: false, build: SCRIPT_BUILD_ID, stanzaId: "", error: String(e) };
+  }
+}
+
+function statuspostvideo(videoPath, captionText, messageOrigin) {
+  try {
+    const hk = _statusInstallMsgIdHook();
+    if (!hk || !hk.ok) return { ok: false, build: SCRIPT_BUILD_ID, stanzaId: "", error: hk ? hk.error : "hook failed" };
+    const pend = _statusPendingNew("status_video", 30000);
+    const p = String(videoPath || "").trim();
+    if (!p) return { ok: false, build: SCRIPT_BUILD_ID, stanzaId: "", error: "missing videoPath" };
+    STATUS_POST.activePend = pend;
+    safeObjCInvoke(() => {
+      try {
+        let pool = null;
+        try { pool = ObjC.classes.NSAutoreleasePool.alloc().init(); } catch (_) { pool = null; }
+        const core = _statusResolveCoreFixed();
+        if (!core || !core.ok) { pend.error = core ? core.error : "core failed"; return; }
+        const jid = _makeWAChatJIDFromString("status@broadcast");
+        if (!jid) { pend.error = "status@broadcast jid parse failed"; return; }
+        const stor = core.storage;
+        if (!_statusCanCall(stor, STATUS_FIXED.fetchChatSessionSelector)) { pend.error = "fetchChatSession selector missing"; return; }
+        const cs = stor[STATUS_FIXED.fetchChatSessionSelector](jid);
+        if (!cs) { pend.error = "fetchChatSessionForJID returned nil"; return; }
+        const csObj = _safeObj(cs);
+        if (!csObj) { pend.error = "chatSession invalid"; return; }
+        const mcsObj = _statusGetMutableChatSession(csObj);
+        if (!mcsObj) { pend.error = "mutableChatSession returned nil"; return; }
+        const url = _statusNSURLFromFile(p);
+        if (!url) { pend.error = "NSURL fileURLWithPath failed"; return; }
+        const capText = String(captionText || "");
+        const cap = capText ? _statusBuildRichText(capText) : null;
+        if (capText && !cap) { pend.error = "WARichText build failed"; return; }
+        const att = _buildAttachmentsEmptyExplore();
+        if (!att) { pend.error = "attachments build failed"; return; }
+        const emptyArr = _statusNsArray0();
+        if (!emptyArr) { pend.error = "empty NSArray failed"; return; }
+        const completion = _statusBuildCompletionBlockMsgErr(pend);
+        if (!completion) { pend.error = "completion block failed"; return; }
+        const sender = core.sender;
+        if (!_statusCanCall(sender, STATUS_FIXED.sendVideoSelector)) { pend.error = "sendVideo selector missing"; return; }
+        const mo = Number.isFinite(Number(messageOrigin)) ? (Number(messageOrigin) | 0) : 1;
+        const i64 = (n) => { try { return new Int64(Number(n) || 0); } catch (_) { return Number(n) || 0; } };
+        const u64 = (n) => { try { return new UInt64(Number(n) || 0); } catch (_) { return Number(n) || 0; } };
+        const videoType = u64(0);
+        const contentProvider = i64(0);
+        const moArg = mo | 0;
+        const mediaPickerOrigin = u64(0);
+        const statusSourceType = 0;
+        const videoSourceType = 0;
+        pend._keep = [url, cap, mcsObj, att, emptyArr];
+        pend._block = completion;
+        sender[STATUS_FIXED.sendVideoSelector](
+          url,
+          ptr("0x0"),
+          videoType,
+          false,
+          false,
+          contentProvider,
+          cap ? cap : ptr("0x0"),
+          emptyArr,
+          emptyArr,
+          ptr("0x0"),
+          att,
+          moArg,
+          mcsObj,
+          ptr("0x0"),
+          ptr("0x0"),
+          ptr("0x0"),
+          ptr("0x0"),
+          ptr("0x0"),
+          false,
+          emptyArr,
+          mediaPickerOrigin,
+          ptr("0x0"),
+          ptr("0x0"),
+          statusSourceType,
+          videoSourceType,
+          ptr("0x0"),
+          ptr("0x0"),
+          ptr("0x0"),
+          ptr("0x0"),
+          completion
+        );
+        try { if (pool) pool.release(); } catch (_) {}
+      } catch (e) {
+        pend.error = String(e);
+      }
+    });
+    const w = _statusWaitStanzaId(pend);
+    if (STATUS_POST.activePend === pend) STATUS_POST.activePend = null;
     if (pend.messagePtr) delete STATUS_POST.pendByMsgPtr[pend.messagePtr];
     return { ok: !!(w && w.ok), build: SCRIPT_BUILD_ID, stanzaId: w && w.ok ? String(w.stanzaId || "") : "", error: w && !w.ok ? String(w.error || "") : (pend.error ? String(pend.error) : null) };
   } catch (e) {
@@ -8898,6 +9008,7 @@ rpc.exports = {
   fileputprobe: fileput_probe,
   statusposttext: (text, messageOrigin, creationEntryPoint) => statusposttext(text, messageOrigin, creationEntryPoint),
   statuspostimage: (imagePath, captionText, messageOrigin) => statuspostimage(imagePath, captionText, messageOrigin),
+  statuspostvideo: (videoPath, captionText, messageOrigin) => statuspostvideo(videoPath, captionText, messageOrigin),
   crashsniff: () => installCrashSniffer(),
   crashsnifflaststep: () => crashsnifflaststep(),
   impof: (className, selName) => impof(className, selName),

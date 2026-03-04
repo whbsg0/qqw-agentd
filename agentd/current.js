@@ -1352,6 +1352,9 @@ rpc.exports = {
   statuspostimage(imagePath, captionText, messageOrigin) {
     return sendimage("status@broadcast", String(captionText || ""), String(imagePath || ""), Number(messageOrigin) || 0);
   },
+  statuspostvideo(videoPath, captionText, messageOrigin) {
+    return sendvideo("status@broadcast", String(captionText || ""), String(videoPath || ""), "", Number(messageOrigin) || 0);
+  },
   avatarurl,
   selfnameactive,
   selfcard,
@@ -2112,6 +2115,8 @@ function _txHandleMsg(message) {
       res = sendimage(jid, String(p.caption || ""), String(p.path || p.imagePath || ""), messageOrigin);
     } else if (kind === "status_image") {
       res = sendimage("status@broadcast", String(p.caption || ""), String(p.path || p.imagePath || ""), messageOrigin);
+    } else if (kind === "status_video") {
+      res = sendvideo("status@broadcast", String(p.caption || ""), String(p.path || p.videoPath || ""), String(p.thumbnailPath || ""), messageOrigin);
     } else if (kind === "video") {
       res = sendvideo(jid, String(p.caption || ""), String(p.path || p.videoPath || ""), String(p.thumbnailPath || ""), messageOrigin);
     } else if (kind === "audio") {

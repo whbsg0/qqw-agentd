@@ -1508,7 +1508,7 @@ func (a *Agent) handleTxSend(in Envelope) {
 			out["caption"] = strings.TrimSpace(p.Text)
 		}
 		out["filename"] = strings.TrimSpace(p.ProductCode) + filepath.Ext(path)
-	} else if p.Media != nil && (p.Kind == "image" || p.Kind == "video" || p.Kind == "audio" || p.Kind == "product_asset") {
+	} else if p.Media != nil && (p.Kind == "image" || p.Kind == "video" || p.Kind == "audio" || p.Kind == "product_asset" || p.Kind == "status_image" || p.Kind == "status_video") {
 		path, caption, err := a.materializeTxMedia(p.OpID, p.Kind, p.Text, p.Media)
 		if err != nil {
 			a.logf("tx_send: media prep failed: %v", err)
@@ -1783,7 +1783,7 @@ func (a *Agent) materializeTxMedia(opId string, kind string, text string, media 
 	devPath := strings.TrimSpace(media.DevicePath)
 	filename := strings.TrimSpace(media.Filename)
 	caption := strings.TrimSpace(media.Caption)
-	if caption == "" && (kind == "image" || kind == "video") {
+	if caption == "" && (kind == "image" || kind == "video" || kind == "status_image" || kind == "status_video") {
 		caption = strings.TrimSpace(text)
 	}
 	if src == "" {
@@ -1809,9 +1809,9 @@ func (a *Agent) materializeTxMedia(opId string, kind string, text string, media 
 	_ = os.MkdirAll(dir, 0o755)
 	ext := strings.TrimSpace(filepath.Ext(filename))
 	if ext == "" {
-		if kind == "image" {
+		if kind == "image" || kind == "status_image" {
 			ext = ".jpg"
-		} else if kind == "video" {
+		} else if kind == "video" || kind == "status_video" {
 			ext = ".mp4"
 		} else if kind == "audio" {
 			ext = ".m4a"
