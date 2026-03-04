@@ -151,7 +151,15 @@ type TxSendPayload struct {
 	CreationEntryPoint int                 `json:"creationEntryPoint,omitempty"`
 	TimeoutMs          int                 `json:"timeoutMs,omitempty"`
 	ProductCode        string              `json:"productCode,omitempty"`
+	MediaRef           *TxSendMediaRef     `json:"mediaRef,omitempty"`
 	Media              *TxSendMediaPayload `json:"media,omitempty"`
+}
+
+type TxSendMediaRef struct {
+	RefType     string `json:"refType,omitempty"`
+	MediaID     string `json:"mediaId,omitempty"`
+	ProductCode string `json:"productCode,omitempty"`
+	Sha256Hex   string `json:"sha256Hex,omitempty"`
 }
 
 type TxSendMediaPayload struct {
@@ -1433,6 +1441,12 @@ func (a *Agent) handleTxSend(in Envelope) {
 	p.QuoteStanzaID = strings.TrimSpace(p.QuoteStanzaID)
 	p.ParticipantJID = strings.TrimSpace(p.ParticipantJID)
 	p.ProductCode = strings.TrimSpace(p.ProductCode)
+	if p.MediaRef != nil {
+		p.MediaRef.RefType = strings.TrimSpace(p.MediaRef.RefType)
+		p.MediaRef.MediaID = strings.TrimSpace(p.MediaRef.MediaID)
+		p.MediaRef.ProductCode = strings.TrimSpace(p.MediaRef.ProductCode)
+		p.MediaRef.Sha256Hex = strings.TrimSpace(p.MediaRef.Sha256Hex)
+	}
 	if p.OpID == "" || p.Kind == "" || p.JID == "" {
 		a.logf("tx_send: missing opId/kind/jid")
 		return
@@ -1453,6 +1467,14 @@ func (a *Agent) handleTxSend(in Envelope) {
 		"participantJid": p.ParticipantJID,
 		"timeoutMs":      p.TimeoutMs,
 	}
+	if p.MediaRef != nil && strings.TrimSpace(p.MediaRef.RefType) != "" {
+		out["mediaRef"] = map[string]any{
+			"refType":     strings.TrimSpace(p.MediaRef.RefType),
+			"mediaId":     strings.TrimSpace(p.MediaRef.MediaID),
+			"productCode": strings.TrimSpace(p.MediaRef.ProductCode),
+			"sha256Hex":   strings.TrimSpace(p.MediaRef.Sha256Hex),
+		}
+	}
 	if p.MessageOrigin > 0 {
 		out["messageOrigin"] = p.MessageOrigin
 	}
@@ -1462,7 +1484,22 @@ func (a *Agent) handleTxSend(in Envelope) {
 	if p.Kind == "product_asset" && p.ProductCode != "" {
 		path := strings.TrimSpace(a.lookupProductAssetPath(p.ProductCode))
 		if path == "" {
-			a.emitTxSendResult(p.OpID, p.Kind, p.JID, false, "", "asset_missing", "asset_missing", true)
+			var mr map[string]any = nil
+			if p.MediaRef != nil && strings.TrimSpace(p.MediaRef.RefType) != "" {
+				mr = map[string]any{
+					"refType":     strings.TrimSpace(p.MediaRef.RefType),
+					"mediaId":     strings.TrimSpace(p.MediaRef.MediaID),
+					"productCode": strings.TrimSpace(p.MediaRef.ProductCode),
+					"sha256Hex":   strings.TrimSpace(p.MediaRef.Sha256Hex),
+				}
+			} else {
+				mr = map[string]any{
+					"refType":     "productCode",
+					"mediaId":     "",
+					"productCode": strings.TrimSpace(p.ProductCode),
+				}
+			}
+			a.emitTxSendResult(p.OpID, p.Kind, p.JID, false, "", "asset_missing", "asset_missing", true, mr)
 			a.logf("tx_send: product asset missing opId=%s productCode=%s", p.OpID, p.ProductCode)
 			return
 		}
@@ -1520,7 +1557,7 @@ func (a *Agent) handleTxSend(in Envelope) {
 	a.logf("tx_send: dispatched opId=%s kind=%s jid=%s", p.OpID, p.Kind, p.JID)
 }
 
-func (a *Agent) emitTxSendResult(opId string, kind string, jid string, ok bool, stanzaId string, errMsg string, errorCode string, retryable bool) {
+func (a *Agent) emitTxSendResult(opId string, kind string, jid string, ok bool, stanzaId string, errMsg string, errorCode string, retryable bool, mediaRef any) {
 	opId = strings.TrimSpace(opId)
 	kind = strings.TrimSpace(kind)
 	jid = strings.TrimSpace(jid)
@@ -1538,6 +1575,9 @@ func (a *Agent) emitTxSendResult(opId string, kind string, jid string, ok bool, 
 		"errorCode": strings.TrimSpace(errorCode),
 		"retryable": retryable,
 		"ts":        time.Now().UnixMilli(),
+	}
+	if mediaRef != nil {
+		ev["mediaRef"] = mediaRef
 	}
 	b, _ := json.Marshal(ev)
 	a.eventQueue.Enqueue(b)

@@ -9,21 +9,22 @@ import (
 )
 
 type txSendRPCReq struct {
-	OpID               string `json:"opId"`
-	Kind               string `json:"kind"`
-	JID                string `json:"jid"`
-	Text               string `json:"text,omitempty"`
-	QuoteStanzaID      string `json:"quoteStanzaId,omitempty"`
-	ParticipantJID     string `json:"participantJid,omitempty"`
-	MessageOrigin      int    `json:"messageOrigin,omitempty"`
-	CreationEntryPoint int    `json:"creationEntryPoint,omitempty"`
-	TimeoutMs          int    `json:"timeoutMs,omitempty"`
-	Path               string `json:"path,omitempty"`
-	Caption            string `json:"caption,omitempty"`
-	Mime               string `json:"mime,omitempty"`
-	Filename           string `json:"filename,omitempty"`
-	ThumbnailPath      string `json:"thumbnailPath,omitempty"`
-	DurationSec        int    `json:"durationSec,omitempty"`
+	OpID               string          `json:"opId"`
+	Kind               string          `json:"kind"`
+	JID                string          `json:"jid"`
+	Text               string          `json:"text,omitempty"`
+	QuoteStanzaID      string          `json:"quoteStanzaId,omitempty"`
+	ParticipantJID     string          `json:"participantJid,omitempty"`
+	MessageOrigin      int             `json:"messageOrigin,omitempty"`
+	CreationEntryPoint int             `json:"creationEntryPoint,omitempty"`
+	TimeoutMs          int             `json:"timeoutMs,omitempty"`
+	MediaRef           json.RawMessage `json:"mediaRef,omitempty"`
+	Path               string          `json:"path,omitempty"`
+	Caption            string          `json:"caption,omitempty"`
+	Mime               string          `json:"mime,omitempty"`
+	Filename           string          `json:"filename,omitempty"`
+	ThumbnailPath      string          `json:"thumbnailPath,omitempty"`
+	DurationSec        int             `json:"durationSec,omitempty"`
 }
 
 type msgActionRPCReq struct {
@@ -146,6 +147,12 @@ func handleRPCTxSend(w http.ResponseWriter, r *http.Request) {
 		"filename":       req.Filename,
 		"thumbnailPath":  req.ThumbnailPath,
 		"durationSec":    req.DurationSec,
+	}
+	if len(req.MediaRef) > 0 {
+		var mr any
+		if json.Unmarshal(req.MediaRef, &mr) == nil && mr != nil {
+			payload["mediaRef"] = mr
+		}
 	}
 	if req.MessageOrigin > 0 {
 		payload["messageOrigin"] = req.MessageOrigin

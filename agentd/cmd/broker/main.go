@@ -109,7 +109,13 @@ type TxSendPayload struct {
 	CreationEntryPoint int    `json:"creationEntryPoint,omitempty"`
 	TimeoutMs          int    `json:"timeoutMs,omitempty"`
 	ProductCode        string `json:"productCode,omitempty"`
-	Media              *struct {
+	MediaRef           *struct {
+		RefType     string `json:"refType,omitempty"`
+		MediaID     string `json:"mediaId,omitempty"`
+		ProductCode string `json:"productCode,omitempty"`
+		Sha256Hex   string `json:"sha256Hex,omitempty"`
+	} `json:"mediaRef,omitempty"`
+	Media *struct {
 		Source      string `json:"source,omitempty"`
 		URL         string `json:"url,omitempty"`
 		Base64      string `json:"base64,omitempty"`

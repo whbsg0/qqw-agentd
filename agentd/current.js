@@ -1434,14 +1434,14 @@ rpc.exports = {
   },
 };
 
-function _txEmitResult(opId, kind, jid, res, extraErr) {
+function _txEmitResult(opId, kind, jid, res, extraErr, mediaRef) {
   try {
     const ok = !!(res && res.ok);
     const stanzaId = res && res.stanzaId ? String(res.stanzaId) : "";
     const err = ok ? "" : String((res && res.error) ? res.error : (extraErr ? extraErr : "failed"));
     const retryable = !!(res && res.retryable);
     const errorCode = res && res.errorCode ? String(res.errorCode) : "";
-    send({
+    const out = {
       type: "wa.tx.send.result",
       build: SCRIPT_BUILD_ID,
       ts: Date.now(),
@@ -1454,7 +1454,13 @@ function _txEmitResult(opId, kind, jid, res, extraErr) {
       error: err,
       retryable: retryable,
       errorCode: errorCode
-    });
+    };
+    try {
+      if (mediaRef && typeof mediaRef === "object") {
+        out.mediaRef = mediaRef;
+      }
+    } catch (_) {}
+    send(out);
   } catch (_) {}
 }
 
@@ -2084,12 +2090,13 @@ function _txHandleMsg(message) {
   const text = String(p.text || "");
   const quoteStanzaId = String(p.quoteStanzaId || p.quote_stanza_id || "");
   const participantJid = String(p.participantJid || p.participant_jid || "");
+  const mediaRef = (p && p.mediaRef && typeof p.mediaRef === "object") ? p.mediaRef : null;
   let messageOrigin = Number.isFinite(p.messageOrigin) ? Number(p.messageOrigin) : 1;
   let creationEntryPoint = Number.isFinite(p.creationEntryPoint) ? Number(p.creationEntryPoint) : 1;
   if (!(messageOrigin > 0)) messageOrigin = 1;
   if (!(creationEntryPoint > 0)) creationEntryPoint = 1;
   if (!opId || !kind || !jid) {
-    _txEmitResult(opId, kind, jid, { ok: false, stanzaId: "", error: "missing opId/kind/jid" }, null);
+    _txEmitResult(opId, kind, jid, { ok: false, stanzaId: "", error: "missing opId/kind/jid" }, null, mediaRef);
     return;
   }
   try { waitready(); } catch (_) {}
@@ -2126,9 +2133,9 @@ function _txHandleMsg(message) {
     } else {
       res = { ok: false, stanzaId: "", error: "unknown kind" };
     }
-    _txEmitResult(opId, kind, jid, res, null);
+    _txEmitResult(opId, kind, jid, res, null, mediaRef);
   } catch (e) {
-    _txEmitResult(opId, kind, jid, { ok: false, stanzaId: "", error: String(e) }, null);
+    _txEmitResult(opId, kind, jid, { ok: false, stanzaId: "", error: String(e) }, null, mediaRef);
   }
 }
 
@@ -2595,6 +2602,24 @@ function RX_deriveChatJidFromUniqueKey(uniqueKeyStr) {
   }
 }
 
+function RX_extractTailJidFromUniqueKey(uniqueKeyStr) {
+  try {
+    const s = String(uniqueKeyStr || "");
+    if (!s) return "";
+    const parts = s.split("_");
+    for (let i = parts.length - 1; i >= 0; i--) {
+      const p = String(parts[i] || "").trim();
+      if (!p) continue;
+      const low = p.toLowerCase();
+      if (low === "status@broadcast" || low.indexOf("@broadcast") !== -1) continue;
+      if (p.indexOf("@") !== -1) return p;
+    }
+    return "";
+  } catch (_) {
+    return "";
+  }
+}
+
 function RX_extractStanzaFieldsFromContext(ctxPtr) {
   const out = { stanzaId: null, uniqueKey: null, chatJID: null, senderJID: null, statusAuthorJID: null, isGroup: null, isFromMe: null };
   try {
@@ -2626,11 +2651,22 @@ function RX_extractStanzaFieldsFromContext(ctxPtr) {
     out.senderJID = RX_jidToString(senderCand);
 
     const pickAuthorJid = () => {
-      const sels = ["incomingOriginalAuthorUserJID", "authorUserJID", "participantUserJID", "authorJID", "participantJID", "threadMsgSenderJID", "participant"];
+      const sels = [
+        "incomingOriginalAuthorUserJID", "incomingOriginalAuthorUserJid", "incomingOriginalAuthorJID", "incomingOriginalAuthorJid",
+        "authorUserJID", "authorUserJid", "participantUserJID", "participantUserJid",
+        "authorJID", "authorJid", "participantJID", "participantJid",
+        "threadMsgSenderJID", "threadMsgSenderJid",
+        "participant", "author",
+        "senderJID", "senderJid", "fromJID", "fromJid",
+      ];
       for (let i = 0; i < sels.length; i++) {
         const v = RX_tryInvokeNoArg(stanzaObj, sels[i]);
         const s = RX_jidToString(v);
         if (s) return s;
+      }
+      if (out.uniqueKey) {
+        const d = RX_deriveChatJidFromUniqueKey(out.uniqueKey);
+        if (d && d.toLowerCase() !== "status@broadcast" && d.toLowerCase().indexOf("@broadcast") === -1) return d;
       }
       return "";
     };
@@ -2638,9 +2674,10 @@ function RX_extractStanzaFieldsFromContext(ctxPtr) {
     const isStatus = (String(out.chatJID || "").toLowerCase() === "status@broadcast");
     if (isStatus) {
       out.chatJID = "status@broadcast";
-      if (authorJid) {
-        out.statusAuthorJID = authorJid;
-        out.senderJID = authorJid;
+      const derivedAuthor = authorJid || RX_extractTailJidFromUniqueKey(out.uniqueKey);
+      if (derivedAuthor) {
+        out.statusAuthorJID = derivedAuthor;
+        out.senderJID = derivedAuthor;
       }
     }
 
