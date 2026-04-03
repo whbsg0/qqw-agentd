@@ -993,6 +993,54 @@ function _sendTextCore(senderObj, mcsObj, nsTextObj, attachmentsObj, messageOrig
   return { ok: true };
 }
 
+function _sendTextCoreStatus(senderObj, mcsObj, nsTextObj, attachmentsObj, messageOrigin, creationEntryPoint, pend) {
+  const sender = senderObj && senderObj.handle ? senderObj : _safeObj(senderObj);
+  const cs = mcsObj && mcsObj.handle ? mcsObj : _safeObj(mcsObj);
+  const nsText = nsTextObj && nsTextObj.handle ? nsTextObj : _safeObj(nsTextObj);
+  const att = attachmentsObj && attachmentsObj.handle ? attachmentsObj : _safeObj(attachmentsObj);
+  if (!sender || !cs || !nsText) return { ok: false, error: "sender/chatSession/text nil" };
+  if (!_objcCanCall(sender, FIXED.sendTextSelector)) return { ok: false, error: "send selector missing" };
+  let mo = Number.isFinite(Number(messageOrigin)) ? (Number(messageOrigin) | 0) : 1;
+  let ep = Number.isFinite(Number(creationEntryPoint)) ? (Number(creationEntryPoint) | 0) : 1;
+  if (!(mo > 0)) mo = 1;
+  if (!(ep > 0)) ep = 1;
+
+  if (att && att.handle && !att.handle.isNull()) {
+    pend.attachmentsPtr = String(att.handle);
+    _pendingByAttachmentsPtr.set(pend.attachmentsPtr, pend);
+  }
+
+  const emptyArr = _nsArray0();
+  if (!emptyArr) return { ok: false, error: "empty NSArray build failed" };
+  const cb = _buildBeforeSendBlockCaptureMessage(pend);
+  if (!cb) return { ok: false, error: "beforeSendCallback block create failed" };
+  pend._block_keep = cb;
+
+  sender[FIXED.sendTextSelector](
+    nsText,
+    false,
+    att ? att : ptr("0x0"),
+    mo,
+    ep,
+    cs,
+    ptr("0x0"),
+    ptr("0x0"),
+    ptr("0x0"),
+    ptr("0x0"),
+    ptr("0x0"),
+    false,
+    false,
+    false,
+    emptyArr,
+    emptyArr,
+    false,
+    ptr("0x0"),
+    cb,
+    cb
+  );
+  return { ok: true };
+}
+
 function waitready() {
   return _runOnMainQueueSync(() => {
     const hk = _installMsgIdHook();
@@ -1024,6 +1072,40 @@ function sendtext(jidStr, text, messageOrigin, creationEntryPoint) {
       pend._keep = [nsText, att, mcs];
       _activePending = pend;
       _sendTextCore(core.sender, mcs, nsText, att, messageOrigin, creationEntryPoint, pend);
+    } catch (e) {
+      pend.error = String(e);
+    }
+  });
+  if (!sch || !sch.ok) return { ok: false, build: SCRIPT_BUILD_ID, stanzaId: "", error: sch ? sch.error : "schedule failed" };
+  const w = _waitStanzaId(pend);
+  const sid = w && w.ok ? String(w.stanzaId || "") : "";
+  const err = w && !w.ok ? String(w.error || "failed") : (pend.error ? String(pend.error) : null);
+  if (_activePending === pend) _activePending = null;
+  _cleanupPending(pend);
+  return { ok: !!(w && w.ok), build: SCRIPT_BUILD_ID, stanzaId: sid, error: err };
+}
+
+function sendstatustext(text, messageOrigin, creationEntryPoint) {
+  const pend = _pendingNew("status_text", "status@broadcast", 8000);
+  const hk = _installMsgIdHook();
+  if (!hk || !hk.ok) return { ok: false, build: SCRIPT_BUILD_ID, stanzaId: "", error: "hook install failed" };
+  const sch = _scheduleOnMainQueue(() => {
+    try {
+      const core = _resolveCoreFixed();
+      if (!core || !core.ok) { pend.error = core ? core.error : "core failed"; return; }
+      const nsText = _ns(text);
+      if (!nsText) { pend.error = "text->NSString failed"; return; }
+      const jid = _makeWAChatJIDFromString("status@broadcast");
+      if (!jid) { pend.error = "WAChatJID parse failed"; return; }
+      const cs = _fetchChatSession(core.storage, jid);
+      if (!cs) { pend.error = "fetchChatSessionForJID returned nil"; return; }
+      const mcs = _getMutableChatSession(cs);
+      if (!mcs) { pend.error = "mutableChatSession returned nil"; return; }
+      const att = _buildAttachmentsEmpty();
+      if (!att) { pend.error = "build attachments failed"; return; }
+      pend._keep = [nsText, att, mcs];
+      _activePending = pend;
+      _sendTextCoreStatus(core.sender, mcs, nsText, att, messageOrigin, creationEntryPoint, pend);
     } catch (e) {
       pend.error = String(e);
     }
@@ -1096,6 +1178,9 @@ function sendimage(jidStr, captionText, imagePath, messageOrigin) {
   if (!img) return { ok: false, build: SCRIPT_BUILD_ID, stanzaId: "", error: "UIImage load failed" };
   const sendable = _buildImageSendablePinned(img);
   if (!sendable) return { ok: false, build: SCRIPT_BUILD_ID, stanzaId: "", error: "UIImage not WAImageSendable" };
+  const capText = String(captionText || "");
+  const cap = capText ? _buildRichTextMaybe(capText) : null;
+  if (capText && !cap) return { ok: false, build: SCRIPT_BUILD_ID, stanzaId: "", error: "WARichText build failed" };
   if (!_objcCanCall(core.sender, FIXED.sendImageSelector)) return { ok: false, build: SCRIPT_BUILD_ID, stanzaId: "", error: "send image selector missing" };
   const att = _buildAttachmentsEmpty();
   if (!att) return { ok: false, build: SCRIPT_BUILD_ID, stanzaId: "", error: "build attachments failed" };
@@ -1103,14 +1188,95 @@ function sendimage(jidStr, captionText, imagePath, messageOrigin) {
   if (!emptyArr) return { ok: false, build: SCRIPT_BUILD_ID, stanzaId: "", error: "empty NSArray build failed" };
   const completion = _buildCompletionBlockCaptureMsgErr(pend);
   if (!completion) return { ok: false, build: SCRIPT_BUILD_ID, stanzaId: "", error: "completion block create failed" };
-  const mo = Number.isFinite(Number(messageOrigin)) ? Number(messageOrigin) : 1;
+  let mo = Number.isFinite(Number(messageOrigin)) ? (Number(messageOrigin) | 0) : 1;
+  if (!(mo > 0)) mo = 1;
+  pend._keep = [img, sendable, cap, mcs, att, emptyArr];
   pend._block_keep = completion;
   const sch = _scheduleOnMainQueue(() => {
     try {
       core.sender[FIXED.sendImageSelector](
         sendable,
         img,
+        cap ? cap : ptr("0x0"),
+        emptyArr,
+        emptyArr,
         ptr("0x0"),
+        att,
+        mo,
+        mcs,
+        ptr("0x0"),
+        ptr("0x0"),
+        ptr("0x0"),
+        ptr("0x0"),
+        ptr("0x0"),
+        false,
+        emptyArr,
+        ptr("0x0"),
+        emptyArr,
+        0,
+        ptr("0x0"),
+        ptr("0x0"),
+        0,
+        0,
+        ptr("0x0"),
+        ptr("0x0"),
+        false,
+        false,
+        ptr("0x0"),
+        ptr("0x0"),
+        completion
+      );
+    } catch (e) {
+      pend.error = String(e);
+    }
+  });
+  if (!sch || !sch.ok) return { ok: false, build: SCRIPT_BUILD_ID, stanzaId: "", error: sch ? sch.error : "schedule failed" };
+  const w = _waitStanzaId(pend);
+  const sid = w && w.ok ? String(w.stanzaId || "") : "";
+  const err = w && !w.ok ? String(w.error || "failed") : (pend.error ? String(pend.error) : null);
+  _cleanupPending(pend);
+  return { ok: !!(w && w.ok), build: SCRIPT_BUILD_ID, stanzaId: sid, error: err };
+}
+
+function sendstatusimage(imagePath, captionText, messageOrigin) {
+  const pend = _pendingNew("status_image", "status@broadcast", 20000);
+  const hk = _installMsgIdHook();
+  if (!hk || !hk.ok) return { ok: false, build: SCRIPT_BUILD_ID, stanzaId: "", error: "hook install failed" };
+  const coreRes = _runOnMainQueueSync(() => _resolveCoreFixed(), 2500);
+  if (!coreRes || !coreRes.ok) return { ok: false, build: SCRIPT_BUILD_ID, stanzaId: "", error: coreRes ? coreRes.error : "core failed" };
+  const core = coreRes;
+  const jid = _makeWAChatJIDFromString("status@broadcast");
+  if (!jid) return { ok: false, build: SCRIPT_BUILD_ID, stanzaId: "", error: "WAChatJID parse failed" };
+  const cs = _runOnMainQueueSync(() => _fetchChatSession(core.storage, jid), 2500);
+  if (!cs) return { ok: false, build: SCRIPT_BUILD_ID, stanzaId: "", error: "fetchChatSessionForJID returned nil" };
+  const mcs = _runOnMainQueueSync(() => _getMutableChatSession(cs), 2500);
+  if (!mcs) return { ok: false, build: SCRIPT_BUILD_ID, stanzaId: "", error: "mutableChatSession returned nil" };
+  try { _chmod(String(imagePath || ""), 0o644); } catch (_) {}
+  try { _setFileProtectionNone(String(imagePath || "")); } catch (_) {}
+  const img = _uiImageFromFile(imagePath);
+  if (!img) return { ok: false, build: SCRIPT_BUILD_ID, stanzaId: "", error: "UIImage load failed" };
+  const sendable = _buildImageSendablePinned(img);
+  if (!sendable) return { ok: false, build: SCRIPT_BUILD_ID, stanzaId: "", error: "UIImage not WAImageSendable" };
+  const capText = String(captionText || "");
+  const cap = capText ? _buildRichTextMaybe(capText) : null;
+  if (capText && !cap) return { ok: false, build: SCRIPT_BUILD_ID, stanzaId: "", error: "WARichText build failed" };
+  if (!_objcCanCall(core.sender, FIXED.sendImageSelector)) return { ok: false, build: SCRIPT_BUILD_ID, stanzaId: "", error: "send image selector missing" };
+  const att = _buildAttachmentsEmpty();
+  if (!att) return { ok: false, build: SCRIPT_BUILD_ID, stanzaId: "", error: "build attachments failed" };
+  const emptyArr = _nsArray0();
+  if (!emptyArr) return { ok: false, build: SCRIPT_BUILD_ID, stanzaId: "", error: "empty NSArray build failed" };
+  const completion = _buildCompletionBlockCaptureMsgErr(pend);
+  if (!completion) return { ok: false, build: SCRIPT_BUILD_ID, stanzaId: "", error: "completion block create failed" };
+  let mo = Number.isFinite(Number(messageOrigin)) ? (Number(messageOrigin) | 0) : 1;
+  if (!(mo > 0)) mo = 1;
+  pend._keep = [img, sendable, cap, mcs, att, emptyArr];
+  pend._block_keep = completion;
+  const sch = _scheduleOnMainQueue(() => {
+    try {
+      core.sender[FIXED.sendImageSelector](
+        sendable,
+        img,
+        cap ? cap : ptr("0x0"),
         emptyArr,
         emptyArr,
         ptr("0x0"),
@@ -1185,7 +1351,93 @@ function sendvideo(jidStr, captionText, videoPath, thumbnailPath, messageOrigin)
   if (!emptyArr) return { ok: false, build: SCRIPT_BUILD_ID, stanzaId: "", error: "empty NSArray build failed" };
   const completion = _buildCompletionBlockCaptureMsgErr(pend);
   if (!completion) return { ok: false, build: SCRIPT_BUILD_ID, stanzaId: "", error: "completion block create failed" };
-  const mo = Number.isFinite(Number(messageOrigin)) ? Number(messageOrigin) : 1;
+  let mo = Number.isFinite(Number(messageOrigin)) ? (Number(messageOrigin) | 0) : 1;
+  if (!(mo > 0)) mo = 1;
+  pend._keep = [url, thumb, cap, mcs, att, emptyArr];
+  pend._block_keep = completion;
+  const sch = _scheduleOnMainQueue(() => {
+    try {
+      core.sender[FIXED.sendVideoSelector](
+        url,
+        thumb ? thumb : ptr("0x0"),
+        uint64(0),
+        false,
+        false,
+        int64(0),
+        cap ? cap : ptr("0x0"),
+        emptyArr,
+        emptyArr,
+        ptr("0x0"),
+        att,
+        mo,
+        mcs,
+        ptr("0x0"),
+        ptr("0x0"),
+        ptr("0x0"),
+        ptr("0x0"),
+        ptr("0x0"),
+        false,
+        emptyArr,
+        uint64(0),
+        ptr("0x0"),
+        ptr("0x0"),
+        0,
+        0,
+        ptr("0x0"),
+        ptr("0x0"),
+        ptr("0x0"),
+        ptr("0x0"),
+        completion
+      );
+    } catch (e) {
+      pend.error = String(e);
+    }
+  });
+  if (!sch || !sch.ok) return { ok: false, build: SCRIPT_BUILD_ID, stanzaId: "", error: sch ? sch.error : "schedule failed" };
+  const w = _waitStanzaId(pend);
+  const sid = w && w.ok ? String(w.stanzaId || "") : "";
+  const err = w && !w.ok ? String(w.error || "failed") : (pend.error ? String(pend.error) : null);
+  _cleanupPending(pend);
+  return { ok: !!(w && w.ok), build: SCRIPT_BUILD_ID, stanzaId: sid, error: err };
+}
+
+function sendstatusvideo(videoPath, captionText, thumbnailPath, messageOrigin) {
+  const pend = _pendingNew("status_video", "status@broadcast", 30000);
+  const hk = _installMsgIdHook();
+  if (!hk || !hk.ok) return { ok: false, build: SCRIPT_BUILD_ID, stanzaId: "", error: "hook install failed" };
+  const coreRes = _runOnMainQueueSync(() => _resolveCoreFixed(), 2500);
+  if (!coreRes || !coreRes.ok) return { ok: false, build: SCRIPT_BUILD_ID, stanzaId: "", error: coreRes ? coreRes.error : "core failed" };
+  const core = coreRes;
+  const jid = _makeWAChatJIDFromString("status@broadcast");
+  if (!jid) return { ok: false, build: SCRIPT_BUILD_ID, stanzaId: "", error: "WAChatJID parse failed" };
+  const cs = _runOnMainQueueSync(() => _fetchChatSession(core.storage, jid), 2500);
+  if (!cs) return { ok: false, build: SCRIPT_BUILD_ID, stanzaId: "", error: "fetchChatSessionForJID returned nil" };
+  const mcs = _runOnMainQueueSync(() => _getMutableChatSession(cs), 2500);
+  if (!mcs) return { ok: false, build: SCRIPT_BUILD_ID, stanzaId: "", error: "mutableChatSession returned nil" };
+  try { _chmod(String(videoPath || ""), 0o644); } catch (_) {}
+  try { _setFileProtectionNone(String(videoPath || "")); } catch (_) {}
+  const url = _fileURLFromPath(videoPath);
+  if (!url) return { ok: false, build: SCRIPT_BUILD_ID, stanzaId: "", error: "NSURL fileURL failed" };
+  const tp = String(thumbnailPath || "").trim();
+  if (tp) {
+    try { _chmod(tp, 0o644); } catch (_) {}
+    try { _setFileProtectionNone(tp); } catch (_) {}
+  }
+  const thumb = tp ? _uiImageFromFile(tp) : null;
+  if (tp && !thumb) return { ok: false, build: SCRIPT_BUILD_ID, stanzaId: "", error: "thumbnail UIImage load failed" };
+  const capText = String(captionText || "");
+  const cap = capText ? _buildRichTextMaybe(capText) : null;
+  if (capText && !cap) return { ok: false, build: SCRIPT_BUILD_ID, stanzaId: "", error: "WARichText build failed" };
+  if (!_objcCanCall(core.sender, FIXED.sendVideoSelector)) return { ok: false, build: SCRIPT_BUILD_ID, stanzaId: "", error: "send video selector missing" };
+  const att = _buildAttachmentsEmpty();
+  if (!att) return { ok: false, build: SCRIPT_BUILD_ID, stanzaId: "", error: "build attachments failed" };
+  const emptyArr = _nsArray0();
+  if (!emptyArr) return { ok: false, build: SCRIPT_BUILD_ID, stanzaId: "", error: "empty NSArray build failed" };
+  const completion = _buildCompletionBlockCaptureMsgErr(pend);
+  if (!completion) return { ok: false, build: SCRIPT_BUILD_ID, stanzaId: "", error: "completion block create failed" };
+  let mo = Number.isFinite(Number(messageOrigin)) ? (Number(messageOrigin) | 0) : 1;
+  if (!(mo > 0)) mo = 1;
+  pend._keep = [url, thumb, cap, mcs, att, emptyArr];
   pend._block_keep = completion;
   const sch = _scheduleOnMainQueue(() => {
     try {
@@ -1346,14 +1598,25 @@ rpc.exports = {
   sendimage,
   sendvideo,
   sendaudio,
+  sendstatustext,
+  sendstatusimage,
+  sendstatusvideo,
   statusposttext(text, messageOrigin, creationEntryPoint) {
-    return sendtext("status@broadcast", String(text || ""), Number(messageOrigin) || 0, Number(creationEntryPoint) || 0);
+    let mo = Number(messageOrigin);
+    let ep = Number(creationEntryPoint);
+    if (!(mo > 0)) mo = 1;
+    if (!(ep > 0)) ep = 1;
+    return sendstatustext(String(text || ""), mo | 0, ep | 0);
   },
   statuspostimage(imagePath, captionText, messageOrigin) {
-    return sendimage("status@broadcast", String(captionText || ""), String(imagePath || ""), Number(messageOrigin) || 0);
+    let mo = Number(messageOrigin);
+    if (!(mo > 0)) mo = 1;
+    return sendstatusimage(String(imagePath || ""), String(captionText || ""), mo | 0);
   },
   statuspostvideo(videoPath, captionText, messageOrigin) {
-    return sendvideo("status@broadcast", String(captionText || ""), String(videoPath || ""), "", Number(messageOrigin) || 0);
+    let mo = Number(messageOrigin);
+    if (!(mo > 0)) mo = 1;
+    return sendstatusvideo(String(videoPath || ""), String(captionText || ""), "", mo | 0);
   },
   avatarurl,
   selfnameactive,
@@ -2085,6 +2348,168 @@ function _selfCardLoop() {
 
 try { setImmediate(_selfCardLoop); } catch (_) {}
 
+function _contactsDigitsOnly(s) {
+  try { return String(s || "").replace(/[^0-9]/g, ""); } catch (_) { return ""; }
+}
+
+function _contactsNoteEmitResult(opId, phoneDigits, res, extraErr) {
+  try {
+    const status = String((res && res.status) ? res.status : "failed");
+    const ok = status === "success";
+    const err = ok ? "" : String((res && res.error) ? res.error : (extraErr ? extraErr : "failed"));
+    send({
+      type: "wa.tx.contact_note_upsert.result",
+      build: SCRIPT_BUILD_ID,
+      ts: Date.now(),
+      op_id: String(opId || ""),
+      opId: String(opId || ""),
+      phoneDigits: String(phoneDigits || ""),
+      ok: ok,
+      status: status,
+      matched: (res && res.matched) ? res.matched : null,
+      before: (res && res.before) ? res.before : null,
+      after: (res && res.after) ? res.after : null,
+      error: err
+    });
+  } catch (_) {}
+}
+
+function _contactsNoteUpsertOnMain(phoneDigits, noteText) {
+  try {
+    if (!RX_objcAvailable()) return { status: "failed", error: "objc unavailable" };
+    const digits = _contactsDigitsOnly(phoneDigits);
+    if (!digits || digits.length < 7 || digits.length > 15) return { status: "invalid_phone", error: "invalid phoneDigits" };
+
+    const CNContactStore = ObjC.classes.CNContactStore;
+    const CNPhoneNumber = ObjC.classes.CNPhoneNumber;
+    const CNContact = ObjC.classes.CNContact;
+    const CNSaveRequest = ObjC.classes.CNSaveRequest;
+    const NSMutableArray = ObjC.classes.NSMutableArray;
+    const NSString = ObjC.classes.NSString;
+    if (!CNContactStore || !CNPhoneNumber || !CNContact || !CNSaveRequest || !NSMutableArray || !NSString) {
+      return { status: "failed", error: "Contacts.framework unavailable" };
+    }
+
+    const store = CNContactStore.alloc().init();
+    if (!store) return { status: "failed", error: "CNContactStore init failed" };
+
+    const pn = CNPhoneNumber["+ phoneNumberWithStringValue:"](NSString.stringWithString_(digits));
+    if (!pn) return { status: "invalid_phone", error: "CNPhoneNumber build failed" };
+
+    if (!CNContact["+ predicateForContactsMatchingPhoneNumber:"]) {
+      return { status: "failed", error: "predicateForContactsMatchingPhoneNumber unavailable" };
+    }
+    const pred = CNContact["+ predicateForContactsMatchingPhoneNumber:"](pn);
+    if (!pred) return { status: "failed", error: "predicate build failed" };
+
+    const keys = NSMutableArray.array();
+    keys.addObject_(NSString.stringWithString_("identifier"));
+    keys.addObject_(NSString.stringWithString_("phoneNumbers"));
+    keys.addObject_(NSString.stringWithString_("note"));
+
+    if (!store["- unifiedContactsMatchingPredicate:keysToFetch:error:"]) {
+      return { status: "failed", error: "unifiedContactsMatchingPredicate unavailable" };
+    }
+    const arr = store["- unifiedContactsMatchingPredicate:keysToFetch:error:"](pred, keys, ptr("0x0"));
+    const candidates = [];
+    if (arr) {
+      const n = arr.count();
+      for (let i = 0; i < n; i++) {
+        try { candidates.push(arr.objectAtIndex_(i)); } catch (_) {}
+      }
+    }
+    if (candidates.length === 0) return { status: "not_found", error: "" };
+
+    const matched = [];
+    for (const c of candidates) {
+      try {
+        const pns = c.phoneNumbers();
+        if (!pns) continue;
+        const pnCount = pns.count();
+        let ok = false;
+        for (let i = 0; i < pnCount; i++) {
+          const lv = pns.objectAtIndex_(i);
+          if (!lv) continue;
+          const val = lv.value();
+          if (!val) continue;
+          const s = String(val.stringValue ? val.stringValue() : "");
+          const d = _contactsDigitsOnly(s);
+          if (d === digits) { ok = true; break; }
+        }
+        if (ok) matched.push(c);
+      } catch (_) {}
+    }
+
+    if (matched.length === 0) return { status: "not_found", error: "" };
+    if (matched.length > 1) {
+      return { status: "ambiguous", error: "", matched: { matchCount: matched.length, matchedDigits: digits } };
+    }
+
+    const c0 = matched[0];
+    const beforeNote = String(c0.note ? c0.note() : "");
+    const cid = String(c0.identifier ? c0.identifier() : "");
+    const mc = c0.mutableCopy();
+    if (!mc) return { status: "failed", error: "mutableCopy failed" };
+
+    if (!mc["- setNote:"]) return { status: "failed", error: "setNote unavailable" };
+    mc["- setNote:"](NSString.stringWithString_(String(noteText || "")));
+
+    const req = CNSaveRequest.alloc().init();
+    if (!req) return { status: "failed", error: "CNSaveRequest init failed" };
+    if (!req["- updateContact:"]) return { status: "failed", error: "updateContact unavailable" };
+    req["- updateContact:"](mc);
+    if (!store["- executeSaveRequest:error:"]) return { status: "failed", error: "executeSaveRequest unavailable" };
+    const okExec = store["- executeSaveRequest:error:"](req, ptr("0x0"));
+    const okBool = (okExec === 1 || okExec === true || String(okExec) === "1");
+    if (!okBool) return { status: "failed", error: "executeSaveRequest failed" };
+
+    let afterNote = String(mc.note ? mc.note() : "");
+    try {
+      if (cid && store["- unifiedContactWithIdentifier:keysToFetch:error:"]) {
+        const keys2 = NSMutableArray.array();
+        keys2.addObject_(NSString.stringWithString_("identifier"));
+        keys2.addObject_(NSString.stringWithString_("note"));
+        const c2 = store["- unifiedContactWithIdentifier:keysToFetch:error:"](NSString.stringWithString_(cid), keys2, ptr("0x0"));
+        if (c2 && c2.note) afterNote = String(c2.note());
+      }
+    } catch (_) {}
+
+    return {
+      status: "success",
+      matched: { contactId: cid, matchedDigits: digits, matchCount: 1 },
+      before: { note: beforeNote },
+      after: { note: afterNote },
+      error: ""
+    };
+  } catch (e) {
+    return { status: "failed", error: String(e) };
+  }
+}
+
+function _contactsNoteHandleMsg(message) {
+  const p = message && message.payload ? message.payload : (message || {});
+  const opId = String(p.opId || p.op_id || "");
+  const phoneDigits = String(p.phoneDigits || "");
+  const noteText = String(p.noteText || "");
+  const timeoutMs = Number(p.timeoutMs || 15000) | 0;
+  if (!opId || !phoneDigits) {
+    _contactsNoteEmitResult(opId, phoneDigits, { status: "failed", error: "missing opId/phoneDigits" }, null);
+    return;
+  }
+  try { waitready(); } catch (_) {}
+  const res = _runOnMainQueueSync(() => _contactsNoteUpsertOnMain(phoneDigits, noteText), timeoutMs + 3000);
+  _contactsNoteEmitResult(opId, phoneDigits, res, null);
+}
+
+function _contactsNoteLoop() {
+  recv("qqw.contacts_note_upsert", function (message) {
+    try { _contactsNoteHandleMsg(message); } catch (_) {}
+    _contactsNoteLoop();
+  }).wait();
+}
+
+try { setImmediate(_contactsNoteLoop); } catch (_) {}
+
 function _txHandleMsg(message) {
   const p = message && message.payload ? message.payload : (message || {});
   const opId = String(p.opId || p.op_id || "");
@@ -2108,15 +2533,15 @@ function _txHandleMsg(message) {
     if (kind === "text") {
       res = sendtext(jid, text, messageOrigin, creationEntryPoint);
     } else if (kind === "status_text") {
-      res = sendtext("status@broadcast", text, messageOrigin, creationEntryPoint);
+      res = sendstatustext(text, messageOrigin, creationEntryPoint);
     } else if (kind === "quote") {
       res = sendquotetext(jid, quoteStanzaId, text, participantJid, messageOrigin, creationEntryPoint);
     } else if (kind === "image") {
       res = sendimage(jid, String(p.caption || ""), String(p.path || p.imagePath || ""), messageOrigin);
     } else if (kind === "status_image") {
-      res = sendimage("status@broadcast", String(p.caption || ""), String(p.path || p.imagePath || ""), messageOrigin);
+      res = sendstatusimage(String(p.path || p.imagePath || ""), String(p.caption || ""), messageOrigin);
     } else if (kind === "status_video") {
-      res = sendvideo("status@broadcast", String(p.caption || ""), String(p.path || p.videoPath || ""), String(p.thumbnailPath || ""), messageOrigin);
+      res = sendstatusvideo(String(p.path || p.videoPath || ""), String(p.caption || ""), String(p.thumbnailPath || ""), messageOrigin);
     } else if (kind === "video") {
       res = sendvideo(jid, String(p.caption || ""), String(p.path || p.videoPath || ""), String(p.thumbnailPath || ""), messageOrigin);
     } else if (kind === "audio") {
@@ -2958,7 +3383,7 @@ function RX_pickBestNSDataCandidate(cands) {
 
 const RX_CONFIG = {
   moduleNameHints: ["WhatsApp", "WhatsAppDecrypted", "WhatsApp_Decrypted"],
-  rva: 0x35B1CE4,
+  rva: 0x369625C,
   cmdSelectors: [
     "reallyProcessResultsAfterSignalForContext:plaintextProtobuf:originalMessageData:notificationBehavior:journalID:error:retryCount:origin:reportEmptyPlaintextError:",
     "processResultsAfterSignalForContext:plaintextProtobuf:originalMessageData:notificationBehavior:journalID:error:retryCount:origin:reportEmptyPlaintextError:",

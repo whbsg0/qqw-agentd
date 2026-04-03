@@ -215,6 +215,15 @@ type TxSelfCardPayload struct {
 	TimeoutMs int    `json:"timeoutMs,omitempty"`
 }
 
+type TxContactNoteUpsertPayload struct {
+	OpID            string `json:"opId"`
+	ChatJid         string `json:"chatJid"`
+	ContactPhoneJid string `json:"contactPhoneJid"`
+	NoteText        string `json:"noteText"`
+	UpdatedAtMs     int64  `json:"updatedAtMs,omitempty"`
+	TimeoutMs       int    `json:"timeoutMs,omitempty"`
+}
+
 type Agent struct {
 	cfgMu sync.RWMutex
 	cfg   Config
@@ -1348,6 +1357,8 @@ func (a *Agent) readLoop(ctx context.Context, ws *websocket.Conn, sessionID stri
 			go a.handleTxAvatarURL(in)
 		case "tx_self_card":
 			go a.handleTxSelfCard(in)
+		case "tx_contact_note_upsert":
+			go a.handleTxContactNoteUpsert(in)
 		}
 	}
 }
@@ -2081,6 +2092,156 @@ func (a *Agent) handleTxSelfCard(in Envelope) {
 		return
 	}
 	a.logf("tx_self_card: dispatched opId=%s", p.OpID)
+}
+
+func (a *Agent) enqueueLocalScriptEvent(m map[string]any) {
+	bs, err := json.Marshal(m)
+	if err != nil || len(bs) == 0 {
+		return
+	}
+	a.eventQueue.Enqueue(bs)
+}
+
+func (a *Agent) handleTxContactNoteUpsert(in Envelope) {
+	var p TxContactNoteUpsertPayload
+	if err := json.Unmarshal(in.Payload, &p); err != nil {
+		a.logf("tx_contact_note_upsert: invalid payload: %v", err)
+		return
+	}
+	p.OpID = strings.TrimSpace(p.OpID)
+	p.ChatJid = strings.TrimSpace(p.ChatJid)
+	p.ContactPhoneJid = strings.TrimSpace(p.ContactPhoneJid)
+	p.NoteText = strings.TrimSpace(p.NoteText)
+	if p.TimeoutMs <= 0 {
+		p.TimeoutMs = 15_000
+	}
+	if p.OpID == "" || p.ContactPhoneJid == "" {
+		a.enqueueLocalScriptEvent(map[string]any{
+			"type":            "wa.tx.contact_note_upsert.result",
+			"build":           "agentd",
+			"ts":              time.Now().UnixMilli(),
+			"opId":            p.OpID,
+			"op_id":           p.OpID,
+			"chatJid":         p.ChatJid,
+			"contactPhoneJid": p.ContactPhoneJid,
+			"ok":              false,
+			"status":          "failed",
+			"error":           "missing opId/contactPhoneJid",
+		})
+		a.logf("tx_contact_note_upsert: missing opId/contactPhoneJid")
+		return
+	}
+	phoneJidLower := strings.ToLower(p.ContactPhoneJid)
+	if !(strings.HasSuffix(phoneJidLower, "@s.whatsapp.net") || strings.HasSuffix(phoneJidLower, "@c.us")) {
+		a.enqueueLocalScriptEvent(map[string]any{
+			"type":            "wa.tx.contact_note_upsert.result",
+			"build":           "agentd",
+			"ts":              time.Now().UnixMilli(),
+			"opId":            p.OpID,
+			"op_id":           p.OpID,
+			"chatJid":         p.ChatJid,
+			"contactPhoneJid": p.ContactPhoneJid,
+			"ok":              false,
+			"status":          "invalid_phone",
+			"error":           "contactPhoneJid must end with @s.whatsapp.net/@c.us",
+		})
+		a.logf("tx_contact_note_upsert: invalid contactPhoneJid=%s", p.ContactPhoneJid)
+		return
+	}
+	left := p.ContactPhoneJid
+	if at := strings.LastIndex(left, "@"); at > 0 {
+		left = left[:at]
+	}
+	digitsOnly := func(s string) string {
+		var b strings.Builder
+		b.Grow(len(s))
+		for _, r := range s {
+			if r >= '0' && r <= '9' {
+				b.WriteRune(r)
+			}
+		}
+		return b.String()
+	}
+	phoneDigits := digitsOnly(left)
+	if l := len(phoneDigits); l < 7 || l > 15 {
+		a.enqueueLocalScriptEvent(map[string]any{
+			"type":            "wa.tx.contact_note_upsert.result",
+			"build":           "agentd",
+			"ts":              time.Now().UnixMilli(),
+			"opId":            p.OpID,
+			"op_id":           p.OpID,
+			"chatJid":         p.ChatJid,
+			"contactPhoneJid": p.ContactPhoneJid,
+			"phoneDigits":     phoneDigits,
+			"ok":              false,
+			"status":          "invalid_phone",
+			"error":           "invalid phoneDigits length",
+		})
+		a.logf("tx_contact_note_upsert: invalid phoneDigits=%s", phoneDigits)
+		return
+	}
+
+	if a.runnerPid.Load() == 0 {
+		_ = a.startRunner()
+	}
+	rpcURL := "http://127.0.0.1:17172/rpc/contacts/note/upsert"
+	body, _ := json.Marshal(map[string]any{
+		"v":           1,
+		"opId":        p.OpID,
+		"phoneDigits": phoneDigits,
+		"noteText":    p.NoteText,
+		"timeoutMs":   p.TimeoutMs,
+	})
+	cctx, cancel := context.WithTimeout(context.Background(), time.Duration(p.TimeoutMs+3000)*time.Millisecond)
+	defer cancel()
+	req, err := http.NewRequestWithContext(cctx, http.MethodPost, rpcURL, bytes.NewReader(body))
+	if err != nil {
+		a.logf("tx_contact_note_upsert: build request failed: %v", err)
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		a.enqueueLocalScriptEvent(map[string]any{
+			"type":            "wa.tx.contact_note_upsert.result",
+			"build":           "agentd",
+			"ts":              time.Now().UnixMilli(),
+			"opId":            p.OpID,
+			"op_id":           p.OpID,
+			"chatJid":         p.ChatJid,
+			"contactPhoneJid": p.ContactPhoneJid,
+			"phoneDigits":     phoneDigits,
+			"ok":              false,
+			"status":          "failed",
+			"error":           "runner rpc failed: " + err.Error(),
+		})
+		a.logf("tx_contact_note_upsert: rpc failed: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		bs, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		msg := strings.TrimSpace(string(bs))
+		if msg == "" {
+			msg = resp.Status
+		}
+		a.enqueueLocalScriptEvent(map[string]any{
+			"type":            "wa.tx.contact_note_upsert.result",
+			"build":           "agentd",
+			"ts":              time.Now().UnixMilli(),
+			"opId":            p.OpID,
+			"op_id":           p.OpID,
+			"chatJid":         p.ChatJid,
+			"contactPhoneJid": p.ContactPhoneJid,
+			"phoneDigits":     phoneDigits,
+			"ok":              false,
+			"status":          "failed",
+			"error":           "runner rpc status: " + msg,
+		})
+		a.logf("tx_contact_note_upsert: rpc status=%d err=%s", resp.StatusCode, msg)
+		return
+	}
+	a.logf("tx_contact_note_upsert: dispatched opId=%s chatJid=%s", p.OpID, p.ChatJid)
 }
 
 func (a *Agent) handleDbSyncStart(in Envelope) {

@@ -49,6 +49,14 @@ type selfCardRPCReq struct {
 	TimeoutMs int    `json:"timeoutMs,omitempty"`
 }
 
+type contactsNoteUpsertRPCReq struct {
+	V           int    `json:"v,omitempty"`
+	OpID        string `json:"opId"`
+	PhoneDigits string `json:"phoneDigits"`
+	NoteText    string `json:"noteText"`
+	TimeoutMs   int    `json:"timeoutMs,omitempty"`
+}
+
 func startRPCServer(addr string) {
 	addr = strings.TrimSpace(addr)
 	if addr == "" {
@@ -65,12 +73,51 @@ func startRPCServer(addr string) {
 	mux.HandleFunc("/rpc/msg/action", handleRPCMsgAction)
 	mux.HandleFunc("/rpc/avatar/url", handleRPCAvatarURL)
 	mux.HandleFunc("/rpc/self/card", handleRPCSelfCard)
+	mux.HandleFunc("/rpc/contacts/note/upsert", handleRPCContactsNoteUpsert)
 	srv := &http.Server{
 		Addr:              addr,
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	_ = srv.ListenAndServe()
+}
+
+func handleRPCContactsNoteUpsert(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req contactsNoteUpsertRPCReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+	req.OpID = strings.TrimSpace(req.OpID)
+	req.PhoneDigits = strings.TrimSpace(req.PhoneDigits)
+	req.NoteText = strings.TrimSpace(req.NoteText)
+	if req.OpID == "" || req.PhoneDigits == "" {
+		http.Error(w, "opId/phoneDigits required", http.StatusBadRequest)
+		return
+	}
+	if req.TimeoutMs <= 0 {
+		req.TimeoutMs = 15_000
+	}
+	msg := map[string]any{
+		"type": "qqw.contacts_note_upsert",
+		"payload": map[string]any{
+			"v":           1,
+			"opId":        req.OpID,
+			"phoneDigits": req.PhoneDigits,
+			"noteText":    req.NoteText,
+			"timeoutMs":   req.TimeoutMs,
+		},
+	}
+	bs, _ := json.Marshal(msg)
+	if err := postToScriptJSON(string(bs)); err != nil {
+		http.Error(w, "script post failed: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 func handleRPCHealth(w http.ResponseWriter, r *http.Request) {
