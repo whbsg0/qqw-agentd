@@ -50,11 +50,13 @@ type selfCardRPCReq struct {
 }
 
 type contactsNoteUpsertRPCReq struct {
-	V           int    `json:"v,omitempty"`
-	OpID        string `json:"opId"`
-	PhoneDigits string `json:"phoneDigits"`
-	NoteText    string `json:"noteText"`
-	TimeoutMs   int    `json:"timeoutMs,omitempty"`
+	V               int    `json:"v,omitempty"`
+	OpID            string `json:"opId"`
+	ChatJid         string `json:"chatJid,omitempty"`
+	ContactPhoneJid string `json:"contactPhoneJid,omitempty"`
+	PhoneDigits     string `json:"phoneDigits"`
+	NoteText        string `json:"noteText"`
+	TimeoutMs       int    `json:"timeoutMs,omitempty"`
 }
 
 func startRPCServer(addr string) {
@@ -93,6 +95,8 @@ func handleRPCContactsNoteUpsert(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	req.OpID = strings.TrimSpace(req.OpID)
+	req.ChatJid = strings.TrimSpace(req.ChatJid)
+	req.ContactPhoneJid = strings.TrimSpace(req.ContactPhoneJid)
 	req.PhoneDigits = strings.TrimSpace(req.PhoneDigits)
 	req.NoteText = strings.TrimSpace(req.NoteText)
 	if req.OpID == "" || req.PhoneDigits == "" {
@@ -105,11 +109,13 @@ func handleRPCContactsNoteUpsert(w http.ResponseWriter, r *http.Request) {
 	msg := map[string]any{
 		"type": "qqw.contacts_note_upsert",
 		"payload": map[string]any{
-			"v":           1,
-			"opId":        req.OpID,
-			"phoneDigits": req.PhoneDigits,
-			"noteText":    req.NoteText,
-			"timeoutMs":   req.TimeoutMs,
+			"v":               1,
+			"opId":            req.OpID,
+			"chatJid":         req.ChatJid,
+			"contactPhoneJid": req.ContactPhoneJid,
+			"phoneDigits":     req.PhoneDigits,
+			"noteText":        req.NoteText,
+			"timeoutMs":       req.TimeoutMs,
 		},
 	}
 	bs, _ := json.Marshal(msg)

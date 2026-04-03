@@ -2186,11 +2186,13 @@ func (a *Agent) handleTxContactNoteUpsert(in Envelope) {
 	}
 	rpcURL := "http://127.0.0.1:17172/rpc/contacts/note/upsert"
 	body, _ := json.Marshal(map[string]any{
-		"v":           1,
-		"opId":        p.OpID,
-		"phoneDigits": phoneDigits,
-		"noteText":    p.NoteText,
-		"timeoutMs":   p.TimeoutMs,
+		"v":               1,
+		"opId":            p.OpID,
+		"chatJid":         p.ChatJid,
+		"contactPhoneJid": p.ContactPhoneJid,
+		"phoneDigits":     phoneDigits,
+		"noteText":        p.NoteText,
+		"timeoutMs":       p.TimeoutMs,
 	})
 	cctx, cancel := context.WithTimeout(context.Background(), time.Duration(p.TimeoutMs+3000)*time.Millisecond)
 	defer cancel()

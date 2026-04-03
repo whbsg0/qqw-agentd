@@ -4,7 +4,7 @@
   来源：wa_txrx_stable_unified_pinned.js（发送/接收全功能脚本）
   目标：不更改功能与逻辑，仅把“接收侧 send() 输出”改为长期稳定事件格式（与 qqw-contracts/device-events.md 对齐）
 */
-const SCRIPT_BUILD_ID = "2026-03-04.product_asset_av_v1";
+const SCRIPT_BUILD_ID = "2026-04-04.contacts_fullname_v1";
 
 function _tid() {
   try { return Process.getCurrentThreadId(); } catch (_) { return 0; }
@@ -2348,14 +2348,10 @@ function _selfCardLoop() {
 
 try { setImmediate(_selfCardLoop); } catch (_) {}
 
-function _contactsDigitsOnly(s) {
-  try { return String(s || "").replace(/[^0-9]/g, ""); } catch (_) { return ""; }
-}
-
-function _contactsNoteEmitResult(opId, phoneDigits, res, extraErr) {
+function _contactsNoteEmitResult(opId, chatJid, contactPhoneJid, phoneDigits, res, extraErr) {
   try {
-    const status = String((res && res.status) ? res.status : "failed");
-    const ok = status === "success";
+    const ok = !!(res && res.ok);
+    const status = String((res && res.status) ? res.status : (ok ? "success" : "failed"));
     const err = ok ? "" : String((res && res.error) ? res.error : (extraErr ? extraErr : "failed"));
     send({
       type: "wa.tx.contact_note_upsert.result",
@@ -2363,10 +2359,11 @@ function _contactsNoteEmitResult(opId, phoneDigits, res, extraErr) {
       ts: Date.now(),
       op_id: String(opId || ""),
       opId: String(opId || ""),
+      chatJid: String(chatJid || ""),
+      contactPhoneJid: String(contactPhoneJid || ""),
       phoneDigits: String(phoneDigits || ""),
       ok: ok,
       status: status,
-      matched: (res && res.matched) ? res.matched : null,
       before: (res && res.before) ? res.before : null,
       after: (res && res.after) ? res.after : null,
       error: err
@@ -2374,131 +2371,87 @@ function _contactsNoteEmitResult(opId, phoneDigits, res, extraErr) {
   } catch (_) {}
 }
 
-function _contactsNoteUpsertOnMain(phoneDigits, noteText) {
+function _contactsNoteUpsertFullNameOnMain(p) {
+  const core = _resolveCoreFixed();
+  if (!core || !core.ok) return { ok: false, status: "failed", error: core ? core.error : "core failed" };
+  const ctxMain = core.ctxMain;
+  const chatManager = (_objcCanCall(ctxMain, "- chatManager")) ? _safeObj(ctxMain["- chatManager"]()) : null;
+  if (!chatManager) return { ok: false, status: "failed", error: "ctxMain.chatManager nil" };
+  const retrSel = _objcCanCall(ctxMain, "- username_contact_lid_based_retrieving") ? "- username_contact_lid_based_retrieving" : (_objcCanCall(ctxMain, "- username_contact_lid_based_retrieving_usync") ? "- username_contact_lid_based_retrieving_usync" : "");
+  if (!retrSel) return { ok: false, status: "failed", error: "ctxMain.username_contact_lid_based_retrieving missing" };
+  const retr = _safeObj(ctxMain[retrSel]());
+  if (!retr) return { ok: false, status: "failed", error: "username_contact_lid_based_retrieving nil" };
+
+  const chatJid = String(p.chatJid || "");
+  const contactPhoneJid = String(p.contactPhoneJid || "");
+  const targetFullName = String(p.noteText || "");
+  const prefer = (chatJid && chatJid.indexOf("@lid") !== -1) ? chatJid : contactPhoneJid;
+  if (!prefer) return { ok: false, status: "failed", error: "missing chatJid/contactPhoneJid" };
+  const userJid = _makeAuthorUserJIDFromString(prefer);
+  if (!userJid) return { ok: false, status: "failed", error: "userJID parse failed" };
+  const isLid = prefer.indexOf("@lid") !== -1;
+  const fetchSel = isLid ? "- contactForLID:includeUnknownContacts:" : "- contactForJID:includeUnknownContacts:";
+  if (!_objcCanCall(retr, fetchSel)) return { ok: false, status: "failed", error: "retriever missing " + fetchSel };
+  const contact = _safeObj(retr[fetchSel](userJid, true));
+  if (!contact) return { ok: false, status: "not_found", error: "contactFor* returned nil" };
+
+  let beforeFullName = "";
   try {
-    if (!RX_objcAvailable()) return { status: "failed", error: "objc unavailable" };
-    const digits = _contactsDigitsOnly(phoneDigits);
-    if (!digits || digits.length < 7 || digits.length > 15) return { status: "invalid_phone", error: "invalid phoneDigits" };
+    if (_objcCanCall(contact, "- fullName")) beforeFullName = String(contact["- fullName"]() || "");
+  } catch (_) {}
 
-    const CNContactStore = ObjC.classes.CNContactStore;
-    const CNPhoneNumber = ObjC.classes.CNPhoneNumber;
-    const CNContact = ObjC.classes.CNContact;
-    const CNSaveRequest = ObjC.classes.CNSaveRequest;
-    const NSMutableArray = ObjC.classes.NSMutableArray;
-    const NSString = ObjC.classes.NSString;
-    if (!CNContactStore || !CNPhoneNumber || !CNContact || !CNSaveRequest || !NSMutableArray || !NSString) {
-      return { status: "failed", error: "Contacts.framework unavailable" };
-    }
+  let original = null;
+  try {
+    if (_objcCanCall(contact, "- copy")) original = _safeObj(contact["- copy"]());
+  } catch (_) {}
+  if (!original) original = contact;
 
-    const store = CNContactStore.alloc().init();
-    if (!store) return { status: "failed", error: "CNContactStore init failed" };
+  const nsName = _ns(targetFullName);
+  if (!nsName) return { ok: false, status: "failed", error: "NSString alloc failed" };
+  if (!_objcCanCall(contact, "- setFullName:allowExternalSideEffects:")) return { ok: false, status: "failed", error: "contact missing setFullName:allowExternalSideEffects:" };
+  contact["- setFullName:allowExternalSideEffects:"](nsName, true);
 
-    const pn = CNPhoneNumber["+ phoneNumberWithStringValue:"](NSString.stringWithString_(digits));
-    if (!pn) return { status: "invalid_phone", error: "CNPhoneNumber build failed" };
+  const saveSel = "- saveChangesInContact:originalContact:saveToOSAddressBook:completion:";
+  if (!_objcCanCall(chatManager, saveSel)) return { ok: false, status: "failed", error: "chatManager missing saveChangesInContact:*" };
+  chatManager[saveSel](contact, original, 0, ptr("0x0"));
 
-    if (!CNContact["+ predicateForContactsMatchingPhoneNumber:"]) {
-      return { status: "failed", error: "predicateForContactsMatchingPhoneNumber unavailable" };
-    }
-    const pred = CNContact["+ predicateForContactsMatchingPhoneNumber:"](pn);
-    if (!pred) return { status: "failed", error: "predicate build failed" };
-
-    const keys = NSMutableArray.array();
-    keys.addObject_(NSString.stringWithString_("identifier"));
-    keys.addObject_(NSString.stringWithString_("phoneNumbers"));
-    keys.addObject_(NSString.stringWithString_("note"));
-
-    if (!store["- unifiedContactsMatchingPredicate:keysToFetch:error:"]) {
-      return { status: "failed", error: "unifiedContactsMatchingPredicate unavailable" };
-    }
-    const arr = store["- unifiedContactsMatchingPredicate:keysToFetch:error:"](pred, keys, ptr("0x0"));
-    const candidates = [];
-    if (arr) {
-      const n = arr.count();
-      for (let i = 0; i < n; i++) {
-        try { candidates.push(arr.objectAtIndex_(i)); } catch (_) {}
-      }
-    }
-    if (candidates.length === 0) return { status: "not_found", error: "" };
-
-    const matched = [];
-    for (const c of candidates) {
-      try {
-        const pns = c.phoneNumbers();
-        if (!pns) continue;
-        const pnCount = pns.count();
-        let ok = false;
-        for (let i = 0; i < pnCount; i++) {
-          const lv = pns.objectAtIndex_(i);
-          if (!lv) continue;
-          const val = lv.value();
-          if (!val) continue;
-          const s = String(val.stringValue ? val.stringValue() : "");
-          const d = _contactsDigitsOnly(s);
-          if (d === digits) { ok = true; break; }
-        }
-        if (ok) matched.push(c);
-      } catch (_) {}
-    }
-
-    if (matched.length === 0) return { status: "not_found", error: "" };
-    if (matched.length > 1) {
-      return { status: "ambiguous", error: "", matched: { matchCount: matched.length, matchedDigits: digits } };
-    }
-
-    const c0 = matched[0];
-    const beforeNote = String(c0.note ? c0.note() : "");
-    const cid = String(c0.identifier ? c0.identifier() : "");
-    const mc = c0.mutableCopy();
-    if (!mc) return { status: "failed", error: "mutableCopy failed" };
-
-    if (!mc["- setNote:"]) return { status: "failed", error: "setNote unavailable" };
-    mc["- setNote:"](NSString.stringWithString_(String(noteText || "")));
-
-    const req = CNSaveRequest.alloc().init();
-    if (!req) return { status: "failed", error: "CNSaveRequest init failed" };
-    if (!req["- updateContact:"]) return { status: "failed", error: "updateContact unavailable" };
-    req["- updateContact:"](mc);
-    if (!store["- executeSaveRequest:error:"]) return { status: "failed", error: "executeSaveRequest unavailable" };
-    const okExec = store["- executeSaveRequest:error:"](req, ptr("0x0"));
-    const okBool = (okExec === 1 || okExec === true || String(okExec) === "1");
-    if (!okBool) return { status: "failed", error: "executeSaveRequest failed" };
-
-    let afterNote = String(mc.note ? mc.note() : "");
-    try {
-      if (cid && store["- unifiedContactWithIdentifier:keysToFetch:error:"]) {
-        const keys2 = NSMutableArray.array();
-        keys2.addObject_(NSString.stringWithString_("identifier"));
-        keys2.addObject_(NSString.stringWithString_("note"));
-        const c2 = store["- unifiedContactWithIdentifier:keysToFetch:error:"](NSString.stringWithString_(cid), keys2, ptr("0x0"));
-        if (c2 && c2.note) afterNote = String(c2.note());
-      }
-    } catch (_) {}
-
-    return {
-      status: "success",
-      matched: { contactId: cid, matchedDigits: digits, matchCount: 1 },
-      before: { note: beforeNote },
-      after: { note: afterNote },
-      error: ""
-    };
-  } catch (e) {
-    return { status: "failed", error: String(e) };
+  let afterFullName = beforeFullName;
+  const deadline = Date.now() + 1800;
+  while (Date.now() < deadline) {
+    Thread.sleep(0.15);
+    const c2 = _safeObj(retr[fetchSel](userJid, true));
+    if (!c2) continue;
+    if (!_objcCanCall(c2, "- fullName")) continue;
+    afterFullName = String(c2["- fullName"]() || "");
+    if (afterFullName === targetFullName) break;
   }
+
+  return {
+    ok: true,
+    status: "success",
+    before: { fullName: beforeFullName },
+    after: { fullName: afterFullName }
+  };
 }
 
 function _contactsNoteHandleMsg(message) {
   const p = message && message.payload ? message.payload : (message || {});
   const opId = String(p.opId || p.op_id || "");
+  const chatJid = String(p.chatJid || p.chatJidStr || "");
+  const contactPhoneJid = String(p.contactPhoneJid || "");
   const phoneDigits = String(p.phoneDigits || "");
-  const noteText = String(p.noteText || "");
-  const timeoutMs = Number(p.timeoutMs || 15000) | 0;
-  if (!opId || !phoneDigits) {
-    _contactsNoteEmitResult(opId, phoneDigits, { status: "failed", error: "missing opId/phoneDigits" }, null);
+  if (!opId) {
+    _contactsNoteEmitResult(opId, chatJid, contactPhoneJid, phoneDigits, { ok: false, status: "failed", error: "missing opId" }, null);
     return;
   }
   try { waitready(); } catch (_) {}
-  const res = _runOnMainQueueSync(() => _contactsNoteUpsertOnMain(phoneDigits, noteText), timeoutMs + 3000);
-  _contactsNoteEmitResult(opId, phoneDigits, res, null);
+  const timeoutMs = Number(p.timeoutMs || 15000) | 0;
+  const res = _runOnMainQueueSync(() => _contactsNoteUpsertFullNameOnMain(p), timeoutMs);
+  if (res && res.ok) {
+    _contactsNoteEmitResult(opId, chatJid, contactPhoneJid, phoneDigits, res, null);
+    return;
+  }
+  _contactsNoteEmitResult(opId, chatJid, contactPhoneJid, phoneDigits, res || { ok: false, status: "failed", error: "failed" }, null);
 }
 
 function _contactsNoteLoop() {
