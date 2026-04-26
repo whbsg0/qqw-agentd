@@ -170,12 +170,21 @@ type TxSelfCardPayload struct {
 }
 
 type TxContactNoteUpsertPayload struct {
-	OpID           string `json:"opId"`
-	ChatJid        string `json:"chatJid"`
+	OpID            string `json:"opId"`
+	ChatJid         string `json:"chatJid"`
 	ContactPhoneJid string `json:"contactPhoneJid"`
-	NoteText       string `json:"noteText"`
-	UpdatedAtMs    int64  `json:"updatedAtMs,omitempty"`
-	TimeoutMs      int    `json:"timeoutMs,omitempty"`
+	NoteText        string `json:"noteText"`
+	UpdatedAtMs     int64  `json:"updatedAtMs,omitempty"`
+	TimeoutMs       int    `json:"timeoutMs,omitempty"`
+}
+
+type TxContactAddPayload struct {
+	OpID        string `json:"opId"`
+	ChatJid     string `json:"chatJid"`
+	PhoneE164   string `json:"phoneE164"`
+	GivenName   string `json:"givenName"`
+	UpdatedAtMs int64  `json:"updatedAtMs,omitempty"`
+	TimeoutMs   int    `json:"timeoutMs,omitempty"`
 }
 
 type AgentSession struct {
@@ -990,6 +999,54 @@ on conflict (device_id) do update set
 			return
 		}
 		logJSON("tx_contact_note_upsert_dispatched", map[string]any{"deviceId": deviceID, "opId": req.OpID, "chatJid": req.ChatJid})
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+		return
+	}
+	if len(parts) == 3 && parts[1] == "tx" && parts[2] == "contact_add" {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		deviceID := strings.TrimSpace(parts[0])
+		if deviceID == "" {
+			http.Error(w, "deviceId required", http.StatusBadRequest)
+			return
+		}
+		sess := b.getSession(deviceID)
+		if sess == nil {
+			http.Error(w, "device offline", http.StatusNotFound)
+			return
+		}
+		var req TxContactAddPayload
+		if err := readJSON(r, &req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		req.OpID = strings.TrimSpace(req.OpID)
+		req.ChatJid = strings.TrimSpace(req.ChatJid)
+		req.PhoneE164 = strings.TrimSpace(req.PhoneE164)
+		req.GivenName = strings.TrimSpace(req.GivenName)
+		if req.OpID == "" || req.ChatJid == "" || req.PhoneE164 == "" {
+			http.Error(w, "opId/chatJid/phoneE164 required", http.StatusBadRequest)
+			return
+		}
+		if req.TimeoutMs <= 0 {
+			req.TimeoutMs = 15_000
+		}
+		payload, _ := json.Marshal(req)
+		env := Envelope{
+			V:        1,
+			Type:     "tx_contact_add",
+			DeviceID: deviceID,
+			Session:  sess.session,
+			TS:       time.Now().UnixMilli(),
+			Payload:  payload,
+		}
+		if err := sess.send(r.Context(), env); err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		logJSON("tx_contact_add_dispatched", map[string]any{"deviceId": deviceID, "opId": req.OpID, "chatJid": req.ChatJid})
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 		return
 	}

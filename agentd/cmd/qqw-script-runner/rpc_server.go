@@ -59,6 +59,15 @@ type contactsNoteUpsertRPCReq struct {
 	TimeoutMs       int    `json:"timeoutMs,omitempty"`
 }
 
+type contactsAddRPCReq struct {
+	V         int    `json:"v,omitempty"`
+	OpID      string `json:"opId"`
+	ChatJid   string `json:"chatJid,omitempty"`
+	PhoneE164 string `json:"phoneE164"`
+	GivenName string `json:"givenName,omitempty"`
+	TimeoutMs int    `json:"timeoutMs,omitempty"`
+}
+
 func startRPCServer(addr string) {
 	addr = strings.TrimSpace(addr)
 	if addr == "" {
@@ -76,6 +85,7 @@ func startRPCServer(addr string) {
 	mux.HandleFunc("/rpc/avatar/url", handleRPCAvatarURL)
 	mux.HandleFunc("/rpc/self/card", handleRPCSelfCard)
 	mux.HandleFunc("/rpc/contacts/note/upsert", handleRPCContactsNoteUpsert)
+	mux.HandleFunc("/rpc/contacts/add", handleRPCContactsAdd)
 	srv := &http.Server{
 		Addr:              addr,
 		Handler:           mux,
@@ -116,6 +126,49 @@ func handleRPCContactsNoteUpsert(w http.ResponseWriter, r *http.Request) {
 			"phoneDigits":     req.PhoneDigits,
 			"noteText":        req.NoteText,
 			"timeoutMs":       req.TimeoutMs,
+		},
+	}
+	bs, _ := json.Marshal(msg)
+	if err := postToScriptJSON(string(bs)); err != nil {
+		http.Error(w, "script post failed: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func handleRPCContactsAdd(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req contactsAddRPCReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+	req.OpID = strings.TrimSpace(req.OpID)
+	req.ChatJid = strings.TrimSpace(req.ChatJid)
+	req.PhoneE164 = strings.TrimSpace(req.PhoneE164)
+	req.GivenName = strings.TrimSpace(req.GivenName)
+	if req.OpID == "" || req.PhoneE164 == "" {
+		http.Error(w, "opId/phoneE164 required", http.StatusBadRequest)
+		return
+	}
+	if req.TimeoutMs <= 0 {
+		req.TimeoutMs = 15_000
+	}
+	if req.GivenName == "" {
+		req.GivenName = "联系人"
+	}
+	msg := map[string]any{
+		"type": "qqw.contacts_add",
+		"payload": map[string]any{
+			"v":         1,
+			"opId":      req.OpID,
+			"chatJid":   req.ChatJid,
+			"phoneE164": req.PhoneE164,
+			"givenName": req.GivenName,
+			"timeoutMs": req.TimeoutMs,
 		},
 	}
 	bs, _ := json.Marshal(msg)

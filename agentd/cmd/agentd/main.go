@@ -224,6 +224,15 @@ type TxContactNoteUpsertPayload struct {
 	TimeoutMs       int    `json:"timeoutMs,omitempty"`
 }
 
+type TxContactAddPayload struct {
+	OpID        string `json:"opId"`
+	ChatJid     string `json:"chatJid"`
+	PhoneE164   string `json:"phoneE164"`
+	GivenName   string `json:"givenName"`
+	UpdatedAtMs int64  `json:"updatedAtMs,omitempty"`
+	TimeoutMs   int    `json:"timeoutMs,omitempty"`
+}
+
 type Agent struct {
 	cfgMu sync.RWMutex
 	cfg   Config
@@ -1359,6 +1368,8 @@ func (a *Agent) readLoop(ctx context.Context, ws *websocket.Conn, sessionID stri
 			go a.handleTxSelfCard(in)
 		case "tx_contact_note_upsert":
 			go a.handleTxContactNoteUpsert(in)
+		case "tx_contact_add":
+			go a.handleTxContactAdd(in)
 		}
 	}
 }
@@ -2244,6 +2255,149 @@ func (a *Agent) handleTxContactNoteUpsert(in Envelope) {
 		return
 	}
 	a.logf("tx_contact_note_upsert: dispatched opId=%s chatJid=%s", p.OpID, p.ChatJid)
+}
+
+func (a *Agent) handleTxContactAdd(in Envelope) {
+	var p TxContactAddPayload
+	if err := json.Unmarshal(in.Payload, &p); err != nil {
+		a.logf("tx_contact_add: invalid payload: %v", err)
+		return
+	}
+	p.OpID = strings.TrimSpace(p.OpID)
+	p.ChatJid = strings.TrimSpace(p.ChatJid)
+	p.PhoneE164 = strings.TrimSpace(p.PhoneE164)
+	p.GivenName = strings.TrimSpace(p.GivenName)
+	if p.TimeoutMs <= 0 {
+		p.TimeoutMs = 15_000
+	}
+	if p.OpID == "" || p.ChatJid == "" || p.PhoneE164 == "" {
+		a.enqueueLocalScriptEvent(map[string]any{
+			"type":      "wa.tx.contact_add.result",
+			"build":     "agentd",
+			"ts":        time.Now().UnixMilli(),
+			"opId":      p.OpID,
+			"op_id":     p.OpID,
+			"jid":       p.ChatJid,
+			"chatJid":   p.ChatJid,
+			"phoneE164": p.PhoneE164,
+			"givenName": p.GivenName,
+			"ok":        false,
+			"status":    "failed",
+			"error":     "missing opId/chatJid/phoneE164",
+		})
+		a.logf("tx_contact_add: missing opId/chatJid/phoneE164")
+		return
+	}
+	digitsOnly := func(s string) string {
+		var b strings.Builder
+		b.Grow(len(s))
+		for _, r := range s {
+			if r >= '0' && r <= '9' {
+				b.WriteRune(r)
+			}
+		}
+		return b.String()
+	}
+	phone := p.PhoneE164
+	if strings.HasPrefix(phone, "00") {
+		phone = "+" + strings.TrimSpace(phone[2:])
+	}
+	if strings.HasPrefix(phone, "+") {
+		d := digitsOnly(phone)
+		if d != "" {
+			phone = "+" + d
+		}
+	} else {
+		d := digitsOnly(phone)
+		if d != "" {
+			phone = "+" + d
+		}
+	}
+	phone = strings.TrimSpace(phone)
+	if phone == "" || !strings.HasPrefix(phone, "+") {
+		a.enqueueLocalScriptEvent(map[string]any{
+			"type":      "wa.tx.contact_add.result",
+			"build":     "agentd",
+			"ts":        time.Now().UnixMilli(),
+			"opId":      p.OpID,
+			"op_id":     p.OpID,
+			"jid":       p.ChatJid,
+			"chatJid":   p.ChatJid,
+			"phoneE164": p.PhoneE164,
+			"givenName": p.GivenName,
+			"ok":        false,
+			"status":    "invalid_phone",
+			"error":     "invalid phoneE164",
+		})
+		a.logf("tx_contact_add: invalid phoneE164=%s", p.PhoneE164)
+		return
+	}
+	p.PhoneE164 = phone
+
+	if a.runnerPid.Load() == 0 {
+		_ = a.startRunner()
+	}
+	rpcURL := "http://127.0.0.1:17172/rpc/contacts/add"
+	body, _ := json.Marshal(map[string]any{
+		"v":         1,
+		"opId":      p.OpID,
+		"chatJid":   p.ChatJid,
+		"phoneE164": p.PhoneE164,
+		"givenName": p.GivenName,
+		"timeoutMs": p.TimeoutMs,
+	})
+	cctx, cancel := context.WithTimeout(context.Background(), time.Duration(p.TimeoutMs+3000)*time.Millisecond)
+	defer cancel()
+	req, err := http.NewRequestWithContext(cctx, http.MethodPost, rpcURL, bytes.NewReader(body))
+	if err != nil {
+		a.logf("tx_contact_add: build request failed: %v", err)
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		a.enqueueLocalScriptEvent(map[string]any{
+			"type":      "wa.tx.contact_add.result",
+			"build":     "agentd",
+			"ts":        time.Now().UnixMilli(),
+			"opId":      p.OpID,
+			"op_id":     p.OpID,
+			"jid":       p.ChatJid,
+			"chatJid":   p.ChatJid,
+			"phoneE164": p.PhoneE164,
+			"givenName": p.GivenName,
+			"ok":        false,
+			"status":    "failed",
+			"error":     "runner rpc failed: " + err.Error(),
+		})
+		a.logf("tx_contact_add: rpc failed: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		bs, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		msg := strings.TrimSpace(string(bs))
+		if msg == "" {
+			msg = resp.Status
+		}
+		a.enqueueLocalScriptEvent(map[string]any{
+			"type":      "wa.tx.contact_add.result",
+			"build":     "agentd",
+			"ts":        time.Now().UnixMilli(),
+			"opId":      p.OpID,
+			"op_id":     p.OpID,
+			"jid":       p.ChatJid,
+			"chatJid":   p.ChatJid,
+			"phoneE164": p.PhoneE164,
+			"givenName": p.GivenName,
+			"ok":        false,
+			"status":    "failed",
+			"error":     "runner rpc status: " + msg,
+		})
+		a.logf("tx_contact_add: rpc status=%d err=%s", resp.StatusCode, msg)
+		return
+	}
+	a.logf("tx_contact_add: dispatched opId=%s chatJid=%s", p.OpID, p.ChatJid)
 }
 
 func (a *Agent) handleDbSyncStart(in Envelope) {
