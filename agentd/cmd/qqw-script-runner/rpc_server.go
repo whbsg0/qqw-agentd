@@ -63,6 +63,7 @@ type contactsAddRPCReq struct {
 	V         int    `json:"v,omitempty"`
 	OpID      string `json:"opId"`
 	ChatJid   string `json:"chatJid,omitempty"`
+	PhoneRaw  string `json:"phoneRaw,omitempty"`
 	PhoneE164 string `json:"phoneE164"`
 	GivenName string `json:"givenName,omitempty"`
 	TimeoutMs int    `json:"timeoutMs,omitempty"`
@@ -148,6 +149,7 @@ func handleRPCContactsAdd(w http.ResponseWriter, r *http.Request) {
 	}
 	req.OpID = strings.TrimSpace(req.OpID)
 	req.ChatJid = strings.TrimSpace(req.ChatJid)
+	req.PhoneRaw = strings.TrimSpace(req.PhoneRaw)
 	req.PhoneE164 = strings.TrimSpace(req.PhoneE164)
 	req.GivenName = strings.TrimSpace(req.GivenName)
 	if req.OpID == "" || req.PhoneE164 == "" {
@@ -166,6 +168,7 @@ func handleRPCContactsAdd(w http.ResponseWriter, r *http.Request) {
 			"v":         1,
 			"opId":      req.OpID,
 			"chatJid":   req.ChatJid,
+			"phoneRaw":  req.PhoneRaw,
 			"phoneE164": req.PhoneE164,
 			"givenName": req.GivenName,
 			"timeoutMs": req.TimeoutMs,

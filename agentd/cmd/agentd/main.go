@@ -2270,7 +2270,7 @@ func (a *Agent) handleTxContactAdd(in Envelope) {
 	if p.TimeoutMs <= 0 {
 		p.TimeoutMs = 15_000
 	}
-	if p.OpID == "" || p.ChatJid == "" || p.PhoneE164 == "" {
+	if p.OpID == "" || p.PhoneE164 == "" {
 		a.enqueueLocalScriptEvent(map[string]any{
 			"type":      "wa.tx.contact_add.result",
 			"build":     "agentd",
@@ -2283,9 +2283,9 @@ func (a *Agent) handleTxContactAdd(in Envelope) {
 			"givenName": p.GivenName,
 			"ok":        false,
 			"status":    "failed",
-			"error":     "missing opId/chatJid/phoneE164",
+			"error":     "missing opId/phoneE164",
 		})
-		a.logf("tx_contact_add: missing opId/chatJid/phoneE164")
+		a.logf("tx_contact_add: missing opId/phoneE164")
 		return
 	}
 	digitsOnly := func(s string) string {

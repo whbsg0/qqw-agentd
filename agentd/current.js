@@ -4,7 +4,24 @@
   来源：wa_txrx_stable_unified_pinned.js（发送/接收全功能脚本）
   目标：不更改功能与逻辑，仅把“接收侧 send() 输出”改为长期稳定事件格式（与 qqw-contracts/device-events.md 对齐）
 */
-const SCRIPT_BUILD_ID = "2026-04-04.contacts_fullname_v1";
+const SCRIPT_BUILD_ID = "2026-04-08.txrx_stable_unified_pinned_output_v2_rx_enabled_default";
+
+const _keepAliveBlocks = [];
+
+function _keepAliveBlock(b, ttlMs) {
+  try {
+    if (!b) return;
+    _keepAliveBlocks.push(b);
+    const ms = Number(ttlMs || 30000) | 0;
+    if (typeof setTimeout !== "function") return;
+    setTimeout(function () {
+      try {
+        const i = _keepAliveBlocks.indexOf(b);
+        if (i >= 0) _keepAliveBlocks.splice(i, 1);
+      } catch (_) {}
+    }, ms);
+  } catch (_) {}
+}
 
 function _tid() {
   try { return Process.getCurrentThreadId(); } catch (_) { return 0; }
@@ -50,6 +67,322 @@ function _ns(s) {
     return NSString.stringWithUTF8String_(Memory.allocUtf8String(String(s || "")));
   } catch (_) {
     return null;
+  }
+}
+
+function _normalizePhoneE164Like(phoneStr) {
+  try {
+    const s0 = String(phoneStr || "").trim();
+    if (!s0) return "";
+    let s = s0.replace(/[^\d+]/g, "");
+    if (!s) return "";
+    if (s.startsWith("00")) s = "+" + s.slice(2);
+    if (s.startsWith("+")) return "+" + s.slice(1).replace(/[^\d]/g, "");
+    return "+" + s.replace(/[^\d]/g, "");
+  } catch (_) {
+    return "";
+  }
+}
+
+function _writeOSContactNameByPhoneDigits(phoneDigits, fullName) {
+  const out = { ok: false, attempted: false, error: "", matches: 0, chosenId: "", chosenGivenName: "", chosenFamilyName: "", usedPredicate: "", wroteGivenName: "", wroteFamilyName: "" };
+  try {
+    out.attempted = true;
+    if (!ObjC.available) {
+      out.error = "ObjC not available";
+      return out;
+    }
+    const CNContactStore = ObjC.classes.CNContactStore;
+    const CNContact = ObjC.classes.CNContact;
+    const CNPhoneNumber = ObjC.classes.CNPhoneNumber;
+    const CNSaveRequest = ObjC.classes.CNSaveRequest;
+    const NSArray = ObjC.classes.NSArray;
+    if (!CNContactStore || !CNContact || !CNPhoneNumber || !CNSaveRequest || !NSArray) {
+      out.error = "Contacts.framework classes missing";
+      return out;
+    }
+    if (!CNPhoneNumber.phoneNumberWithStringValue_) {
+      out.error = "CNPhoneNumber.phoneNumberWithStringValue_ missing";
+      return out;
+    }
+    const pn = CNPhoneNumber.phoneNumberWithStringValue_(_ns(String(phoneDigits || "")));
+    if (!pn) {
+      out.error = "CNPhoneNumber alloc failed";
+      return out;
+    }
+    if (!CNContact.predicateForContactsMatchingPhoneNumber_) {
+      out.error = "CNContact.predicateForContactsMatchingPhoneNumber_ missing";
+      return out;
+    }
+    const pred = CNContact.predicateForContactsMatchingPhoneNumber_(pn);
+    if (!pred) {
+      out.error = "predicate nil";
+      return out;
+    }
+    out.usedPredicate = "predicateForContactsMatchingPhoneNumber";
+    const kId = _ns("identifier");
+    const kGiven = _ns("givenName");
+    const kFamily = _ns("familyName");
+    if (!kId || !kGiven || !kFamily) {
+      out.error = "NSString alloc failed for keys";
+      return out;
+    }
+    const keys = NSArray.arrayWithObjects_(kId, kGiven, kFamily, ptr("0x0"));
+    const store = CNContactStore.alloc().init();
+    const errPtr = Memory.alloc(Process.pointerSize);
+    Memory.writePointer(errPtr, ptr("0x0"));
+    const contacts = _safeObj(store.unifiedContactsMatchingPredicate_keysToFetch_error_(pred, keys, errPtr));
+    const errObj = _safeObj(Memory.readPointer(errPtr));
+    if (!contacts) {
+      out.error = errObj ? _safeDescValue(errObj) : "unifiedContactsMatchingPredicate returned nil";
+      return out;
+    }
+    const count = Number(contacts.count());
+    out.matches = count;
+    if (count <= 0) {
+      out.error = "no match";
+      return out;
+    }
+    const c0 = _safeObj(contacts.objectAtIndex_(0));
+    if (!c0) {
+      out.error = "first contact nil";
+      return out;
+    }
+    try {
+      const idv = _safeObj(c0.identifier());
+      if (idv) out.chosenId = String(idv);
+    } catch (_) {}
+    try {
+      const gv = _safeObj(c0.givenName());
+      if (gv) out.chosenGivenName = String(gv);
+    } catch (_) {}
+    try {
+      const fv = _safeObj(c0.familyName());
+      if (fv) out.chosenFamilyName = String(fv);
+    } catch (_) {}
+    const mc = _safeObj(c0.mutableCopy());
+    if (!mc) {
+      out.error = "mutableCopy nil";
+      return out;
+    }
+    const newGiven = _ns(String(fullName || ""));
+    if (!newGiven) {
+      out.error = "NSString alloc failed for name";
+      return out;
+    }
+    mc.setGivenName_(newGiven);
+    mc.setFamilyName_(_ns(""));
+    out.wroteGivenName = String(fullName || "");
+    out.wroteFamilyName = "";
+    const req = CNSaveRequest.alloc().init();
+    req.updateContact_(mc);
+    const errPtr2 = Memory.alloc(Process.pointerSize);
+    Memory.writePointer(errPtr2, ptr("0x0"));
+    const ok = !!store.executeSaveRequest_error_(req, errPtr2);
+    const errObj2 = _safeObj(Memory.readPointer(errPtr2));
+    out.ok = ok;
+    out.error = ok ? "" : (errObj2 ? _safeDescValue(errObj2) : "executeSaveRequest failed");
+    return out;
+  } catch (e) {
+    out.ok = false;
+    out.error = String(e);
+    return out;
+  }
+}
+
+function csabcncreatephone(phoneStr, givenNameStr) {
+  try {
+    if (!ObjC.available) return { ok: false, build: SCRIPT_BUILD_ID, error: "ObjC not available" };
+    const phone = _normalizePhoneE164Like(phoneStr);
+    const givenName = String(givenNameStr || "");
+    if (!phone) return { ok: false, build: SCRIPT_BUILD_ID, error: "missing phone" };
+
+    const CNContactStore = ObjC.classes.CNContactStore;
+    const CNContact = ObjC.classes.CNContact;
+    const CNPhoneNumber = ObjC.classes.CNPhoneNumber;
+    const CNSaveRequest = ObjC.classes.CNSaveRequest;
+    const CNMutableContact = ObjC.classes.CNMutableContact;
+    const CNLabeledValue = ObjC.classes.CNLabeledValue;
+    const NSArray = ObjC.classes.NSArray;
+    const NSMutableArray = ObjC.classes.NSMutableArray;
+    if (!CNContactStore || !CNContact || !CNPhoneNumber || !CNSaveRequest || !CNMutableContact || !CNLabeledValue || !NSArray || !NSMutableArray) {
+      return { ok: false, build: SCRIPT_BUILD_ID, error: "Contacts.framework classes missing" };
+    }
+    if (!CNPhoneNumber.alloc || !CNPhoneNumber.alloc().initWithStringValue_) return { ok: false, build: SCRIPT_BUILD_ID, error: "CNPhoneNumber initWithStringValue missing", phone };
+    const pn = CNPhoneNumber.alloc().initWithStringValue_(_ns(phone));
+    if (!pn) return { ok: false, build: SCRIPT_BUILD_ID, error: "CNPhoneNumber alloc failed", phone };
+    if (!CNContact.predicateForContactsMatchingPhoneNumber_) return { ok: false, build: SCRIPT_BUILD_ID, error: "predicate missing", phone };
+    const pred = CNContact.predicateForContactsMatchingPhoneNumber_(pn);
+    if (!pred) return { ok: false, build: SCRIPT_BUILD_ID, error: "predicate nil", phone };
+
+    const kId = _ns("identifier");
+    if (!kId) return { ok: false, build: SCRIPT_BUILD_ID, error: "NSString alloc failed for keys", phone };
+    const keys = NSMutableArray.alloc().init();
+    try { keys.addObject_(kId); } catch (_) {}
+    const store = CNContactStore.alloc().init();
+
+    const errPtr = Memory.alloc(Process.pointerSize);
+    Memory.writePointer(errPtr, ptr("0x0"));
+    const arr0 = store.unifiedContactsMatchingPredicate_keysToFetch_error_(pred, keys, errPtr);
+    const errObj = _safeObj(Memory.readPointer(errPtr));
+    const contacts = arr0 ? _safeObj(arr0) : null;
+    if (!contacts) return { ok: false, build: SCRIPT_BUILD_ID, error: errObj ? _safeDescValue(errObj) : "query failed", phone };
+    const count = Number(contacts.count());
+    if (count > 0) {
+      let identifier = "";
+      try {
+        const c0 = _safeObj(contacts.objectAtIndex_(0));
+        const idv = c0 ? _safeObj(c0.identifier()) : null;
+        if (idv) identifier = String(idv);
+      } catch (_) {}
+      return { ok: false, build: SCRIPT_BUILD_ID, error: "already exists", phone, existed: true, count, identifier };
+    }
+
+    const mc = CNMutableContact.alloc().init();
+    if (!mc) return { ok: false, build: SCRIPT_BUILD_ID, error: "CNMutableContact alloc failed", phone };
+    try { if (mc.setGivenName_) mc.setGivenName_(_ns(givenName)); } catch (_) {}
+    try {
+      const lv = CNLabeledValue.labeledValueWithLabel_value_(_ns("mobile"), pn);
+      const phones = NSArray.arrayWithObject_(lv);
+      if (mc.setPhoneNumbers_) mc.setPhoneNumbers_(phones);
+    } catch (_) {}
+
+    const req = CNSaveRequest.alloc().init();
+    if (!req || !req.addContact_toContainerWithIdentifier_) return { ok: false, build: SCRIPT_BUILD_ID, error: "CNSaveRequest missing addContact", phone };
+    req.addContact_toContainerWithIdentifier_(mc, ptr("0x0"));
+
+    const errPtr2 = Memory.alloc(Process.pointerSize);
+    Memory.writePointer(errPtr2, ptr("0x0"));
+    const ok = !!store.executeSaveRequest_error_(req, errPtr2);
+    const errObj2 = _safeObj(Memory.readPointer(errPtr2));
+    if (!ok) return { ok: false, build: SCRIPT_BUILD_ID, error: errObj2 ? _safeDescValue(errObj2) : "executeSaveRequest failed", phone };
+
+    let identifier2 = "";
+    try { const idv2 = _safeObj(mc.identifier()); if (idv2) identifier2 = String(idv2); } catch (_) {}
+    return { ok: true, build: SCRIPT_BUILD_ID, phone, existed: false, saved: true, identifier: identifier2, givenName };
+  } catch (e) {
+    return { ok: false, build: SCRIPT_BUILD_ID, error: String(e) };
+  }
+}
+
+function csabcnupsertgivenphone(phoneStr, givenNameStr, phoneRawStr) {
+  try {
+    if (!ObjC.available) return { ok: false, build: SCRIPT_BUILD_ID, error: "ObjC not available" };
+    const phone = _normalizePhoneE164Like(phoneStr);
+    const givenName = String(givenNameStr || "");
+    if (!phone) return { ok: false, build: SCRIPT_BUILD_ID, error: "missing phone" };
+    const digits = phone.replace(/[^\d]/g, "");
+    const phoneRaw = String(phoneRawStr || "").trim();
+    let phoneForStore = phone;
+    try {
+      if (phoneRaw && digits) {
+        const d2 = String(phoneRaw).replace(/[^\d]/g, "");
+        if (d2 && d2 === digits && /[\s\-()]/.test(phoneRaw) && (/^\+/.test(phoneRaw) || /^00/.test(phoneRaw))) {
+          phoneForStore = phoneRaw.startsWith("00") ? ("+" + phoneRaw.slice(2).trim()) : phoneRaw;
+        }
+      }
+    } catch (_) {}
+    try {
+      if (phoneForStore === phone && phone.startsWith("+62") && !/[\s\-()]/.test(phone) && phone.length > 3) {
+        phoneForStore = "+62 " + phone.slice(3);
+      }
+    } catch (_) {}
+
+    const CNContactStore = ObjC.classes.CNContactStore;
+    const CNContact = ObjC.classes.CNContact;
+    const CNPhoneNumber = ObjC.classes.CNPhoneNumber;
+    const CNSaveRequest = ObjC.classes.CNSaveRequest;
+    const NSMutableArray = ObjC.classes.NSMutableArray;
+    const NSArray = ObjC.classes.NSArray;
+    const CNLabeledValue = ObjC.classes.CNLabeledValue;
+    if (!CNContactStore || !CNContact || !CNPhoneNumber || !CNSaveRequest || !NSMutableArray || !NSArray || !CNLabeledValue) {
+      return { ok: false, build: SCRIPT_BUILD_ID, error: "Contacts.framework classes missing" };
+    }
+    if (!CNPhoneNumber.alloc || !CNPhoneNumber.alloc().initWithStringValue_) return { ok: false, build: SCRIPT_BUILD_ID, error: "CNPhoneNumber initWithStringValue missing", phone };
+    const pn = CNPhoneNumber.alloc().initWithStringValue_(_ns(phone));
+    if (!pn) return { ok: false, build: SCRIPT_BUILD_ID, error: "CNPhoneNumber alloc failed", phone };
+    if (!CNContact.predicateForContactsMatchingPhoneNumber_) return { ok: false, build: SCRIPT_BUILD_ID, error: "predicate missing", phone };
+    const pred = CNContact.predicateForContactsMatchingPhoneNumber_(pn);
+    if (!pred) return { ok: false, build: SCRIPT_BUILD_ID, error: "predicate nil", phone };
+
+    const store = CNContactStore.alloc().init();
+    const keys = NSMutableArray.alloc().init();
+    try { keys.addObject_(_ns("identifier")); } catch (_) {}
+    try { keys.addObject_(_ns("givenName")); } catch (_) {}
+    try { keys.addObject_(_ns("familyName")); } catch (_) {}
+    try { keys.addObject_(_ns("phoneNumbers")); } catch (_) {}
+
+    const errPtr = Memory.alloc(Process.pointerSize);
+    Memory.writePointer(errPtr, ptr("0x0"));
+    const arr0 = store.unifiedContactsMatchingPredicate_keysToFetch_error_(pred, keys, errPtr);
+    const errObj = _safeObj(Memory.readPointer(errPtr));
+    const arr = arr0 ? _safeObj(arr0) : null;
+    if (!arr) return { ok: false, build: SCRIPT_BUILD_ID, error: errObj ? _safeDescValue(errObj) : "query failed", phone };
+    const n = Number(arr.count());
+
+    if (n <= 0) {
+      const created = csabcncreatephone(phoneForStore, givenName);
+      if (!created || !created.ok) return created || { ok: false, build: SCRIPT_BUILD_ID, error: "create failed", phone };
+      return { ok: true, build: SCRIPT_BUILD_ID, phone, phoneForStore, existed: false, saved: true, identifier: String(created.identifier || ""), givenName };
+    }
+
+    const c0 = _safeObj(arr.objectAtIndex_(0));
+    if (!c0) return { ok: false, build: SCRIPT_BUILD_ID, error: "first contact nil", phone };
+    let identifier = "";
+    let beforeGivenName = "";
+    let beforePhone = "";
+    try { const idv = _safeObj(c0.identifier()); if (idv) identifier = String(idv); } catch (_) {}
+    try { const gv = _safeObj(c0.givenName()); if (gv) beforeGivenName = String(gv); } catch (_) {}
+    try {
+      if (c0.phoneNumbers && c0.phoneNumbers()) {
+        const pns = _safeObj(c0.phoneNumbers());
+        const pnCount = pns && pns.count ? Number(pns.count()) : 0;
+        if (pnCount > 0) {
+          const lv = _safeObj(pns.objectAtIndex_(0));
+          const v = lv && lv.value ? _safeObj(lv.value()) : null;
+          const sv = v && v.stringValue ? _safeObj(v.stringValue()) : null;
+          if (sv) beforePhone = String(sv);
+        }
+      }
+    } catch (_) {}
+    const mc = _safeObj(c0.mutableCopy());
+    if (!mc) return { ok: false, build: SCRIPT_BUILD_ID, error: "mutableCopy nil", phone, identifier };
+    try { if (mc.setGivenName_) mc.setGivenName_(_ns(givenName)); } catch (_) {}
+    try {
+      const beforeDigits = String(beforePhone || "").replace(/[^\d]/g, "");
+      if (phoneForStore !== phone && beforeDigits && beforeDigits === digits && /[\s\-()]/.test(phoneForStore)) {
+        let label = _ns("mobile");
+        try {
+          if (c0.phoneNumbers && c0.phoneNumbers()) {
+            const pns = _safeObj(c0.phoneNumbers());
+            const pnCount = pns && pns.count ? Number(pns.count()) : 0;
+            if (pnCount > 0) {
+              const lv0 = _safeObj(pns.objectAtIndex_(0));
+              const lb = lv0 && lv0.label ? _safeObj(lv0.label()) : null;
+              if (lb) label = lb;
+            }
+          }
+        } catch (_) {}
+        const pnStore = CNPhoneNumber.alloc().initWithStringValue_(_ns(String(phoneForStore)));
+        const lv2 = CNLabeledValue.labeledValueWithLabel_value_(label, pnStore);
+        const phones2 = NSArray.arrayWithObject_(lv2);
+        if (mc.setPhoneNumbers_) mc.setPhoneNumbers_(phones2);
+      }
+    } catch (_) {}
+
+    const req = CNSaveRequest.alloc().init();
+    if (!req || !req.updateContact_) return { ok: false, build: SCRIPT_BUILD_ID, error: "CNSaveRequest missing updateContact", phone, identifier };
+    req.updateContact_(mc);
+
+    const errPtr2 = Memory.alloc(Process.pointerSize);
+    Memory.writePointer(errPtr2, ptr("0x0"));
+    const ok = !!store.executeSaveRequest_error_(req, errPtr2);
+    const errObj2 = _safeObj(Memory.readPointer(errPtr2));
+    if (!ok) return { ok: false, build: SCRIPT_BUILD_ID, error: errObj2 ? _safeDescValue(errObj2) : "executeSaveRequest failed", phone, identifier };
+
+    return { ok: true, build: SCRIPT_BUILD_ID, phone, phoneForStore, existed: true, saved: true, identifier, beforeGivenName, givenName, beforePhone };
+  } catch (e) {
+    return { ok: false, build: SCRIPT_BUILD_ID, error: String(e) };
   }
 }
 
@@ -1590,6 +1923,333 @@ function entries() {
   return { ok: true, build: SCRIPT_BUILD_ID, exports: Object.keys(rpc.exports || {}).sort() };
 }
 
+function csabsetgivennamejid(chatJidStr, givenNameStr, saveAfter) {
+  try {
+    if (!ObjC.available) return { ok: false, build: SCRIPT_BUILD_ID, error: "ObjC not available" };
+    const chatJid = String(chatJidStr || "").trim();
+    const givenName = String(givenNameStr || "");
+    const doSave = (saveAfter === undefined) ? 1 : ((Number(saveAfter) | 0) ? 1 : 0);
+    if (!chatJid) return { ok: false, build: SCRIPT_BUILD_ID, error: "missing chatJid" };
+
+    const r = _runOnMainQueueSync(function () {
+      const core = _resolveCoreFixed();
+      if (!core || !core.ok) return { ok: false, build: SCRIPT_BUILD_ID, error: core ? core.error : "core failed" };
+      const ctxMain = core.ctxMain;
+      const chatManager = (_objcCanCall(ctxMain, "- chatManager")) ? _safeObj(ctxMain["- chatManager"]()) : null;
+      if (!chatManager) return { ok: false, build: SCRIPT_BUILD_ID, error: "ctxMain.chatManager nil" };
+
+      const jidObj = _makeAuthorUserJIDFromString(chatJid);
+      if (!jidObj) return { ok: false, build: SCRIPT_BUILD_ID, error: "invalid chatJid" };
+      const isLid = chatJid.indexOf("@lid") !== -1;
+
+      let contactToSave = null;
+      const mcsSel = "- mappedContactsStorage";
+      const mcs = _objcCanCall(ctxMain, mcsSel) ? _safeObj(ctxMain[mcsSel]()) : null;
+      if (mcs) {
+        const s2 = isLid ? "- contactForLID:includeUnknownContacts:" : "- contactForJID:includeUnknownContacts:";
+        const s1 = isLid ? "- contactForLID:" : "- contactForJID:";
+        if (_objcCanCall(mcs, s2)) contactToSave = _safeObj(mcs[s2](jidObj, 1));
+        if (!contactToSave && _objcCanCall(mcs, s1)) contactToSave = _safeObj(mcs[s1](jidObj));
+      }
+      if (!contactToSave) return { ok: false, build: SCRIPT_BUILD_ID, error: "contact not found", chatJid };
+
+      const setGivenSel = "- setGivenName:";
+      if (!_objcCanCall(contactToSave, setGivenSel)) return { ok: false, build: SCRIPT_BUILD_ID, error: "missing setGivenName:", chatJid };
+      const beforeGiven = _objcCanCall(contactToSave, "- givenName") ? String(_safeObj(contactToSave["- givenName"]()) || "") : "";
+      try { contactToSave[setGivenSel](_ns(givenName)); } catch (e) { return { ok: false, build: SCRIPT_BUILD_ID, error: "setGivenName failed: " + String(e), chatJid }; }
+      const afterGiven = _objcCanCall(contactToSave, "- givenName") ? String(_safeObj(contactToSave["- givenName"]()) || "") : "";
+
+      let saved = false;
+      let saveError = "";
+      if (doSave) {
+        const saveSel = "- saveChangesInContact:originalContact:saveToOSAddressBook:completion:";
+        if (!_objcCanCall(chatManager, saveSel)) return { ok: false, build: SCRIPT_BUILD_ID, error: "chatManager missing saveChangesInContact:*", chatJid };
+        if (!_objcCanCall(contactToSave, "- copy")) return { ok: false, build: SCRIPT_BUILD_ID, error: "contact missing copy", chatJid };
+        const originalContact = _safeObj(contactToSave["- copy"]());
+        if (!originalContact) return { ok: false, build: SCRIPT_BUILD_ID, error: "contact copy nil", chatJid };
+        try { chatManager[saveSel](contactToSave, originalContact, 0, ptr("0x0")); saved = true; } catch (e) { saved = false; saveError = String(e); }
+      }
+
+      let osId = "";
+      try {
+        const osIdSel = "- osAddressBookContactID";
+        const osIdObj = _objcCanCall(contactToSave, osIdSel) ? _safeObj(contactToSave[osIdSel]()) : null;
+        osId = osIdObj ? String(osIdObj) : "";
+      } catch (_) {}
+
+      let osSaved = null;
+      let osBefore = "";
+      let osAfter = "";
+      let osError = "";
+      if (osId && doSave) {
+        try {
+          const CNContactStore = ObjC.classes.CNContactStore;
+          const CNSaveRequest = ObjC.classes.CNSaveRequest;
+          const NSMutableArray = ObjC.classes.NSMutableArray;
+          if (CNContactStore && CNSaveRequest && NSMutableArray) {
+            const store = CNContactStore.alloc().init();
+            const keys = NSMutableArray.alloc().init();
+            try { keys.addObject_(_ns("givenName")); } catch (_) {}
+            const errPtr = Memory.alloc(Process.pointerSize);
+            Memory.writePointer(errPtr, ptr("0x0"));
+            const cn0 = store.unifiedContactWithIdentifier_keysToFetch_error_(_ns(osId), keys, errPtr);
+            const eobj = _safeObj(Memory.readPointer(errPtr));
+            const cn = cn0 ? _safeObj(cn0) : null;
+            if (cn) {
+              try { osBefore = String(_safeObj(cn.givenName()) || "") || ""; } catch (_) {}
+              const m = _safeObj(cn.mutableCopy());
+              try { if (m && m.setGivenName_) m.setGivenName_(_ns(givenName)); } catch (_) {}
+              const req = CNSaveRequest.alloc().init();
+              if (req && req.updateContact_) {
+                req.updateContact_(m);
+                const err2 = Memory.alloc(Process.pointerSize);
+                Memory.writePointer(err2, ptr("0x0"));
+                const ok2 = !!store.executeSaveRequest_error_(req, err2);
+                const e2 = _safeObj(Memory.readPointer(err2));
+                osSaved = ok2;
+                if (e2) osError = _safeDescValue(e2);
+                Memory.writePointer(errPtr, ptr("0x0"));
+                const cn1 = store.unifiedContactWithIdentifier_keysToFetch_error_(_ns(osId), keys, errPtr);
+                const cnAfter = cn1 ? _safeObj(cn1) : null;
+                if (cnAfter) {
+                  try { osAfter = String(_safeObj(cnAfter.givenName()) || "") || ""; } catch (_) {}
+                }
+              } else {
+                osSaved = false;
+                osError = "CNSaveRequest missing updateContact:";
+              }
+            } else {
+              osSaved = false;
+              osError = eobj ? _safeDescValue(eobj) : "CNContact nil";
+            }
+          }
+        } catch (e) {
+          osSaved = false;
+          osError = String(e);
+        }
+      }
+
+      return { ok: true, build: SCRIPT_BUILD_ID, chatJid, beforeGivenName: beforeGiven, afterGivenName: afterGiven, saved: !!saved, saveError, osAddressBookContactID: osId, osSaved, osBeforeGivenName: osBefore, osAfterGivenName: osAfter, osSaveError: osError };
+    }, 8000);
+    return r && r.ok !== undefined ? r : { ok: false, build: SCRIPT_BUILD_ID, error: (r && r.error) ? r.error : "failed" };
+  } catch (e) {
+    return { ok: false, build: SCRIPT_BUILD_ID, error: String(e) };
+  }
+}
+
+function csabsetgivennamejid_writecontext(chatJidStr, givenNameStr, saveToOSAddressBook) {
+  try {
+    if (!ObjC.available) return { ok: false, build: SCRIPT_BUILD_ID, error: "ObjC not available" };
+    const targetJidStr = String(chatJidStr || "").trim();
+    if (!targetJidStr) return { ok: false, build: SCRIPT_BUILD_ID, error: "missing chatJid" };
+    const givenName = String(givenNameStr || "");
+    const doSyncOS = (saveToOSAddressBook === undefined) ? 1 : ((Number(saveToOSAddressBook) | 0) ? 1 : 0);
+
+    const core = _runOnMainQueueSync(() => _resolveCoreFixed(), 2500);
+    if (!core || !core.ok) return { ok: false, build: SCRIPT_BUILD_ID, error: core ? String(core.error || "core failed") : "core failed" };
+    const ctxMain = core.ctxMain;
+    const chatManager = (_objcCanCall(ctxMain, "- chatManager")) ? _safeObj(ctxMain["- chatManager"]()) : null;
+
+    const getIvar = (obj, keys) => {
+      try {
+        const o = obj && obj.handle ? obj : _safeObj(obj);
+        if (!o || !o.$ivars) return null;
+        for (let i = 0; i < keys.length; i++) {
+          const k = keys[i];
+          try {
+            const v = _safeObj(o.$ivars[k]);
+            if (v) return v;
+          } catch (_) {}
+        }
+      } catch (_) {}
+      return null;
+    };
+    const getPropOrIvar = (owner, selNoArg, ivarKeys) => {
+      try {
+        const o = owner && owner.handle ? owner : _safeObj(owner);
+        if (!o) return null;
+        if (selNoArg && _objcCanCall(o, selNoArg)) {
+          const v = _safeObj(o[selNoArg]());
+          if (v) return v;
+        }
+        const iv = getIvar(o, ivarKeys || []);
+        if (iv) return iv;
+      } catch (_) {}
+      return null;
+    };
+
+    const cs = getPropOrIvar(ctxMain, "- contactsStorage", ["_contactsStorage", "contactsStorage"])
+      || getPropOrIvar(chatManager, "- contactsStorage", ["_contactsStorage", "contactsStorage"])
+      || getIvar(ctxMain, ["_contactsManager", "contactsManager"]);
+    const csq = getPropOrIvar(ctxMain, "- contactsStorageQueries", ["_contactsStorageQueries", "contactsStorageQueries"])
+      || getPropOrIvar(chatManager, "- contactsStorageQueries", ["_contactsStorageQueries", "contactsStorageQueries"]);
+    const contactsStorage = (cs && cs.handle && String(cs.$className || "").indexOf("Contacts") !== -1) ? cs : getPropOrIvar(cs, "- contactsStorage", ["_contactsStorage", "contactsStorage"]) || cs;
+    if (!contactsStorage) return { ok: false, build: SCRIPT_BUILD_ID, error: "contactsStorage missing" };
+    if (!csq) return { ok: false, build: SCRIPT_BUILD_ID, error: "contactsStorageQueries missing" };
+
+    const wc = getIvar(contactsStorage, ["_writeContext", "writeContext"]) || getPropOrIvar(contactsStorage, "- writeContext", ["_writeContext", "writeContext"]);
+    if (!wc) return { ok: false, build: SCRIPT_BUILD_ID, error: "contactsStorage writeContext missing" };
+    if (!_objcCanCall(wc, "- performBlockAndWait:") || !ObjC.Block) return { ok: false, build: SCRIPT_BUILD_ID, error: "writeContext missing performBlockAndWait:" };
+
+    const jidObj = (function () {
+      try {
+        const s = String(targetJidStr || "").trim();
+        if (!s) return null;
+        const ns = _ns(s);
+        if (!ns) return null;
+        const WAUserJID = ObjC.classes.WAUserJID;
+        const WAJID = ObjC.classes.WAJID;
+        let o = null;
+        if (WAUserJID) {
+          if (_objcCanCall(WAUserJID, "+ jidOrLIDWithString:")) o = _safeObj(WAUserJID["+ jidOrLIDWithString:"](ns));
+          else if (_objcCanCall(WAUserJID, "+ withString:")) o = _safeObj(WAUserJID["+ withString:"](ns));
+          else if (_objcCanCall(WAUserJID, "+ withJIDString:")) o = _safeObj(WAUserJID["+ withJIDString:"](ns));
+          else if (_objcCanCall(WAUserJID, "+ userJIDWithString:")) o = _safeObj(WAUserJID["+ userJIDWithString:"](ns));
+          else if (_objcCanCall(WAUserJID, "+ jidWithString:")) o = _safeObj(WAUserJID["+ jidWithString:"](ns));
+        }
+        if (!o && WAJID && _objcCanCall(WAJID, "+ withString:")) o = _safeObj(WAJID["+ withString:"](ns));
+        if (!o) o = _makeAuthorUserJIDFromString(s);
+        return o || null;
+      } catch (_) {
+        return null;
+      }
+    })();
+    if (!jidObj) return { ok: false, build: SCRIPT_BUILD_ID, error: "invalid chatJid" };
+
+    const out = {
+      ok: false,
+      build: SCRIPT_BUILD_ID,
+      chatJid: targetJidStr,
+      givenName: givenName,
+      saveToOSAddressBook: doSyncOS,
+      osAddressBookContactID: "",
+      osSaved: null,
+      osSaveError: "",
+      beforeGivenName: "",
+      afterGivenName: ""
+    };
+
+    let result = null;
+    const blk = new ObjC.Block({
+      retType: "void",
+      argTypes: [],
+      implementation: function () {
+        let pool = null;
+        try { pool = ObjC.classes.NSAutoreleasePool.alloc().init(); } catch (_) { pool = null; }
+        try {
+          const preferred = _ns("");
+          let ab0 = null;
+          const isLid = targetJidStr.toLowerCase().endsWith("@lid");
+          const sL = "- addressBookContactForLID:preferredFullName:";
+          const sJ = "- addressBookContactForJID:preferredFullName:";
+          if (isLid && _objcCanCall(csq, sL)) {
+            try { ab0 = _safeObj(csq[sL](jidObj, preferred)); } catch (_) { ab0 = null; }
+          }
+          if (!ab0 && _objcCanCall(csq, sJ)) {
+            try { ab0 = _safeObj(csq[sJ](jidObj, preferred)); } catch (_) { ab0 = null; }
+          }
+          const ab = ab0 ? (ab0 instanceof ObjC.Object ? ab0 : new ObjC.Object(ab0)) : null;
+          if (!ab) { result = { ok: false, error: "addressBookContactFor* returned nil" }; return; }
+
+          let uid = "";
+          try {
+            if (_objcCanCall(ab, "- uniqueID")) uid = String(_safeObj(ab["- uniqueID"]()) || "");
+            else if (_objcCanCall(ab, "- persistedUniqueID")) uid = String(_safeObj(ab["- persistedUniqueID"]()) || "");
+          } catch (_) {}
+          if (!uid) { result = { ok: false, error: "uniqueID empty" }; return; }
+
+          const fetchSel = "- fetchAddressBookContactsForUniqueIDs:inContext:filteringPredicate:";
+          if (!_objcCanCall(contactsStorage, fetchSel)) { result = { ok: false, error: "contactsStorage missing fetchAddressBookContactsForUniqueIDs" }; return; }
+          const NSArray = ObjC.classes.NSArray;
+          if (!NSArray || !_objcCanCall(NSArray, "+ arrayWithObject:")) { result = { ok: false, error: "NSArray missing arrayWithObject" }; return; }
+          const uids = NSArray.arrayWithObject_(_ns(uid));
+          const dict0 = _safeObj(contactsStorage[fetchSel](uids, wc, ptr("0x0")));
+          if (!dict0) { result = { ok: false, error: "fetch returned nil dict" }; return; }
+          if (!_objcCanCall(dict0, "- objectForKey:")) { result = { ok: false, error: "dict missing objectForKey" }; return; }
+          const vv = _safeObj(dict0["- objectForKey:"](_ns(uid)));
+          const c = vv ? (vv instanceof ObjC.Object ? vv : new ObjC.Object(vv)) : null;
+          if (!c) { result = { ok: false, error: "dict missing value for uniqueID" }; return; }
+
+          try {
+            const osIdSel = "- osAddressBookContactID";
+            if (_objcCanCall(c, osIdSel)) out.osAddressBookContactID = String(_safeObj(c[osIdSel]()) || "");
+          } catch (_) {}
+
+          try { if (_objcCanCall(c, "- givenName")) out.beforeGivenName = String(_safeObj(c["- givenName"]()) || ""); } catch (_) {}
+          if (!_objcCanCall(c, "- setGivenName:")) { result = { ok: false, error: "missing setGivenName:" }; return; }
+          try { c["- setGivenName:"](_ns(givenName)); } catch (e) { result = { ok: false, error: "set failed: " + String(e) }; return; }
+          try { if (_objcCanCall(c, "- givenName")) out.afterGivenName = String(_safeObj(c["- givenName"]()) || ""); } catch (_) {}
+
+          if (_objcCanCall(wc, "- save:")) {
+            const errPtr = Memory.alloc(Process.pointerSize);
+            Memory.writePointer(errPtr, ptr("0x0"));
+            const okSave = !!wc["- save:"](errPtr);
+            const eobj = _safeObj(Memory.readPointer(errPtr));
+            out.saved = okSave;
+            if (eobj) out.saveError = String(eobj);
+          }
+          result = { ok: true };
+        } finally {
+          try { if (pool) pool.release(); } catch (_) {}
+        }
+      }
+    });
+
+    wc["- performBlockAndWait:"](blk);
+
+    if (result && result.ok && doSyncOS && out.osAddressBookContactID) {
+      try {
+        const CNContactStore = ObjC.classes.CNContactStore;
+        const CNSaveRequest = ObjC.classes.CNSaveRequest;
+        const NSMutableArray = ObjC.classes.NSMutableArray;
+        if (CNContactStore && CNSaveRequest && NSMutableArray) {
+          const store = CNContactStore.alloc().init();
+          const keys = NSMutableArray.alloc().init();
+          try { keys.addObject_(_ns("givenName")); } catch (_) {}
+          try { keys.addObject_(_ns("familyName")); } catch (_) {}
+          try { keys.addObject_(_ns("nickname")); } catch (_) {}
+          const errPtr = Memory.alloc(Process.pointerSize);
+          Memory.writePointer(errPtr, ptr("0x0"));
+          const cn0 = store.unifiedContactWithIdentifier_keysToFetch_error_(_ns(out.osAddressBookContactID), keys, errPtr);
+          const eobj = _safeObj(Memory.readPointer(errPtr));
+          const cn = cn0 ? _safeObj(cn0) : null;
+          if (cn) {
+            const m = _safeObj(cn.mutableCopy());
+            try { if (m && m.setGivenName_) m.setGivenName_(_ns(givenName)); } catch (_) {}
+            const req = CNSaveRequest.alloc().init();
+            if (req && req.updateContact_) {
+              req.updateContact_(m);
+              const err2 = Memory.alloc(Process.pointerSize);
+              Memory.writePointer(err2, ptr("0x0"));
+              const okSave = !!store.executeSaveRequest_error_(req, err2);
+              const e2 = _safeObj(Memory.readPointer(err2));
+              out.osSaved = okSave;
+              if (e2) out.osSaveError = String(e2);
+            } else {
+              out.osSaved = false;
+              out.osSaveError = "CNSaveRequest missing updateContact:";
+            }
+          } else {
+            out.osSaved = false;
+            out.osSaveError = eobj ? _safeDescValue(eobj) : "CNContact nil";
+          }
+        } else {
+          out.osSaved = false;
+          out.osSaveError = "Contacts.framework classes missing";
+        }
+      } catch (e) {
+        out.osSaved = false;
+        out.osSaveError = String(e);
+      }
+    }
+
+    out.ok = !!(result && result.ok);
+    return out;
+  } catch (e) {
+    return { ok: false, build: SCRIPT_BUILD_ID, error: String(e) };
+  }
+}
+
 rpc.exports = {
   entries,
   waitready,
@@ -1601,6 +2261,8 @@ rpc.exports = {
   sendstatustext,
   sendstatusimage,
   sendstatusvideo,
+  notifycontactstoredidchange: _contactsNotifyContactStoreDidChange,
+  csabsetgivennamejidwc: csabsetgivennamejid_writecontext,
   statusposttext(text, messageOrigin, creationEntryPoint) {
     let mo = Number(messageOrigin);
     let ep = Number(creationEntryPoint);
@@ -1698,6 +2360,9 @@ rpc.exports = {
     RX_SAMPLE.quoted_stanza_id = "";
     return { ok: true, build: SCRIPT_BUILD_ID, enabled: false };
   },
+  csabcncreatephone,
+  csabcnupsertgivenphone,
+  csabsetgivennamejid,
 };
 
 function _txEmitResult(opId, kind, jid, res, extraErr, mediaRef) {
@@ -2351,107 +3016,1115 @@ try { setImmediate(_selfCardLoop); } catch (_) {}
 function _contactsNoteEmitResult(opId, chatJid, contactPhoneJid, phoneDigits, res, extraErr) {
   try {
     const ok = !!(res && res.ok);
-    const status = String((res && res.status) ? res.status : (ok ? "success" : "failed"));
+    const status = String((res && res.status) ? res.status : (ok ? "ok" : "failed"));
     const err = ok ? "" : String((res && res.error) ? res.error : (extraErr ? extraErr : "failed"));
     send({
       type: "wa.tx.contact_note_upsert.result",
       build: SCRIPT_BUILD_ID,
       ts: Date.now(),
-      op_id: String(opId || ""),
       opId: String(opId || ""),
+      op_id: String(opId || ""),
       chatJid: String(chatJid || ""),
       contactPhoneJid: String(contactPhoneJid || ""),
       phoneDigits: String(phoneDigits || ""),
       ok: ok,
       status: status,
-      before: (res && res.before) ? res.before : null,
-      after: (res && res.after) ? res.after : null,
-      error: err
+      error: err,
+      waOk: !!(res && res.waOk),
+      osOk: !!(res && res.osOk)
     });
   } catch (_) {}
 }
 
+const ENABLE_CONTACTS_STORAGE_FETCH = true;
+const ENABLE_SAFE_CONTACTS_STORAGE_FETCH = true;
+const ENABLE_CN_DIRECT_WRITE = false;
+const ENABLE_DELAYED_READ_6000MS = false;
+
 function _contactsNoteUpsertFullNameOnMain(p) {
+  if (1) {
+  const opId = String((p && (p.opId || p.op_id)) ? (p.opId || p.op_id) : "").trim();
+  const chatJid = String((p && p.chatJid) ? p.chatJid : "").trim();
+  const contactPhoneJid = String((p && p.contactPhoneJid) ? p.contactPhoneJid : "").trim();
+  const phoneDigits = String((p && p.phoneDigits) ? p.phoneDigits : "").trim();
+  const noteText = String((p && p.noteText) ? p.noteText : "").trim();
+  const saveToOSAddressBook = (p && p.saveToOSAddressBook !== undefined) ? ((Number(p.saveToOSAddressBook) | 0) ? 1 : 0) : 1;
+  if (!chatJid || !phoneDigits) {
+    return { ok: false, status: "failed", error: "missing chatJid/phoneDigits", waOk: false, osOk: false };
+  }
+
+  const r = csabsetgivennamejid_writecontext(chatJid, noteText, saveToOSAddressBook);
+  const waOk = !!(r && r.ok);
+  let osSaved = !!(r && r.osSaved === true);
+  let osMethod = "";
+  let osErr = String((r && r.osSaveError) ? r.osSaveError : "");
+  try {
+    if (r && r.osAddressBookContactID) osMethod = "id";
+    else osMethod = "id_missing";
+  } catch (_) {}
+  let osFallback = null;
+  try {
+    if (saveToOSAddressBook && (!osSaved || osMethod === "id_missing")) {
+      osFallback = csabcnupsertgivenphone("+" + phoneDigits, noteText);
+      if (osFallback && osFallback.ok) {
+        osSaved = true;
+        osMethod = "phone";
+        osErr = "";
+      } else if (!osErr) {
+        osErr = String((osFallback && osFallback.error) ? osFallback.error : "failed");
+        osMethod = (osMethod === "id_missing") ? "id_missing+phone_failed" : "id+phone_failed";
+      }
+    }
+  } catch (e) {
+    if (!osErr) osErr = String(e);
+    osMethod = (osMethod === "id_missing") ? "id_missing+phone_exception" : "id+phone_exception";
+  }
+  const osOk = saveToOSAddressBook ? !!osSaved : true;
+  const ok = waOk && osOk;
+  const status = ok ? "success" : (waOk ? "wa_only" : "failed");
+  const error = ok ? "" : String((r && r.error) ? r.error : (waOk ? ("os=" + (osErr || "failed") + " method=" + (osMethod || "")) : "failed"));
+  return {
+    ok: ok,
+    status: status,
+    error: error,
+    opId: opId,
+    chatJid: chatJid,
+    contactPhoneJid: contactPhoneJid,
+    phoneDigits: phoneDigits,
+    noteText: noteText,
+    saveToOSAddressBook: saveToOSAddressBook,
+    waOk: waOk,
+    osOk: osOk,
+    debug: Object.assign({}, r || {}, { osMethod: osMethod, osFallback: osFallback })
+  };
+  }
   const core = _resolveCoreFixed();
   if (!core || !core.ok) return { ok: false, status: "failed", error: core ? core.error : "core failed" };
   const ctxMain = core.ctxMain;
   const chatManager = (_objcCanCall(ctxMain, "- chatManager")) ? _safeObj(ctxMain["- chatManager"]()) : null;
   if (!chatManager) return { ok: false, status: "failed", error: "ctxMain.chatManager nil" };
-  const retrSel = _objcCanCall(ctxMain, "- username_contact_lid_based_retrieving") ? "- username_contact_lid_based_retrieving" : (_objcCanCall(ctxMain, "- username_contact_lid_based_retrieving_usync") ? "- username_contact_lid_based_retrieving_usync" : "");
-  if (!retrSel) return { ok: false, status: "failed", error: "ctxMain.username_contact_lid_based_retrieving missing" };
-  const retr = _safeObj(ctxMain[retrSel]());
-  if (!retr) return { ok: false, status: "failed", error: "username_contact_lid_based_retrieving nil" };
 
+  const opId = String((p && (p.opId || p.op_id)) ? (p.opId || p.op_id) : "");
   const chatJid = String(p.chatJid || "");
   const contactPhoneJid = String(p.contactPhoneJid || "");
   const targetFullName = String(p.noteText || "");
-  const prefer = (chatJid && chatJid.indexOf("@lid") !== -1) ? chatJid : contactPhoneJid;
+  const saveToOSAddressBook = (p && p.saveToOSAddressBook !== undefined) ? ((Number(p.saveToOSAddressBook) | 0) ? 1 : 0) : 1;
+  const preferLid = (chatJid && chatJid.indexOf("@lid") !== -1) ? chatJid : "";
+  const preferPn = contactPhoneJid || "";
+  const prefer = (saveToOSAddressBook && preferPn) ? preferPn : (preferLid || preferPn);
   if (!prefer) return { ok: false, status: "failed", error: "missing chatJid/contactPhoneJid" };
-  const userJid = _makeAuthorUserJIDFromString(prefer);
-  if (!userJid) return { ok: false, status: "failed", error: "userJID parse failed" };
   const isLid = prefer.indexOf("@lid") !== -1;
-  const fetchSel = isLid ? "- contactForLID:includeUnknownContacts:" : "- contactForJID:includeUnknownContacts:";
-  if (!_objcCanCall(retr, fetchSel)) return { ok: false, status: "failed", error: "retriever missing " + fetchSel };
-  const contact = _safeObj(retr[fetchSel](userJid, true));
-  if (!contact) return { ok: false, status: "not_found", error: "contactFor* returned nil" };
+  let debug = {};
+  let contactToSave = null;
+  let fetchSel = "";
+  let retrSel = "";
+  let abPropsFrom = "";
+  let abPropsClass = "";
+  let altPn = null;
+  let altPnFetchSel = "";
+  let mcsFetchFrom = null;
+
+  if (!contactToSave) {
+    const pickRetriever = () => {
+      const out = {
+        ok: false,
+        retriever: null,
+        retrSel: "",
+        abPropsFrom: "",
+        abPropsClass: "",
+        debug: {}
+      };
+
+      const retrSels = [
+        "- username_contact_lid_based_retrieving",
+        "- username_contact_lid_based_retrieving_usync"
+      ];
+
+      const abPropsSel = "- abProperties";
+      const ucSel = "- userContext";
+
+      const cands = [
+        { k: "ctxMain.abProperties", owner: ctxMain, viaUserContext: false },
+        { k: "ctxMain.userContext.abProperties", owner: ctxMain, viaUserContext: true },
+        { k: "chatManager.userContext.abProperties", owner: chatManager, viaUserContext: true }
+      ];
+
+      for (let i = 0; i < cands.length; i++) {
+        const c = cands[i];
+        const o0 = c.owner && c.owner.handle ? c.owner : _safeObj(c.owner);
+        const ownerClass = o0 ? String(o0.$className || "") : "";
+        out.debug[c.k] = { ownerClassName: ownerClass, hasUserContext: false, userContextClass: "", hasAbProperties: false, abPropsClass: "", retrSels: {} };
+        if (!o0) continue;
+
+        let owner2 = o0;
+        if (c.viaUserContext) {
+          out.debug[c.k].hasUserContext = _objcCanCall(owner2, ucSel);
+          if (!out.debug[c.k].hasUserContext) continue;
+          const uc = _safeObj(owner2[ucSel]());
+          out.debug[c.k].userContextClass = uc ? String(uc.$className || "") : "";
+          if (!uc) continue;
+          owner2 = uc;
+        }
+
+        out.debug[c.k].hasAbProperties = _objcCanCall(owner2, abPropsSel);
+        if (!out.debug[c.k].hasAbProperties) continue;
+        const ab = _safeObj(owner2[abPropsSel]());
+        out.debug[c.k].abPropsClass = ab ? String(ab.$className || "") : "";
+        if (!ab) continue;
+
+        for (let si = 0; si < retrSels.length; si++) {
+          const rs = retrSels[si];
+          const hasSel = _objcCanCall(ab, rs);
+          out.debug[c.k].retrSels[rs] = { hasSel: hasSel, retrieverNil: true };
+          if (!hasSel) continue;
+          const r = _safeObj(ab[rs]());
+          out.debug[c.k].retrSels[rs].retrieverNil = !r;
+          if (!r) continue;
+          out.ok = true;
+          out.retriever = r;
+          out.retrSel = rs;
+          out.abPropsFrom = c.k;
+          out.abPropsClass = out.debug[c.k].abPropsClass;
+          return out;
+        }
+      }
+      return out;
+    };
+
+    const picked = pickRetriever();
+    const retriever = (picked && picked.ok) ? picked.retriever : null;
+    retrSel = (picked && picked.ok) ? picked.retrSel : "";
+    abPropsFrom = (picked && picked.ok) ? picked.abPropsFrom : "";
+    abPropsClass = (picked && picked.ok) ? picked.abPropsClass : "";
+    if (picked && picked.debug) debug = Object.assign({}, debug, picked.debug);
+
+    if (retriever) {
+      const jidObj = _makeAuthorUserJIDFromString(prefer);
+      const retrFetchSel = isLid ? "- contactForLID:includeUnknownContacts:" : "- contactForJID:includeUnknownContacts:";
+      debug.uiLike = debug.uiLike || {};
+      debug.uiLike.retrFetchSel = retrFetchSel;
+      debug.uiLike.includeUnknown = 0;
+      debug.uiLike.retrSel = retrSel;
+      debug.uiLike.abPropsFrom = abPropsFrom;
+      if (_objcCanCall(retriever, retrFetchSel) && jidObj) {
+        const c = _safeObj(retriever[retrFetchSel](jidObj, 0));
+        if (c) {
+          contactToSave = c;
+          fetchSel = retrFetchSel;
+        } else {
+          debug.uiLike.retrieverReturnedNil = true;
+        }
+      } else {
+        debug.uiLike.retrieverMissingSelOrJid = true;
+      }
+    }
+  }
+
+  const mcsSel = "- mappedContactsStorage";
+  const mcsHasSel = _objcCanCall(ctxMain, mcsSel);
+  debug["ctxMain.mappedContactsStorage"] = { className: "WAContextMain", hasSel: mcsHasSel, storageNil: true, storageClass: "", fetchSels: {} };
+  if (mcsHasSel) {
+    const mcs = _safeObj(ctxMain[mcsSel]());
+    debug["ctxMain.mappedContactsStorage"].storageNil = !mcs;
+    debug["ctxMain.mappedContactsStorage"].storageClass = mcs ? String(mcs.$className || "") : "";
+    if (mcs) {
+      const includeUnknown = 0;
+      const fetchFrom = (jidStr) => {
+        const u = _makeAuthorUserJIDFromString(jidStr);
+        if (!u) return { c: null, usedSel: "" };
+        const isL = jidStr.indexOf("@lid") !== -1;
+        const s2 = isL ? "- contactForLID:includeUnknownContacts:" : "- contactForJID:includeUnknownContacts:";
+        const has2 = _objcCanCall(mcs, s2);
+        debug["ctxMain.mappedContactsStorage"].fetchSels[s2] = debug["ctxMain.mappedContactsStorage"].fetchSels[s2] || { hasSel: has2, contactNil: true };
+        debug["ctxMain.mappedContactsStorage"].fetchSels[s2].hasSel = has2;
+        if (has2) {
+          const c2 = _safeObj(mcs[s2](u, includeUnknown));
+          debug["ctxMain.mappedContactsStorage"].fetchSels[s2].contactNil = !c2;
+          if (c2) return { c: c2, usedSel: s2 };
+        }
+        const s1 = isL ? "- contactForLID:" : "- contactForJID:";
+        const has1 = _objcCanCall(mcs, s1);
+        debug["ctxMain.mappedContactsStorage"].fetchSels[s1] = debug["ctxMain.mappedContactsStorage"].fetchSels[s1] || { hasSel: has1, contactNil: true };
+        debug["ctxMain.mappedContactsStorage"].fetchSels[s1].hasSel = has1;
+        if (has1) {
+          const c1 = _safeObj(mcs[s1](u));
+          debug["ctxMain.mappedContactsStorage"].fetchSels[s1].contactNil = !c1;
+          if (c1) return { c: c1, usedSel: s1 };
+        }
+        return { c: null, usedSel: "" };
+      };
+      mcsFetchFrom = fetchFrom;
+
+      if (saveToOSAddressBook && preferPn) {
+        const rpn0 = fetchFrom(preferPn);
+        altPn = rpn0.c;
+        altPnFetchSel = rpn0.usedSel;
+        if (rpn0.c) {
+          contactToSave = rpn0.c;
+          fetchSel = rpn0.usedSel;
+          retrSel = "ctxMain.mappedContactsStorage." + rpn0.usedSel;
+          abPropsFrom = "ctxMain.mappedContactsStorage";
+          abPropsClass = "";
+        }
+      }
+      if (!contactToSave && preferLid) {
+        const r = fetchFrom(preferLid);
+        if (r.c) {
+          contactToSave = r.c;
+          fetchSel = r.usedSel;
+          retrSel = "ctxMain.mappedContactsStorage." + r.usedSel;
+          abPropsFrom = "ctxMain.mappedContactsStorage";
+          abPropsClass = "";
+        }
+      }
+    }
+  }
+
+  if (!contactToSave) {
+    return {
+      ok: false,
+      status: "failed",
+      error: "no contact fetch path available",
+      retrSel: retrSel,
+      debug: debug
+    };
+  }
+
+  let wrapperClass = String(contactToSave.$className || "");
+
+  try {
+    debug.osab = debug.osab || {};
+    debug.osab.altPn = { hasAlt: !!altPn, fetchSel: String(altPnFetchSel || ""), osAddressBookContactID: "" };
+    if (altPn) {
+      const osIdSelAlt = "- osAddressBookContactID";
+      if (_objcCanCall(altPn, osIdSelAlt)) {
+        const v = _safeObj(altPn[osIdSelAlt]());
+        if (v) debug.osab.altPn.osAddressBookContactID = String(v);
+      }
+    }
+  } catch (_) {}
+
+  if (!_objcCanCall(contactToSave, "- copy")) {
+    return { ok: false, status: "failed", error: "contact missing copy", fetchSel: fetchSel, retrSel: retrSel, abPropsFrom: abPropsFrom, abPropsClass: abPropsClass, debug: debug, prefer: prefer, wrapperClass: wrapperClass };
+  }
+  let originalContact = _safeObj(contactToSave["- copy"]());
+  if (!originalContact) {
+    return { ok: false, status: "failed", error: "contact copy returned nil", fetchSel: fetchSel, retrSel: retrSel, abPropsFrom: abPropsFrom, abPropsClass: abPropsClass, debug: debug, prefer: prefer, wrapperClass: wrapperClass };
+  }
+
+  try {
+    if (saveToOSAddressBook) {
+      debug.osab = debug.osab || {};
+      debug.osab.abSync = debug.osab.abSync || { attempted: false, hasAbSync: false, abSyncClass: "", hasFetch: false, hasObjectForKey: false, fetched: false, uid: "", gotProxy: false, proxyClass: "", error: "", via: "" };
+      debug.osab.abSync.attempted = true;
+      const abSyncSel = "- addressBookSynchronizer";
+      debug.osab.abSync.hasAbSync = _objcCanCall(chatManager, abSyncSel);
+      if (debug.osab.abSync.hasAbSync) {
+        const abSync = _safeObj(chatManager[abSyncSel]());
+        debug.osab.abSync.abSyncClass = abSync ? String(abSync.$className || "") : "";
+        const ucSel = "- userContext";
+        const hasUc = _objcCanCall(chatManager, ucSel);
+        const uc = hasUc ? _safeObj(chatManager[ucSel]()) : null;
+        const puSel = "- persistedUniqueID";
+        const hasPuid = _objcCanCall(contactToSave, puSel);
+        const puidObj = hasPuid ? _safeObj(contactToSave[puSel]()) : null;
+        const puid = puidObj ? String(puidObj) : "";
+        debug.osab.abSync.uid = puid;
+        const fetchSel2 = "- fetchAddressBookContactsForUniqueIDs:inContext:filteringPredicate:";
+
+        let csCtxMain = null;
+        let csChatManager = null;
+        try {
+          const csSel = "- contactsStorage";
+          if (_objcCanCall(ctxMain, csSel)) csCtxMain = _safeObj(ctxMain[csSel]());
+          if (_objcCanCall(chatManager, csSel)) csChatManager = _safeObj(chatManager[csSel]());
+        } catch (_) {}
+
+      try {
+        debug.osab.abSync.fetchOwnerCandidates = [];
+        const addCand = (label, obj) => {
+          try {
+            if (!obj) return;
+            debug.osab.abSync.fetchOwnerCandidates.push({
+              label: String(label || ""),
+              className: String(obj.$className || ""),
+              hasFetch: _objcCanCall(obj, fetchSel2),
+              hasCDM: _objcCanCall(obj, "- contactsDownloadManager"),
+              hasMainMoc: _objcCanCall(obj, "- mainManagedObjectContext"),
+              hasMoc: _objcCanCall(obj, "- managedObjectContext")
+            });
+          } catch (_) {}
+        };
+        addCand("chatManager", chatManager);
+        addCand("chatManager.userContext", uc);
+        addCand("chatManager.addressBookSynchronizer", abSync);
+        addCand("ctxMain", ctxMain);
+        addCand("ctxMain.contactsStorage", csCtxMain);
+        const csqSel = "- contactsStorageQueries";
+        if (_objcCanCall(ctxMain, csqSel)) addCand("ctxMain.contactsStorageQueries", _safeObj(ctxMain[csqSel]()));
+        addCand("chatManager.contactsStorage", csChatManager);
+        if (_objcCanCall(chatManager, csqSel)) addCand("chatManager.contactsStorageQueries", _safeObj(chatManager[csqSel]()));
+      } catch (_) {}
+
+        const tryFetchFrom = (owner, ownerLabel, inContext) => {
+          try {
+            if (!owner || !puidObj) return null;
+            if (!inContext) return null;
+            const can = _objcCanCall(owner, fetchSel2);
+            if (!can) return null;
+            const arr = ObjC.classes.NSArray.arrayWithObject_(puidObj);
+            const dict = _safeObj(owner[fetchSel2](arr, inContext, ptr("0x0")));
+            if (!dict) return null;
+            if (!_objcCanCall(dict, "- objectForKey:")) return null;
+            const proxy = _safeObj(dict["- objectForKey:"](puidObj));
+            if (!proxy) return null;
+            return { ownerLabel, proxy, dict };
+          } catch (_) {
+            return null;
+          }
+        };
+
+        const tryFetchFromContactsStorageSafe = (csObj, ownerLabel) => {
+          try {
+            if (!csObj || !puidObj) return null;
+            if (!_objcCanCall(csObj, "- managedObjectContext")) return null;
+            const moc = _safeObj(csObj["- managedObjectContext"]());
+            debug.osab.abSync.csMoc = debug.osab.abSync.csMoc || {};
+            debug.osab.abSync.csMoc[ownerLabel] = { nil: !moc, className: moc ? String(moc.$className || "") : "" };
+            if (!moc) return null;
+            const pbwSel = "- performBlockAndWait:";
+            const hasPBW = _objcCanCall(moc, pbwSel);
+            debug.osab.abSync.csMoc[ownerLabel].hasPerformBlockAndWait = !!hasPBW;
+            if (!hasPBW || !ObjC.Block) return null;
+
+            let outProxy = null;
+            let outProxyClass = "";
+            let outProxyHasCopy = false;
+            let outErr = "";
+            const blk = new ObjC.Block({
+              retType: "void",
+              argTypes: [],
+              implementation: function () {
+                try {
+                  if (!_objcCanCall(csObj, fetchSel2)) return;
+                  const arr = ObjC.classes.NSArray.arrayWithObject_(puidObj);
+                  const dict = _safeObj(csObj[fetchSel2](arr, moc, ptr("0x0")));
+                  if (!dict) return;
+                  if (!_objcCanCall(dict, "- objectForKey:")) return;
+                  const proxy = _safeObj(dict["- objectForKey:"](puidObj));
+                  if (!proxy) return;
+                  outProxyClass = String(proxy.$className || "");
+                  outProxyHasCopy = _objcCanCall(proxy, "- copy");
+                  if (outProxyHasCopy) {
+                    outProxy = _safeObj(proxy["- copy"]());
+                  } else {
+                    outProxy = proxy;
+                  }
+                } catch (e) {
+                  outErr = String(e);
+                }
+              }
+            });
+            _keepAliveBlock(blk, 15000);
+            moc[pbwSel](blk);
+            if (!outProxy) {
+              debug.osab.abSync.csMoc[ownerLabel].fetchError = outErr;
+              return null;
+            }
+            debug.osab.abSync.csMoc[ownerLabel].proxyClass = outProxyClass;
+            debug.osab.abSync.csMoc[ownerLabel].proxyHasCopy = outProxyHasCopy;
+            return { ownerLabel, proxy: outProxy, dict: null };
+          } catch (e) {
+            try {
+              debug.osab.abSync.csMoc = debug.osab.abSync.csMoc || {};
+              debug.osab.abSync.csMoc[ownerLabel] = debug.osab.abSync.csMoc[ownerLabel] || {};
+              debug.osab.abSync.csMoc[ownerLabel].outerError = String(e);
+            } catch (_) {}
+            return null;
+          }
+        };
+
+        debug.osab.abSync.hasFetch = abSync ? _objcCanCall(abSync, fetchSel2) : false;
+        let got = null;
+        if (abSync && uc && puid) got = tryFetchFrom(abSync, "chatManager.addressBookSynchronizer", uc);
+
+        if (ENABLE_CONTACTS_STORAGE_FETCH) {
+          if (ENABLE_SAFE_CONTACTS_STORAGE_FETCH) {
+            if (!got && csCtxMain) got = tryFetchFromContactsStorageSafe(csCtxMain, "ctxMain.contactsStorage");
+            if (!got && csChatManager) got = tryFetchFromContactsStorageSafe(csChatManager, "chatManager.contactsStorage");
+          } else {
+            try {
+              debug.osab.abSync.csMoc = debug.osab.abSync.csMoc || {};
+              if (!got && csCtxMain && _objcCanCall(csCtxMain, "- managedObjectContext")) {
+                const moc = _safeObj(csCtxMain["- managedObjectContext"]());
+                debug.osab.abSync.csMoc.ctxMain = { nil: !moc, className: moc ? String(moc.$className || "") : "" };
+                if (moc) got = tryFetchFrom(csCtxMain, "ctxMain.contactsStorage", moc);
+              }
+              if (!got && csChatManager && _objcCanCall(csChatManager, "- managedObjectContext")) {
+                const moc2 = _safeObj(csChatManager["- managedObjectContext"]());
+                debug.osab.abSync.csMoc.chatManager = { nil: !moc2, className: moc2 ? String(moc2.$className || "") : "" };
+                if (moc2) got = tryFetchFrom(csChatManager, "chatManager.contactsStorage", moc2);
+              }
+            } catch (_) {}
+          }
+        }
+
+        if (!got) {
+          let cdm = null;
+          const cdmSel = "- contactsDownloadManager";
+          const tryGetByIvars = (owner) => {
+            try {
+              const o = owner && owner.handle ? owner : _safeObj(owner);
+              if (!o || !o.$ivars) return null;
+              const iv = o.$ivars;
+              const names = [
+                "contactsDownloadManager",
+                "_contactsDownloadManager",
+                "$__lazy_storage_$_contactsDownloadManager",
+                "$__lazy_storage_$_contactsDownloadManager_0",
+                "$__lazy_storage_$_contactsDownloadManager_1",
+                "$__lazy_storage_$_contactsDownloadManager_2"
+              ];
+              for (let i = 0; i < names.length; i++) {
+                const k = names[i];
+                if (!(k in iv)) continue;
+                const v = _safeObj(iv[k]);
+                if (v) return { key: k, obj: v };
+              }
+              return null;
+            } catch (_) {
+              return null;
+            }
+          };
+
+          debug.osab.abSync.hasContactsDownloadManager = _objcCanCall(ctxMain, cdmSel) || (uc ? _objcCanCall(uc, cdmSel) : false) || _objcCanCall(chatManager, cdmSel);
+          if (_objcCanCall(ctxMain, cdmSel)) cdm = _safeObj(ctxMain[cdmSel]());
+          if (!cdm && uc && _objcCanCall(uc, cdmSel)) cdm = _safeObj(uc[cdmSel]());
+          if (!cdm && _objcCanCall(chatManager, cdmSel)) cdm = _safeObj(chatManager[cdmSel]());
+
+          debug.osab.abSync.contactsDownloadManagerViaIvar = "";
+          if (!cdm) {
+            let r = tryGetByIvars(ctxMain);
+            if (!r && uc) r = tryGetByIvars(uc);
+            if (!r) r = tryGetByIvars(chatManager);
+            if (r && r.obj) {
+              cdm = r.obj;
+              debug.osab.abSync.contactsDownloadManagerViaIvar = String(r.key || "");
+            }
+          }
+
+          debug.osab.abSync.contactsDownloadManagerClass = cdm ? String(cdm.$className || "") : "";
+          debug.osab.abSync.contactsDownloadManagerHasFetch = cdm ? _objcCanCall(cdm, fetchSel2) : false;
+          if (cdm && uc && puid) got = tryFetchFrom(cdm, "contactsDownloadManager", uc);
+        }
+
+        debug.osab.abSync.fetched = !!got;
+        debug.osab.abSync.hasObjectForKey = got ? true : false;
+        if (got && got.proxy) {
+          debug.osab.abSync.via = String(got.ownerLabel || "");
+          const proxy = got.proxy;
+          debug.osab.abSync.gotProxy = true;
+          debug.osab.abSync.proxyClass = proxy ? String(proxy.$className || "") : "";
+          debug.osab.abSync.proxyCaps = {
+            hasCopy: proxy ? _objcCanCall(proxy, "- copy") : false,
+            hasMutableCopy: proxy ? _objcCanCall(proxy, "- mutableCopy") : false,
+            hasFullNameSel: proxy ? _objcCanCall(proxy, "- fullName") : false
+          };
+          if (proxy && _objcCanCall(proxy, "- copy")) {
+            contactToSave = proxy;
+            originalContact = _safeObj(proxy["- copy"]());
+            wrapperClass = String(contactToSave.$className || "");
+            fetchSel = String("abFetch:" + got.ownerLabel);
+          }
+        }
+      }
+    }
+  } catch (e) {
+    try {
+      debug.osab = debug.osab || {};
+      debug.osab.abSync = debug.osab.abSync || {};
+      debug.osab.abSync.error = String(e);
+    } catch (_) {}
+  }
+
+  if (!originalContact) {
+    return { ok: false, status: "failed", error: "contact/originalContact nil after abSync", fetchSel: fetchSel, retrSel: retrSel, abPropsFrom: abPropsFrom, abPropsClass: abPropsClass, debug: debug, prefer: prefer, wrapperClass: wrapperClass };
+  }
+
+  try {
+    if (saveToOSAddressBook && ENABLE_CN_DIRECT_WRITE) {
+      debug.osab = debug.osab || {};
+      const phoneDigits2 = _derivePhoneFromJid(contactPhoneJid);
+      debug.osab.cnWriteName = _writeOSContactNameByPhoneDigits(phoneDigits2, targetFullName);
+    }
+  } catch (e) {
+    try {
+      debug.osab = debug.osab || {};
+      debug.osab.cnWriteName = { ok: false, attempted: true, error: String(e) };
+    } catch (_) {}
+  }
+  const contactClass = String(originalContact.$className || "");
+  let fullNameClass = "";
+  let setterUsed = "";
 
   let beforeFullName = "";
   try {
-    if (_objcCanCall(contact, "- fullName")) beforeFullName = String(contact["- fullName"]() || "");
+    if (_objcCanCall(originalContact, "- fullName")) {
+      const n = _safeObj(originalContact["- fullName"]());
+      if (n) {
+        fullNameClass = String(n.$className || "");
+        if (_objcCanCall(n, "- fullName")) {
+          const s = _safeObj(n["- fullName"]());
+          if (s) beforeFullName = String(s);
+        } else if (_objcCanCall(n, "- description")) {
+          const s = _safeObj(n["- description"]());
+          if (s) beforeFullName = String(s);
+        } else {
+          beforeFullName = String(n);
+        }
+      }
+    } else if (_objcCanCall(originalContact, "- cachedFullName")) {
+      const s = _safeObj(originalContact["- cachedFullName"]());
+      if (s) beforeFullName = String(s);
+    } else if (_objcCanCall(originalContact, "- businessName")) {
+      const s = _safeObj(originalContact["- businessName"]());
+      if (s) beforeFullName = String(s);
+    }
   } catch (_) {}
 
-  let original = null;
   try {
-    if (_objcCanCall(contact, "- copy")) original = _safeObj(contact["- copy"]());
+    debug.nameObjProbe = debug.nameObjProbe || {};
+    const sFn = "- fullName";
+    debug.nameObjProbe.hasContactFullNameSel = _objcCanCall(contactToSave, sFn);
+    debug.nameObjProbe.contactFullNameObjNil = true;
+    if (debug.nameObjProbe.hasContactFullNameSel) {
+      const fnObj = _safeObj(contactToSave[sFn]());
+      debug.nameObjProbe.contactFullNameObjNil = !fnObj;
+      if (fnObj) {
+        debug.nameObjProbe.contactFullNameObjClass = String(fnObj.$className || "");
+        debug.nameObjProbe.contactFullNameObjDesc = _safeDescValue(fnObj);
+        const selAllow = "- setFullName:allowExternalSideEffects:";
+        const selSet = "- setFullName:";
+        debug.nameObjProbe.contactFullNameObjHasSetAllow = _objcCanCall(fnObj, selAllow);
+        debug.nameObjProbe.contactFullNameObjHasSet = _objcCanCall(fnObj, selSet);
+      }
+    }
+
+    debug.nameObjProbe.hasOriginalFullNameSel = _objcCanCall(originalContact, sFn);
+    debug.nameObjProbe.originalFullNameObjNil = true;
+    if (debug.nameObjProbe.hasOriginalFullNameSel) {
+      const ofnObj = _safeObj(originalContact[sFn]());
+      debug.nameObjProbe.originalFullNameObjNil = !ofnObj;
+      if (ofnObj) {
+        debug.nameObjProbe.originalFullNameObjClass = String(ofnObj.$className || "");
+        debug.nameObjProbe.originalFullNameObjDesc = _safeDescValue(ofnObj);
+        const selAllow = "- setFullName:allowExternalSideEffects:";
+        const selSet = "- setFullName:";
+        debug.nameObjProbe.originalFullNameObjHasSetAllow = _objcCanCall(ofnObj, selAllow);
+        debug.nameObjProbe.originalFullNameObjHasSet = _objcCanCall(ofnObj, selSet);
+      }
+    }
   } catch (_) {}
-  if (!original) original = contact;
+
+  try {
+    debug.osab = debug.osab || {};
+    const osIdSel = "- osAddressBookContactID";
+    debug.osab.hasOsAddressBookContactID = _objcCanCall(contactToSave, osIdSel);
+    debug.osab.osAddressBookContactID = "";
+    if (debug.osab.hasOsAddressBookContactID) {
+      const v = _safeObj(contactToSave[osIdSel]());
+      if (v) debug.osab.osAddressBookContactID = String(v);
+    }
+    const syncPolicySel = "- syncPolicy";
+    debug.osab.hasSyncPolicy = _objcCanCall(contactToSave, syncPolicySel);
+    debug.osab.syncPolicy = debug.osab.hasSyncPolicy ? Number(contactToSave[syncPolicySel]()) : -1;
+    const phoneStatusSel = "- phoneStatus";
+    debug.osab.hasPhoneStatus = _objcCanCall(contactToSave, phoneStatusSel);
+    debug.osab.phoneStatus = debug.osab.hasPhoneStatus ? Number(contactToSave[phoneStatusSel]()) : -1;
+    const pnSel = "- pnJID";
+    debug.osab.hasPnJID = _objcCanCall(contactToSave, pnSel);
+    debug.osab.pnJid = "";
+    if (debug.osab.hasPnJID) {
+      const pj = _safeObj(contactToSave[pnSel]());
+      if (pj && _objcCanCall(pj, "- stringRepresentation")) {
+        const s = _safeObj(pj["- stringRepresentation"]());
+        if (s) debug.osab.pnJid = String(s);
+      } else if (pj) {
+        debug.osab.pnJid = String(pj);
+      }
+    }
+  } catch (_) {}
 
   const nsName = _ns(targetFullName);
-  if (!nsName) return { ok: false, status: "failed", error: "NSString alloc failed" };
-  if (!_objcCanCall(contact, "- setFullName:allowExternalSideEffects:")) return { ok: false, status: "failed", error: "contact missing setFullName:allowExternalSideEffects:" };
-  contact["- setFullName:allowExternalSideEffects:"](nsName, true);
+  if (!nsName) return { ok: false, status: "failed", error: "NSString alloc failed", fetchSel: fetchSel, retrSel: retrSel, abPropsFrom: abPropsFrom, abPropsClass: abPropsClass, debug: debug, prefer: prefer, wrapperClass: wrapperClass, contactClass: contactClass };
+
+  try {
+    debug.uiLike = debug.uiLike || {};
+    const setLidSel = "- setLidJID:";
+    const setChatSel = "- setChatJID:";
+    const setSrcSel = "- setSource:";
+    const setUpdSel = "- setLastUpdated:";
+    debug.uiLike.hasSetLidJID = _objcCanCall(contactToSave, setLidSel);
+    debug.uiLike.hasSetChatJID = _objcCanCall(contactToSave, setChatSel);
+    debug.uiLike.hasSetSource = _objcCanCall(contactToSave, setSrcSel);
+    debug.uiLike.hasSetLastUpdated = _objcCanCall(contactToSave, setUpdSel);
+    if (debug.uiLike.hasSetLidJID && preferLid) {
+      const lidObj = _makeAuthorUserJIDFromString(preferLid);
+      if (lidObj) contactToSave[setLidSel](lidObj);
+    }
+    if (debug.uiLike.hasSetChatJID) {
+      const chatObj = _makeAuthorUserJIDFromString(preferPn || prefer);
+      if (chatObj) contactToSave[setChatSel](chatObj);
+    }
+    if (debug.uiLike.hasSetSource) {
+      contactToSave[setSrcSel](1);
+    }
+    if (debug.uiLike.hasSetLastUpdated && ObjC.available && ObjC.classes.NSDate && ObjC.classes.NSDate.date) {
+      const d = ObjC.classes.NSDate.date();
+      if (d) contactToSave[setUpdSel](d);
+    }
+  } catch (_) {}
+
+  const trySetName = () => {
+    try { debug.nameSetterCaps = debug.nameSetterCaps || {}; } catch (_) {}
+    try {
+      if (_objcCanCall(contactToSave, "- fullName")) {
+        const nameObj = _safeObj(contactToSave["- fullName"]());
+        if (nameObj) {
+          fullNameClass = fullNameClass || String(nameObj.$className || "");
+          const setNameSel = "- setFullName:allowExternalSideEffects:";
+          try { debug.nameSetterCaps[setNameSel] = _objcCanCall(nameObj, setNameSel); } catch (_) {}
+          if (_objcCanCall(nameObj, setNameSel)) {
+            nameObj[setNameSel](nsName, 1);
+            setterUsed = "contact.fullName.setFullName:allowExternalSideEffects:";
+            return true;
+          }
+        }
+      }
+    } catch (_) {}
+    try {
+      const cnNoSideSel = "- setContactNameWithoutExternalSideEffects:";
+      try { debug.nameSetterCaps[cnNoSideSel] = _objcCanCall(contactToSave, cnNoSideSel); } catch (_) {}
+      if (_objcCanCall(contactToSave, cnNoSideSel)) {
+        contactToSave[cnNoSideSel](nsName);
+        setterUsed = "contact.setContactNameWithoutExternalSideEffects:";
+        return true;
+      }
+    } catch (_) {}
+    try {
+      const cnSel = "- setContactName:";
+      try { debug.nameSetterCaps[cnSel] = _objcCanCall(contactToSave, cnSel); } catch (_) {}
+      if (_objcCanCall(contactToSave, cnSel)) {
+        contactToSave[cnSel](nsName);
+        setterUsed = "contact.setContactName:";
+        return true;
+      }
+    } catch (_) {}
+    try {
+      const directSel = "- setFullName:";
+      try { debug.nameSetterCaps[directSel] = _objcCanCall(contactToSave, directSel); } catch (_) {}
+      if (_objcCanCall(contactToSave, directSel)) {
+        contactToSave[directSel](nsName);
+        setterUsed = "contact.setFullName:";
+        return true;
+      }
+    } catch (_) {}
+    try {
+      const cachedSel = "- setCachedFullName:";
+      try { debug.nameSetterCaps[cachedSel] = _objcCanCall(contactToSave, cachedSel); } catch (_) {}
+      if (_objcCanCall(contactToSave, cachedSel)) {
+        contactToSave[cachedSel](nsName);
+        setterUsed = "contact.setCachedFullName:";
+        return true;
+      }
+    } catch (_) {}
+    try {
+      const bizSel = "- setBusinessName:";
+      try { debug.nameSetterCaps[bizSel] = _objcCanCall(contactToSave, bizSel); } catch (_) {}
+      if (_objcCanCall(contactToSave, bizSel)) {
+        contactToSave[bizSel](nsName);
+        setterUsed = "contact.setBusinessName:";
+        return true;
+      }
+    } catch (_) {}
+    try {
+      const givenSel = "- setGivenName:";
+      try { debug.nameSetterCaps[givenSel] = _objcCanCall(contactToSave, givenSel); } catch (_) {}
+      if (_objcCanCall(contactToSave, givenSel)) {
+        contactToSave[givenSel](nsName);
+        setterUsed = "contact.setGivenName:";
+        return true;
+      }
+    } catch (_) {}
+    try {
+      const famSel = "- setFamilyName:";
+      try { debug.nameSetterCaps[famSel] = _objcCanCall(contactToSave, famSel); } catch (_) {}
+      if (_objcCanCall(contactToSave, famSel)) {
+        contactToSave[famSel](nsName);
+        setterUsed = "contact.setFamilyName:";
+        return true;
+      }
+    } catch (_) {}
+    try {
+      const hiSel = "- setHighlightedName:";
+      try { debug.nameSetterCaps[hiSel] = _objcCanCall(contactToSave, hiSel); } catch (_) {}
+      if (_objcCanCall(contactToSave, hiSel)) {
+        contactToSave[hiSel](nsName);
+        setterUsed = "contact.setHighlightedName:";
+        return true;
+      }
+    } catch (_) {}
+    try {
+      const secSel = "- setSectionTitle:";
+      try { debug.nameSetterCaps[secSel] = _objcCanCall(contactToSave, secSel); } catch (_) {}
+      if (_objcCanCall(contactToSave, secSel)) {
+        contactToSave[secSel](nsName);
+        setterUsed = "contact.setSectionTitle:";
+        return true;
+      }
+    } catch (_) {}
+    return false;
+  };
+  if (!trySetName()) {
+    return { ok: false, status: "failed", error: "no supported name setter", fetchSel: fetchSel, retrSel: retrSel, abPropsFrom: abPropsFrom, abPropsClass: abPropsClass, debug: debug, prefer: prefer, wrapperClass: wrapperClass, contactClass: contactClass, fullNameClass: fullNameClass };
+  }
+
+  try {
+    debug.afterSetter = debug.afterSetter || {};
+    try {
+      const s9 = "- contactName";
+      debug.afterSetter.hasContactName = _objcCanCall(contactToSave, s9);
+      if (debug.afterSetter.hasContactName) {
+        const v = _safeObj(contactToSave[s9]());
+        if (v) debug.afterSetter.contactName = String(v);
+      }
+    } catch (_) {}
+    const s1 = "- givenName";
+    debug.afterSetter.hasGivenName = _objcCanCall(contactToSave, s1);
+    if (debug.afterSetter.hasGivenName) {
+      const v = _safeObj(contactToSave[s1]());
+      if (v) debug.afterSetter.givenName = String(v);
+    }
+    const s0 = "- cachedFullName";
+    debug.afterSetter.hasCachedFullName = _objcCanCall(contactToSave, s0);
+    if (debug.afterSetter.hasCachedFullName) {
+      const v = _safeObj(contactToSave[s0]());
+      if (v) debug.afterSetter.cachedFullName = String(v);
+    }
+  } catch (_) {}
+
+  try {
+    const syncSel = "- setSyncWithServerState:";
+    debug.osab = debug.osab || {};
+    debug.osab.hasSetSyncWithServerState = _objcCanCall(contactToSave, syncSel);
+    if (debug.osab.hasSetSyncWithServerState) {
+      contactToSave[syncSel](1);
+    }
+  } catch (_) {}
 
   const saveSel = "- saveChangesInContact:originalContact:saveToOSAddressBook:completion:";
-  if (!_objcCanCall(chatManager, saveSel)) return { ok: false, status: "failed", error: "chatManager missing saveChangesInContact:*" };
-  chatManager[saveSel](contact, original, 0, ptr("0x0"));
-
-  let afterFullName = beforeFullName;
-  const deadline = Date.now() + 1800;
-  while (Date.now() < deadline) {
-    Thread.sleep(0.15);
-    const c2 = _safeObj(retr[fetchSel](userJid, true));
-    if (!c2) continue;
-    if (!_objcCanCall(c2, "- fullName")) continue;
-    afterFullName = String(c2["- fullName"]() || "");
-    if (afterFullName === targetFullName) break;
+  if (!_objcCanCall(chatManager, saveSel)) {
+    return { ok: false, status: "failed", error: "chatManager missing saveChangesInContact:*", fetchSel: fetchSel, retrSel: retrSel, abPropsFrom: abPropsFrom, abPropsClass: abPropsClass, debug: debug, prefer: prefer, wrapperClass: wrapperClass, contactClass: contactClass, fullNameClass: fullNameClass, setterUsed: setterUsed };
   }
+  chatManager[saveSel](contactToSave, originalContact, saveToOSAddressBook, ptr("0x0"));
+
+  try {
+    debug.osab = debug.osab || {};
+    debug.osab.persist = debug.osab.persist || { attempted: false, called: false, error: "", hasPersistSel: false, hasPersistedUniqueID: false, persistedUniqueID: "" };
+    if (saveToOSAddressBook) {
+      debug.osab.persist.attempted = true;
+      const persistSel1 = "- persistEditsToContact:completion:";
+      const persistSel2 = "- persistEditsToSyncedContact:completion:";
+      const has1 = _objcCanCall(chatManager, persistSel1);
+      const has2 = _objcCanCall(chatManager, persistSel2);
+      debug.osab.persist.hasPersistEditsToContact = has1;
+      debug.osab.persist.hasPersistEditsToSyncedContact = has2;
+      const persistSel = has2 ? persistSel2 : persistSel1;
+      debug.osab.persist.hasPersistSel = _objcCanCall(chatManager, persistSel);
+      debug.osab.persist.persistSel = String(persistSel || "");
+      const puSel = "- persistedUniqueID";
+      debug.osab.persist.hasPersistedUniqueID = _objcCanCall(contactToSave, puSel);
+      if (debug.osab.persist.hasPersistedUniqueID) {
+        const v = _safeObj(contactToSave[puSel]());
+        if (v) debug.osab.persist.persistedUniqueID = String(v);
+      }
+      if (debug.osab.persist.hasPersistSel && debug.osab.persist.hasPersistedUniqueID) {
+        try {
+          let cb = null;
+          try {
+            if (ObjC.available && ObjC.Block) {
+              cb = new ObjC.Block({
+                retType: "void",
+                argTypes: ["pointer", "pointer"],
+                implementation: function (a0, a1) {
+                  try {
+                    const o0 = _safeObj(a0);
+                    const o1 = _safeObj(a1);
+                    send({
+                      ok: true,
+                      ts: Date.now(),
+                      op_id: String(opId || ""),
+                      opId: String(opId || ""),
+                      type: "wa.tx.contact_note_upsert.result",
+                      build: SCRIPT_BUILD_ID,
+                      status: "debug",
+                      debugPhase: "persist_completion",
+                      chatJid: String(chatJid || ""),
+                      contactPhoneJid: String(contactPhoneJid || ""),
+                      prefer: String(prefer || ""),
+                      debug: {
+                        osab: {
+                          persist: {
+                            persistSel: String(debug.osab && debug.osab.persist ? (debug.osab.persist.persistSel || "") : ""),
+                            persistedUniqueID: String(debug.osab && debug.osab.persist ? (debug.osab.persist.persistedUniqueID || "") : "")
+                          }
+                        },
+                        persistCompletion: {
+                          a0Ptr: String(_toPtr(a0)),
+                          a0Class: o0 ? String(o0.$className || "") : "",
+                          a0: o0 ? _safeDescValue(o0) : "",
+                          a1Ptr: String(_toPtr(a1)),
+                          a1Class: o1 ? String(o1.$className || "") : "",
+                          a1: o1 ? _safeDescValue(o1) : ""
+                        }
+                      }
+                    });
+                  } catch (_) {}
+                }
+              });
+              try { _keepAliveBlock(cb, 30000); } catch (_) {}
+            }
+          } catch (_) { cb = null; }
+          chatManager[persistSel](contactToSave, cb ? cb : ptr("0x0"));
+          debug.osab.persist.called = true;
+          debug.osab.persist.cb = { scheduled: !!cb, note: "completion async (no wait on main)" };
+        } catch (e) {
+          debug.osab.persist.error = String(e);
+        }
+      }
+      const notifySel = "- notifyContactStoreDidChange";
+      debug.osab.hasNotifyContactStoreDidChange = _objcCanCall(chatManager, notifySel);
+      if (debug.osab.hasNotifyContactStoreDidChange) {
+        try {
+          chatManager[notifySel]();
+          debug.osab.didNotifyContactStoreDidChange = true;
+        } catch (_) {
+          debug.osab.didNotifyContactStoreDidChange = false;
+        }
+      }
+    }
+  } catch (_) {}
+
+  try {
+    if (typeof setTimeout === "function" && mcsFetchFrom) {
+      const opId2 = String(opId || "");
+      const chatJid2 = String(chatJid || "");
+      const contactPhoneJid2 = String(contactPhoneJid || "");
+      const prefer2 = String(prefer || "");
+      const build2 = String(SCRIPT_BUILD_ID || "");
+      const puid2 = debug && debug.osab && debug.osab.persist ? String(debug.osab.persist.persistedUniqueID || "") : "";
+      const delayRead = function (delayMs) {
+        try {
+          const rr = mcsFetchFrom(prefer2);
+          if (!rr || !rr.c) return;
+          const c = rr.c;
+          const out = { delayMs: Number(delayMs) | 0, refetchSel: String(rr.usedSel || "") };
+          try {
+            const s1 = "- givenName";
+            if (_objcCanCall(c, s1)) {
+              const v = _safeObj(c[s1]());
+              if (v) out.givenName = String(v);
+            }
+          } catch (_) {}
+          try {
+            const s0 = "- cachedFullName";
+            if (_objcCanCall(c, s0)) {
+              const v = _safeObj(c[s0]());
+              if (v) out.cachedFullName = String(v);
+            }
+          } catch (_) {}
+          try {
+            const osIdSel = "- osAddressBookContactID";
+            if (_objcCanCall(c, osIdSel)) {
+              const v = _safeObj(c[osIdSel]());
+              if (v) out.osAddressBookContactID = String(v);
+            }
+          } catch (_) {}
+          send({
+            ok: true,
+            ts: Date.now(),
+            op_id: opId2,
+            opId: opId2,
+            type: "wa.tx.contact_note_upsert.result",
+            build: build2,
+            status: "debug",
+            debugPhase: "delayed_read",
+            chatJid: chatJid2,
+            contactPhoneJid: contactPhoneJid2,
+            prefer: prefer2,
+            debug: {
+              osab: { persist: { persistedUniqueID: puid2 } },
+              afterDelay: out
+            }
+          });
+        } catch (_) {}
+      };
+      setTimeout(function () { delayRead(1200); }, 1200);
+      if (ENABLE_DELAYED_READ_6000MS) setTimeout(function () { delayRead(6000); }, 6000);
+    }
+  } catch (_) {}
+
+  try {
+    if (saveToOSAddressBook && altPn && altPn.handle && contactToSave.handle && !altPn.handle.equals(contactToSave.handle)) {
+      const altClass = String(altPn.$className || "");
+      const altOrig = (_objcCanCall(altPn, "- copy")) ? _safeObj(altPn["- copy"]()) : null;
+      if (altOrig) {
+        let altBefore = "";
+        try {
+          if (_objcCanCall(altPn, "- givenName")) {
+            const v = _safeObj(altPn["- givenName"]());
+            if (v) altBefore = String(v);
+          }
+        } catch (_) {}
+        try {
+          debug.osab = debug.osab || {};
+          debug.osab.altPn = debug.osab.altPn || {};
+          const setGivenSel = "- setGivenName:";
+          debug.osab.altPn.hasSetGivenName = _objcCanCall(altPn, setGivenSel);
+          if (debug.osab.altPn.hasSetGivenName) {
+            altPn[setGivenSel](nsName);
+            debug.osab.altPn.setterUsed = "altPn.setGivenName:";
+          }
+        } catch (_) {}
+        try {
+          debug.osab = debug.osab || {};
+          debug.osab.altPn = debug.osab.altPn || {};
+          const syncSelAlt = "- setSyncWithServerState:";
+          debug.osab.altPn.hasSetSyncWithServerState = _objcCanCall(altPn, syncSelAlt);
+          if (debug.osab.altPn.hasSetSyncWithServerState) {
+            altPn[syncSelAlt](1);
+          }
+        } catch (_) {}
+        chatManager[saveSel](altPn, altOrig, 1, ptr("0x0"));
+        debug.osab.altPn.saved = true;
+        debug.osab.altPn.altClass = altClass;
+        debug.osab.altPn.altBeforeGivenName = altBefore;
+      } else {
+        debug.osab.altPn.saved = false;
+        debug.osab.altPn.error = "altPn copy nil";
+      }
+    }
+  } catch (_) {}
+
+  let afterRead = {};
+  try {
+    try {
+      if (saveToOSAddressBook && ObjC.available && ObjC.classes.NSThread && ObjC.classes.NSThread.sleepForTimeInterval_) {
+        ObjC.classes.NSThread.sleepForTimeInterval_(0.2);
+      }
+    } catch (_) {}
+    try {
+      const s9 = "- contactName";
+      if (_objcCanCall(contactToSave, s9)) {
+        const v = _safeObj(contactToSave[s9]());
+        if (v) afterRead.contactName = String(v);
+      }
+    } catch (_) {}
+    const s1 = "- givenName";
+    if (_objcCanCall(contactToSave, s1)) {
+      const v = _safeObj(contactToSave[s1]());
+      if (v) afterRead.givenName = String(v);
+    }
+    const s2 = "- familyName";
+    if (_objcCanCall(contactToSave, s2)) {
+      const v = _safeObj(contactToSave[s2]());
+      if (v) afterRead.familyName = String(v);
+    }
+    const s3 = "- businessName";
+    if (_objcCanCall(contactToSave, s3)) {
+      const v = _safeObj(contactToSave[s3]());
+      if (v) afterRead.businessName = String(v);
+    }
+    const s4 = "- sectionTitle";
+    if (_objcCanCall(contactToSave, s4)) {
+      const v = _safeObj(contactToSave[s4]());
+      if (v) afterRead.sectionTitle = String(v);
+    }
+    const s5 = "- cachedFullName";
+    if (_objcCanCall(contactToSave, s5)) {
+      const v = _safeObj(contactToSave[s5]());
+      if (v) afterRead.cachedFullName = String(v);
+    }
+    const s6 = "- fullName";
+    if (_objcCanCall(contactToSave, s6)) {
+      const n = _safeObj(contactToSave[s6]());
+      if (n) afterRead.fullNameObjClass = String(n.$className || "");
+    }
+    if (saveToOSAddressBook && mcsFetchFrom) {
+      const rr = mcsFetchFrom(prefer);
+      if (rr && rr.c) {
+        afterRead.refetchSel = String(rr.usedSel || "");
+        try {
+          if (_objcCanCall(rr.c, s1)) {
+            const v = _safeObj(rr.c[s1]());
+            if (v) afterRead.refetchGivenName = String(v);
+          }
+        } catch (_) {}
+        try {
+          const s0 = "- cachedFullName";
+          if (_objcCanCall(rr.c, s0)) {
+            const v = _safeObj(rr.c[s0]());
+            if (v) afterRead.refetchCachedFullName = String(v);
+          }
+        } catch (_) {}
+      }
+    }
+  } catch (_) {}
 
   return {
     ok: true,
     status: "success",
+    matched: { prefer: prefer, fetchSel: fetchSel },
     before: { fullName: beforeFullName },
-    after: { fullName: afterFullName }
+    after: { fullName: targetFullName },
+    fetchSel: fetchSel,
+    retrSel: retrSel,
+    abPropsFrom: abPropsFrom,
+    abPropsClass: abPropsClass,
+    debug: debug,
+    prefer: prefer,
+    saveToOSAddressBook: saveToOSAddressBook,
+    afterRead: afterRead,
+    wrapperClass: wrapperClass,
+    contactClass: contactClass,
+    fullNameClass: fullNameClass,
+    setterUsed: setterUsed
   };
 }
 
 function _contactsNoteHandleMsg(message) {
   const p = message && message.payload ? message.payload : (message || {});
-  const opId = String(p.opId || p.op_id || "");
-  const chatJid = String(p.chatJid || p.chatJidStr || "");
-  const contactPhoneJid = String(p.contactPhoneJid || "");
-  const phoneDigits = String(p.phoneDigits || "");
-  if (!opId) {
-    _contactsNoteEmitResult(opId, chatJid, contactPhoneJid, phoneDigits, { ok: false, status: "failed", error: "missing opId" }, null);
-    return;
-  }
   try { waitready(); } catch (_) {}
-  const timeoutMs = Number(p.timeoutMs || 15000) | 0;
-  const res = _runOnMainQueueSync(() => _contactsNoteUpsertFullNameOnMain(p), timeoutMs);
-  if (res && res.ok) {
-    _contactsNoteEmitResult(opId, chatJid, contactPhoneJid, phoneDigits, res, null);
-    return;
+  const opId = String(p.opId || p.op_id || "").trim();
+  const chatJid = String(p.chatJid || "").trim();
+  const contactPhoneJid = String(p.contactPhoneJid || "").trim();
+  const phoneDigits = String(p.phoneDigits || "").trim();
+  let res = null;
+  try {
+    res = _contactsNoteUpsertFullNameOnMain(p);
+  } catch (e) {
+    res = { ok: false, status: "failed", error: String(e) };
   }
-  _contactsNoteEmitResult(opId, chatJid, contactPhoneJid, phoneDigits, res || { ok: false, status: "failed", error: "failed" }, null);
+  try {
+    const r = (res && typeof res === "object") ? Object.assign({}, res) : { ok: false, status: "failed", error: "no result" };
+    if (r.waOk === undefined) r.waOk = !!(r && r.ok);
+    if (r.osOk === undefined) {
+      const saveToOS = (r && r.saveToOSAddressBook !== undefined) ? ((Number(r.saveToOSAddressBook) | 0) ? 1 : 0) : 1;
+      const osSaved = !!(r && r.debug && r.debug.osSaved === true);
+      r.osOk = saveToOS ? osSaved : true;
+    }
+    _contactsNoteEmitResult(opId, chatJid, contactPhoneJid, phoneDigits, r, null);
+  } catch (_) {}
 }
 
 function _contactsNoteLoop() {
@@ -2462,6 +4135,99 @@ function _contactsNoteLoop() {
 }
 
 try { setImmediate(_contactsNoteLoop); } catch (_) {}
+
+function _contactsAddEmitResult(opId, chatJid, phoneE164, givenName, res, extraErr) {
+  try {
+    const ok = !!(res && res.ok);
+    const status = String((res && res.status) ? res.status : (ok ? "ok" : "failed"));
+    const err = ok ? "" : String((res && res.error) ? res.error : (extraErr ? extraErr : "failed"));
+    const refresh = (res && res.refresh && typeof res.refresh === "object") ? res.refresh : null;
+    send({
+      type: "wa.tx.contact_add.result",
+      build: SCRIPT_BUILD_ID,
+      ts: Date.now(),
+      opId: String(opId || ""),
+      op_id: String(opId || ""),
+      jid: String(chatJid || ""),
+      chatJid: String(chatJid || ""),
+      phoneE164: String(phoneE164 || ""),
+      givenName: String(givenName || ""),
+      ok: ok,
+      status: status,
+      error: err,
+      existed: !!(res && res.existed),
+      identifier: String((res && res.identifier) ? res.identifier : ""),
+      refresh: refresh
+    });
+  } catch (_) {}
+}
+
+function _contactsNotifyContactStoreDidChange() {
+  try {
+    if (!ObjC.available) return { ok: false, build: SCRIPT_BUILD_ID, error: "ObjC not available" };
+    const r = _runOnMainQueueSync(function () {
+      const core = _resolveCoreFixed();
+      if (!core || !core.ok) return { ok: false, build: SCRIPT_BUILD_ID, error: core ? core.error : "core failed" };
+      const ctxMain = core.ctxMain;
+      const chatManager = (_objcCanCall(ctxMain, "- chatManager")) ? _safeObj(ctxMain["- chatManager"]()) : null;
+      if (!chatManager) return { ok: false, build: SCRIPT_BUILD_ID, error: "ctxMain.chatManager nil" };
+      const selNotify = "- notifyContactStoreDidChange";
+      if (!_objcCanCall(chatManager, selNotify)) return { ok: false, build: SCRIPT_BUILD_ID, error: "chatManager missing notifyContactStoreDidChange" };
+      let before = null;
+      let after = null;
+      try {
+        if (_objcCanCall(chatManager, "- ignoreAddressBookChangeNotifications")) before = !!chatManager["- ignoreAddressBookChangeNotifications"]();
+      } catch (_) { before = null; }
+      try { chatManager[selNotify](); } catch (e) { return { ok: false, build: SCRIPT_BUILD_ID, error: "notifyContactStoreDidChange failed: " + String(e) }; }
+      try {
+        if (_objcCanCall(chatManager, "- ignoreAddressBookChangeNotifications")) after = !!chatManager["- ignoreAddressBookChangeNotifications"]();
+      } catch (_) { after = null; }
+      return { ok: true, build: SCRIPT_BUILD_ID, invoked: true, beforeIgnore: before, afterIgnore: after };
+    }, 2500);
+    return r && r.ok !== undefined ? r : { ok: false, build: SCRIPT_BUILD_ID, error: (r && r.error) ? r.error : "failed" };
+  } catch (e) {
+    return { ok: false, build: SCRIPT_BUILD_ID, error: String(e) };
+  }
+}
+
+function _contactsAddHandleMsg(message) {
+  const p = message && message.payload ? message.payload : (message || {});
+  try { waitready(); } catch (_) {}
+  const opId = String(p.opId || p.op_id || "").trim();
+  const chatJid = String(p.chatJid || p.jid || "").trim();
+  const phoneRaw = String(p.phoneRaw || p.phone_raw || "").trim();
+  const phoneE164 = String(p.phoneE164 || p.phone || "").trim();
+  const givenName = String(p.givenName || "").trim();
+  if (!opId || !phoneE164) {
+    _contactsAddEmitResult(opId, chatJid, phoneE164, givenName, { ok: false, status: "failed", error: "missing opId/phoneE164" }, null);
+    return;
+  }
+  let res = null;
+  try {
+    res = csabcnupsertgivenphone(phoneE164, givenName || "联系人", phoneRaw || phoneE164);
+  } catch (e) {
+    res = { ok: false, status: "failed", error: String(e) };
+  }
+  try {
+    if (res && res.ok) {
+      const digits = _normalizePhoneE164Like(phoneE164).replace(/[^\d]/g, "");
+      const phoneJid = digits ? (digits + "@s.whatsapp.net") : "";
+      const rr = _contactsNotifyContactStoreDidChange();
+      const wr = phoneJid ? csabsetgivennamejid_writecontext(phoneJid, givenName || "联系人", 1) : { ok: false, build: SCRIPT_BUILD_ID, error: "phoneJid empty", chatJid: "" };
+      res.refresh = { notifyContactStoreDidChange: rr, writeContext: wr, phoneJid: phoneJid };
+    }
+  } catch (_) {}
+  _contactsAddEmitResult(opId, chatJid, phoneE164, givenName, res, null);
+}
+
+function _contactsAddLoop() {
+  recv("qqw.contacts_add", function (message) {
+    try { _contactsAddHandleMsg(message); } catch (_) {}
+    _contactsAddLoop();
+  }).wait();
+}
+
+try { setImmediate(_contactsAddLoop); } catch (_) {}
 
 function _txHandleMsg(message) {
   const p = message && message.payload ? message.payload : (message || {});
@@ -2659,7 +4425,7 @@ function _msgLoop() {
 
 try { setImmediate(_msgLoop); } catch (_) {}
 
-const RX_STATE = { installed: false, error: null, installedAt: null, waVersion: null };
+const RX_STATE = { installed: false, error: null, installedAt: null, waVersion: null, mode: "", objcHooks: null };
 const RX_SAMPLE = { enabled: false, msg_kind: "unknown", quoted_kind: "none", quoted_stanza_id: "" };
 
 function RX_objcAvailable() { try { return !!(ObjC && ObjC.available); } catch (_) { return false; } }
@@ -3336,14 +5102,17 @@ function RX_pickBestNSDataCandidate(cands) {
 
 const RX_CONFIG = {
   moduleNameHints: ["WhatsApp", "WhatsAppDecrypted", "WhatsApp_Decrypted"],
-  rva: 0x369625C,
+  rva: 0x3aeeef0,
   cmdSelectors: [
     "reallyProcessResultsAfterSignalForContext:plaintextProtobuf:originalMessageData:notificationBehavior:journalID:error:retryCount:origin:reportEmptyPlaintextError:",
     "processResultsAfterSignalForContext:plaintextProtobuf:originalMessageData:notificationBehavior:journalID:error:retryCount:origin:reportEmptyPlaintextError:",
   ],
+  enableObjcFallback: false,
   limits: { maxEvents: 0, maxLinesPerSecond: 60 },
   protobuf: { hardCapBytes: 256 * 1024, alwaysEmitB64: true },
 };
+
+const RX_ENABLED_DEFAULT = true;
 
 const RX_AUTO_READ = { enabled: true, minIntervalMs: 3000, lastByChat: new Map() };
 const RX_AUTO_READ_INFLIGHT = new Map();
@@ -3556,6 +5325,110 @@ function RX_scheduleAutoRead(chatJid, stanzaId, senderJid, isGroup, fromMe) {
   } catch (_) {}
 }
 
+function RX_installObjCBySelectors(selectors) {
+  try {
+    if (!RX_objcAvailable()) throw new Error("ObjC unavailable");
+    const sels = (selectors || []).map(s => String(s)).filter(Boolean);
+    if (!sels.length) throw new Error("no selectors");
+    const loaded = ObjC.enumerateLoadedClassesSync();
+    const classNames = [];
+    for (const k of Object.keys(loaded || {})) {
+      const arr = loaded[k] || [];
+      for (let i = 0; i < arr.length; i++) classNames.push(String(arr[i] || ""));
+    }
+    const hooks = [];
+    for (let i = 0; i < classNames.length; i++) {
+      const cn = classNames[i];
+      if (!cn || !(cn.startsWith("WA") || cn.indexOf("WA") !== -1)) continue;
+      const cls = ObjC.classes[cn];
+      if (!cls) continue;
+      for (let j = 0; j < sels.length; j++) {
+        const sel = sels[j];
+        const m = cls["- " + sel];
+        if (!m || !m.implementation) continue;
+        const impl = m.implementation;
+        if (hooks.find(h => h.impl && h.impl.equals && h.impl.equals(impl))) continue;
+        Interceptor.attach(impl, {
+          onEnter(args) {
+            try {
+              RX_STATE.hitsTotal = (Number(RX_STATE.hitsTotal) || 0) + 1;
+              RX_STATE.lastHitTs = Date.now();
+              let cmdSel = null;
+              try { cmdSel = ObjC.selectorAsString(args[1]); } catch (_) { cmdSel = null; }
+              RX_STATE.lastCmdSel = cmdSel ? String(cmdSel) : "";
+              const ctxPtr = args[2];
+              const arg3Ptr = args[3];
+              const arg4Ptr = args[4];
+              const arg5Ptr = args[5];
+              const stanza = RX_extractStanzaFieldsFromContext(ctxPtr);
+              const cand3 = RX_tryReadNSDataAll(arg3Ptr, RX_CONFIG.protobuf.hardCapBytes);
+              const cand4 = RX_tryReadNSDataAll(arg4Ptr, RX_CONFIG.protobuf.hardCapBytes);
+              const best = RX_pickBestNSDataCandidate([
+                { source: "arg3", data: cand3 },
+                { source: "arg4", data: cand4 },
+              ]);
+              const data = best ? best.data : (cand3 || cand4);
+              const source = best ? best.source : (cand3 ? "arg3" : (cand4 ? "arg4" : null));
+              const bytes = best && best.bytes ? best.bytes : (data ? data.bytes : null);
+              const b64 = (bytes && RX_CONFIG.protobuf.alwaysEmitB64) ? RX_bytesToBase64(bytes) : "";
+              const proto = data ? {
+                len: data.totalLen,
+                truncated: data.truncated,
+                b64: b64 || null,
+                hexChunks: null,
+              } : null;
+              const parsed = best && best.parsed ? best.parsed : ((bytes && bytes.length) ? RX_extractPbFromProtoBytes(bytes) : null);
+              const chatJID = stanza.chatJID ? String(stanza.chatJID) : "";
+              const stanzaId = stanza.stanzaId ? String(stanza.stanzaId) : "";
+              const senderJID = stanza.senderJID ? String(stanza.senderJID) : "";
+              const statusAuthorJID = stanza.statusAuthorJID ? String(stanza.statusAuthorJID) : "";
+              const isGroup = (stanza.isGroup === true || stanza.isGroup === false) ? stanza.isGroup : null;
+              const fromMe = (stanza.isFromMe === true || stanza.isFromMe === false) ? stanza.isFromMe : null;
+              const uniqueKey = stanza.uniqueKey ? String(stanza.uniqueKey) : "";
+              const isStatus = (chatJID || "").toLowerCase() === "status@broadcast";
+              const participantJID = isStatus ? statusAuthorJID : senderJID;
+              send({
+                type: "wa.recv.update",
+                build: SCRIPT_BUILD_ID,
+                ts: Date.now(),
+                phase: "objc_post_decrypt_pinned_style",
+                data: {
+                  stanzaId: stanzaId,
+                  route: {
+                    via: "objc_post_decrypt",
+                    chatJID: chatJID,
+                    remoteChat: chatJID,
+                    participantJID: participantJID,
+                    statusAuthorJID: statusAuthorJID,
+                    isStatus: isStatus,
+                    fromMe: fromMe === true,
+                    isGroup: isGroup,
+                    uniqueKey: uniqueKey,
+                  },
+                  protobuf: proto,
+                  pb: parsed,
+                  diag: { cmdSel: cmdSel ? String(cmdSel) : null, protobufSource: proto ? source : null, waVersion: RX_STATE.waVersion ? String(RX_STATE.waVersion) : null },
+                  rawType: "wa.recv.objc_post_decrypt.pinned_style",
+                },
+              });
+              RX_STATE.hitsEmitted = (Number(RX_STATE.hitsEmitted) || 0) + 1;
+            } catch (_) {}
+          },
+        });
+        hooks.push({ className: cn, selector: sel, impl: impl });
+        if (hooks.length >= 6) break;
+      }
+      if (hooks.length >= 6) break;
+    }
+    RX_STATE.objcHooks = hooks;
+    RX_STATE.mode = hooks.length ? "objc" : (RX_STATE.mode || "");
+    return hooks.length;
+  } catch (e) {
+    RX_STATE.objcHooks = RX_STATE.objcHooks || [];
+    return 0;
+  }
+}
+
 function RX_install() {
   try {
     if (!RX_objcAvailable()) throw new Error("ObjC unavailable");
@@ -3573,6 +5446,8 @@ function RX_install() {
     Interceptor.attach(addr, {
       onEnter(args) {
         try {
+          RX_STATE.hitsTotal = (Number(RX_STATE.hitsTotal) || 0) + 1;
+          RX_STATE.lastHitTs = Date.now();
           const maxEvents = Number(RX_CONFIG.limits.maxEvents) || 0;
           if (maxEvents > 0 && events >= maxEvents) return;
           const tid = Process.getCurrentThreadId();
@@ -3590,8 +5465,12 @@ function RX_install() {
 
           let cmdSel = null;
           try { cmdSel = ObjC.selectorAsString(args[1]); } catch (_) { cmdSel = null; }
+          RX_STATE.lastCmdSel = cmdSel ? String(cmdSel) : "";
           if (RX_CONFIG.cmdSelectors && RX_CONFIG.cmdSelectors.length) {
-            if (!cmdSel || RX_CONFIG.cmdSelectors.indexOf(String(cmdSel)) === -1) return;
+            if (!cmdSel || RX_CONFIG.cmdSelectors.indexOf(String(cmdSel)) === -1) {
+              RX_STATE.hitsFiltered = (Number(RX_STATE.hitsFiltered) || 0) + 1;
+              return;
+            }
           }
 
           const ctxPtr = args[2];
@@ -3602,16 +5481,14 @@ function RX_install() {
           const doWork = () => {
             try {
               const stanza = RX_extractStanzaFieldsFromContext(ctxPtr);
-              const cand3 = RX_tryReadNSDataAll(arg3Ptr, RX_CONFIG.protobuf.hardCapBytes);
-              const cand4 = RX_tryReadNSDataAll(arg4Ptr, RX_CONFIG.protobuf.hardCapBytes);
-              const cand5 = RX_tryReadNSDataAll(arg5Ptr, RX_CONFIG.protobuf.hardCapBytes);
+          const cand3 = RX_tryReadNSDataAll(arg3Ptr, RX_CONFIG.protobuf.hardCapBytes);
+          const cand4 = RX_tryReadNSDataAll(arg4Ptr, RX_CONFIG.protobuf.hardCapBytes);
               const best = RX_pickBestNSDataCandidate([
                 { source: "arg3", data: cand3 },
                 { source: "arg4", data: cand4 },
-                { source: "arg5", data: cand5 },
               ]);
-              const data = best ? best.data : (cand3 || cand4 || cand5);
-              const source = best ? best.source : (cand3 ? "arg3" : (cand4 ? "arg4" : (cand5 ? "arg5" : null)));
+          const data = best ? best.data : (cand3 || cand4);
+          const source = best ? best.source : (cand3 ? "arg3" : (cand4 ? "arg4" : null));
               const bytes = best && best.bytes ? best.bytes : (data ? data.bytes : null);
               const b64 = (bytes && RX_CONFIG.protobuf.alwaysEmitB64) ? RX_bytesToBase64(bytes) : "";
               const proto = data ? {
@@ -3634,8 +5511,8 @@ function RX_install() {
 
               try {
                 const tid = Process.getCurrentThreadId();
-                if (reentry[tid] && typeof reentry[tid] === "object") {
-                  reentry[tid].autoRead = { chatJID: chatJID, stanzaId: stanzaId, senderJID: senderJID, isGroup: isGroup, fromMe: fromMe };
+            if (reentry[tid] && typeof reentry[tid] === "object") {
+              reentry[tid].autoRead = { chatJID: chatJID, stanzaId: stanzaId, senderJID: senderJID, isGroup: isGroup, fromMe: fromMe };
                 }
               } catch (_) {}
               send({
@@ -3661,6 +5538,7 @@ function RX_install() {
                   rawType: "wa.recv.native_post_decrypt.pinned_style",
                 },
               });
+              RX_STATE.hitsEmitted = (Number(RX_STATE.hitsEmitted) || 0) + 1;
               if (RX_SAMPLE.enabled) {
                 send({
                   type: "qqw.sample",
@@ -3703,6 +5581,16 @@ function RX_install() {
     RX_STATE.installed = true;
     RX_STATE.installedAt = String(addr);
     RX_STATE.error = null;
+    RX_STATE.mode = "rva";
+    setTimeout(() => {
+      try {
+        if (!RX_STATE.installed) return;
+        if ((Number(RX_STATE.hitsTotal) || 0) > 0) return;
+        if (RX_STATE.mode === "objc") return;
+        if (!RX_CONFIG.enableObjcFallback) return;
+        RX_installObjCBySelectors(RX_CONFIG.cmdSelectors);
+      } catch (_) {}
+    }, 5000);
   } catch (e) {
     RX_STATE.installed = false;
     RX_STATE.error = String(e);
@@ -3710,7 +5598,7 @@ function RX_install() {
 }
 
 setImmediate(() => {
-  try { RX_install(); } catch (_) {}
+  try { if (RX_ENABLED_DEFAULT) RX_install(); } catch (_) {}
 });
 
 setInterval(() => {
@@ -3723,6 +5611,16 @@ setInterval(() => {
       rxInstalled: !!RX_STATE.installed,
       rxErr: RX_STATE.error ? String(RX_STATE.error) : "",
       waVersion: RX_STATE.waVersion ? String(RX_STATE.waVersion) : "",
+      rxHit: {
+        total: Number(RX_STATE.hitsTotal) || 0,
+        emitted: Number(RX_STATE.hitsEmitted) || 0,
+        filtered: Number(RX_STATE.hitsFiltered) || 0,
+        lastTs: Number(RX_STATE.lastHitTs) || 0,
+        lastCmdSel: RX_STATE.lastCmdSel ? String(RX_STATE.lastCmdSel) : "",
+        mode: RX_STATE.mode ? String(RX_STATE.mode) : "",
+        objcHooks: (RX_STATE.objcHooks && RX_STATE.objcHooks.length) ? RX_STATE.objcHooks.length : 0,
+        rva: Number(RX_CONFIG.rva) || 0,
+      },
       autoRead: {
         recv: RX_AUTO_READ_STATS.recv | 0,
         filtered: RX_AUTO_READ_STATS.filtered | 0,

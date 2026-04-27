@@ -181,6 +181,7 @@ type TxContactNoteUpsertPayload struct {
 type TxContactAddPayload struct {
 	OpID        string `json:"opId"`
 	ChatJid     string `json:"chatJid"`
+	PhoneRaw    string `json:"phoneRaw,omitempty"`
 	PhoneE164   string `json:"phoneE164"`
 	GivenName   string `json:"givenName"`
 	UpdatedAtMs int64  `json:"updatedAtMs,omitempty"`
@@ -1024,10 +1025,11 @@ on conflict (device_id) do update set
 		}
 		req.OpID = strings.TrimSpace(req.OpID)
 		req.ChatJid = strings.TrimSpace(req.ChatJid)
+		req.PhoneRaw = strings.TrimSpace(req.PhoneRaw)
 		req.PhoneE164 = strings.TrimSpace(req.PhoneE164)
 		req.GivenName = strings.TrimSpace(req.GivenName)
-		if req.OpID == "" || req.ChatJid == "" || req.PhoneE164 == "" {
-			http.Error(w, "opId/chatJid/phoneE164 required", http.StatusBadRequest)
+		if req.OpID == "" || req.PhoneE164 == "" {
+			http.Error(w, "opId/phoneE164 required", http.StatusBadRequest)
 			return
 		}
 		if req.TimeoutMs <= 0 {

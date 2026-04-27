@@ -30,6 +30,8 @@ function _objcGetRuntimeFns() {
     out.ivar_getName = get("ivar_getName", "pointer", ["pointer"]);
     out.ivar_getOffset = get("ivar_getOffset", "ulong", ["pointer"]);
     out.ivar_getTypeEncoding = get("ivar_getTypeEncoding", "pointer", ["pointer"]);
+    out.objc_retain = get("objc_retain", "pointer", ["pointer"]);
+    out.objc_release = get("objc_release", "void", ["pointer"]);
     try {
       const pFree = Module.findExportByName(null, "free");
       out.free = pFree ? new NativeFunction(pFree, "void", ["pointer"]) : null;
@@ -343,6 +345,8 @@ const RX_PINNED = { installed: false, err: "", installedAt: 0, events: 0, maxEve
 const STATUS_MSG_PROBE = { installed: false, err: "", installedAt: 0, count: 0, last: null, lastN: [], maxLastN: 50, _hs: [], msgByKey: {}, msgKeys: [], maxMsgKeys: 200 };
 const SEND_PROBE = { installed: false, err: "", last: null, count: 0, _ls: [], hooked: [] };
 const LIKE_PROBE = { installed: false, err: "", last: null, count: 0, _h: null, retainedPtr: "0x0", retainedConnPtr: "0x0", lastText: "" };
+const MSG10_PROBE = { installed: false, err: "", count: 0, maxEvents: 200, lastN: [], maxLastN: 50, _h: null, _sel: {}, byObj: {}, byObjKeys: [], maxByObjKeys: 2000, includeBacktrace: false };
+const ADDCONTACT_PROBE = { installed: false, err: "", count: 0, maxEvents: 200, lastN: [], maxLastN: 50, _h: null };
 const STATUS_LIKE = { template: null, last: null, armedUntilMs: 0, lastXMPP: null };
 const XMPP_SEND = { last: null };
 const LIKE_BUILD = { installed: false, err: "", armedUntilMs: 0, events: [], maxEvents: 200, _hs: [], last: null, retained: [], templateStanzaPtr: "0x0" };
@@ -7728,7 +7732,7 @@ function _statusInstallMsgIdHook() {
     if (!cls) return { ok: false, error: "WAMessageID missing" };
     const m = cls[STATUS_FIXED.msgIdInitUsingStanzaIdSelector];
     if (!m || !m.implementation) return { ok: false, error: "msgid selector missing" };
-    Interceptor.attach(m.implementation, {
+    const l0 = Interceptor.attach(m.implementation, {
       onEnter(args) {
         try {
           const msgPtr = String(args[2] || "");
@@ -8495,6 +8499,35 @@ const REVOKE_TRACE = {
 
 const REVOKE_PROBE = { installed: false, err: "", last: null, count: 0, _ls: [] };
 
+const CS_FETCH_PROBE = { installed: false, err: "", last: null, count: 0, _ls: [] };
+const CONTACTS_PIPE_PROBE = { installed: false, err: "", last: null, count: 0, _ls: [], lastByTid: {} };
+const CONTACTS_CHAIN_PROBE = { installed: false, err: "", last: null, count: 0, _ls: [], lastByTid: {}, lastAny: null, emit: false };
+const CS_CTX_LAST = { ts: 0, selfPtr: "0x0", uniqueIDsPtr: "0x0", inContextPtr: "0x0", predicatePtr: "0x0", returnAddress: "0x0", off: "", selfClass: "", uniqueIDsClass: "", inContextClass: "" };
+const PROXY_CALL_PROBE = { installed: false, err: "", last: null, count: 0, _ls: [] };
+const CS_IVARS_ONCE = { sent: {}, last: null };
+const CS_SELF_FIELDS_ONCE = { sent: {}, last: null };
+const CS_USERCTX_IVARS_ONCE = { sent: {}, last: null };
+const CS_FETCH_RET = { ts: 0, retPtr: "0x0", retClass: "", retainedPtr: "0x0" };
+const CS_FETCH_VALUE = { ts: 0, keyPtr: "0x0", keyClass: "", valuePtr: "0x0", valueClass: "", retainedValuePtr: "0x0" };
+
+function _cfGetFns() {
+  const out = {};
+  try {
+    const get = (lib, name, ret, args) => {
+      try {
+        const p = Module.findExportByName(lib, name) || Module.findExportByName(null, name);
+        if (!p) return null;
+        return new NativeFunction(p, ret, args);
+      } catch (_) {
+        return null;
+      }
+    };
+    out.CFDictionaryGetCount = get("CoreFoundation", "CFDictionaryGetCount", "long", ["pointer"]);
+    out.CFDictionaryApplyFunction = get("CoreFoundation", "CFDictionaryApplyFunction", "void", ["pointer", "pointer", "pointer"]);
+  } catch (_) {}
+  return out;
+}
+
 function _safeObj(p) {
   try {
     if (!objcAvailable() || !p) return null;
@@ -8509,6 +8542,1842 @@ function _safeObj(p) {
 
 function _safeDesc(o) {
   try { return o ? String(o) : ""; } catch (_) { return ""; }
+}
+
+function csFetchProbeOn() {
+  if (!objcAvailable()) return { ok: false, error: "objc_unavailable" };
+  if (CS_FETCH_PROBE.installed) return { ok: true, installed: true, count: CS_FETCH_PROBE.count, err: CS_FETCH_PROBE.err || "" };
+  CS_FETCH_PROBE.err = "";
+  try {
+    const cls = ObjC.classes.WAContactsStorage;
+    if (!cls) return { ok: false, error: "WAContactsStorage missing" };
+    const sel = "- fetchAddressBookContactsForUniqueIDs:inContext:filteringPredicate:";
+    const m = cls[sel];
+    if (!m || !m.implementation) return { ok: false, error: "method missing", selector: sel };
+    const l0 = Interceptor.attach(m.implementation, {
+      onEnter(args) {
+        try {
+          const ts = nowMs();
+          const tid = (function () { try { return Process.getCurrentThreadId(); } catch (_) { return 0; } })();
+          const pSelf = ptr(args[0]);
+          const pSel = ptr(args[1]);
+          const pUnique = ptr(args[2]);
+          const pCtx = ptr(args[3]);
+          const pPred = ptr(args[4]);
+          let ret = ptr("0x0");
+          let retMod = null;
+          let retOff = "";
+          try {
+            ret = ptr(this.returnAddress);
+            retMod = Process.findModuleByAddress(ret);
+            if (retMod && retMod.base) retOff = ret.sub(retMod.base).toString();
+          } catch (_) {}
+
+          const probe = {
+            ts: ts,
+            tid: tid,
+            selfPtr: pSelf.toString(),
+            selPtr: pSel.toString(),
+            uniqueIDsPtr: pUnique.toString(),
+            inContextPtr: pCtx.toString(),
+            filteringPredicatePtr: pPred.toString(),
+            returnAddress: ret.toString(),
+            returnModule: retMod ? { name: String(retMod.name || ""), base: ptr(retMod.base).toString(), off: retOff } : null,
+            selfClass: _objcClassNameNoTouch(pSelf),
+            uniqueIDsClass: _objcClassNameNoTouch(pUnique),
+            inContextClass: _objcClassNameNoTouch(pCtx),
+            filteringPredicateClass: _objcClassNameNoTouch(pPred),
+          };
+          try {
+            CS_CTX_LAST.ts = ts;
+            CS_CTX_LAST.selfPtr = probe.selfPtr;
+            CS_CTX_LAST.uniqueIDsPtr = probe.uniqueIDsPtr;
+            CS_CTX_LAST.inContextPtr = probe.inContextPtr;
+            CS_CTX_LAST.predicatePtr = probe.filteringPredicatePtr;
+            CS_CTX_LAST.returnAddress = probe.returnAddress;
+            CS_CTX_LAST.off = (probe.returnModule && probe.returnModule.off) ? String(probe.returnModule.off) : "";
+            CS_CTX_LAST.selfClass = probe.selfClass;
+            CS_CTX_LAST.uniqueIDsClass = probe.uniqueIDsClass;
+            CS_CTX_LAST.inContextClass = probe.inContextClass;
+          } catch (_) {}
+
+          try {
+            const key = String(probe.selfPtr || "");
+            if (key && !CS_IVARS_ONCE.sent[key]) {
+              CS_IVARS_ONCE.sent[key] = 1;
+              const ivSelf = _listIvarsNoTouch(probe.selfPtr, 160);
+              const ivUnique = _listIvarsNoTouch(probe.uniqueIDsPtr, 120);
+              const ivCtx = _listIvarsNoTouch(probe.inContextPtr, 200);
+              CS_IVARS_ONCE.last = { ts: ts, self: ivSelf, uniqueIDs: ivUnique, inContext: ivCtx };
+              send({ type: "qqw.explore.cs_fetch_ivars", ok: true, ts: ts, selfPtr: probe.selfPtr, uniqueIDsPtr: probe.uniqueIDsPtr, inContextPtr: probe.inContextPtr, ivars: CS_IVARS_ONCE.last });
+            }
+          } catch (_) {}
+
+          try {
+            const key = String(probe.selfPtr || "");
+            if (key && !CS_SELF_FIELDS_ONCE.sent[key]) {
+              CS_SELF_FIELDS_ONCE.sent[key] = 1;
+              const base = ptr(probe.selfPtr);
+              const readPtr = (off) => {
+                try {
+                  const a = base.add(off);
+                  if (!_isReadablePtr(a, Process.pointerSize)) return ptr("0x0");
+                  return Memory.readPointer(a);
+                } catch (_) {
+                  return ptr("0x0");
+                }
+              };
+              const pUserCtx = readPtr(224);
+              const pQueue = readPtr(240);
+              const pNC = readPtr(248);
+              const pWriteCtx = readPtr(264);
+              const rec = {
+                ts: ts,
+                selfPtr: probe.selfPtr,
+                selfClass: probe.selfClass,
+                userContextPtr: pUserCtx.toString(),
+                userContextClass: _objcClassNameNoTouch(pUserCtx),
+                contactsSerialQueuePtr: pQueue.toString(),
+                contactsSerialQueueClass: _objcClassNameNoTouch(pQueue),
+                notificationCenterPtr: pNC.toString(),
+                notificationCenterClass: _objcClassNameNoTouch(pNC),
+                writeContextPtr: pWriteCtx.toString(),
+                writeContextClass: _objcClassNameNoTouch(pWriteCtx),
+                inContextPtr: probe.inContextPtr,
+                inContextClass: probe.inContextClass,
+              };
+              CS_SELF_FIELDS_ONCE.last = rec;
+              send({ type: "qqw.explore.cs_fetch_self_fields", ok: true, ...rec });
+
+              const ucKey = String(rec.userContextPtr || "");
+              if (ucKey && ucKey !== "0x0" && !CS_USERCTX_IVARS_ONCE.sent[ucKey]) {
+                CS_USERCTX_IVARS_ONCE.sent[ucKey] = 1;
+                const ivUc = _listIvarsNoTouch(rec.userContextPtr, 260);
+                CS_USERCTX_IVARS_ONCE.last = { ts: ts, userContextPtr: rec.userContextPtr, userContextClass: rec.userContextClass, ivars: ivUc };
+                send({ type: "qqw.explore.cs_fetch_usercontext_ivars", ok: true, ...CS_USERCTX_IVARS_ONCE.last });
+              }
+            }
+          } catch (_) {}
+          try {
+            const chain = CONTACTS_CHAIN_PROBE.lastByTid[String(tid)] || null;
+            probe.chain = chain || null;
+          } catch (_) { probe.chain = null; }
+          try {
+            const p = CONTACTS_PIPE_PROBE.lastByTid[String(tid)] || null;
+            probe.pipeline = p || null;
+          } catch (_) { probe.pipeline = null; }
+
+          CS_FETCH_PROBE.last = probe;
+          CS_FETCH_PROBE.count++;
+          try {
+            const lastTs = Number(CS_FETCH_PROBE._lastSendTs || 0) | 0;
+            if (!lastTs || ts - lastTs >= 200) {
+              CS_FETCH_PROBE._lastSendTs = ts;
+              send({ type: "qqw.explore.cs_fetch_probe", ok: true, ...probe });
+            }
+          } catch (_) {}
+        } catch (e) {
+          try { send({ type: "qqw.explore.cs_fetch_probe", ok: false, error: String(e) }); } catch (_) {}
+        }
+      }
+      ,
+      onLeave(retval) {
+        try {
+          const ts = nowMs();
+          const ret = ptr(retval);
+          const retClass = _objcClassNameNoTouch(ret);
+          let retainedPtr = ptr("0x0");
+          try {
+            const f = _objcGetRuntimeFns();
+            if (f.objc_retain && f.objc_release && ret && !ret.isNull()) {
+              retainedPtr = ptr(f.objc_retain(ret));
+              const prev = ptr(String(CS_FETCH_RET.retainedPtr || "0x0"));
+              if (!prev.isNull()) {
+                try { f.objc_release(prev); } catch (_) {}
+              }
+            }
+          } catch (_) { retainedPtr = ptr("0x0"); }
+
+          const rec = {
+            ts: ts,
+            retPtr: ret.toString(),
+            retClass: retClass,
+            retainedPtr: retainedPtr.toString(),
+            selfPtr: String(CS_CTX_LAST.selfPtr || "0x0"),
+            inContextPtr: String(CS_CTX_LAST.inContextPtr || "0x0"),
+            returnAddress: String(CS_CTX_LAST.returnAddress || "0x0"),
+            off: String(CS_CTX_LAST.off || ""),
+          };
+          CS_FETCH_PROBE.lastRet = rec;
+          try {
+            CS_FETCH_RET.ts = ts;
+            CS_FETCH_RET.retPtr = rec.retPtr;
+            CS_FETCH_RET.retClass = rec.retClass;
+            CS_FETCH_RET.retainedPtr = rec.retainedPtr;
+          } catch (_) {}
+          const lastTs = Number(CS_FETCH_PROBE._lastRetSendTs || 0) | 0;
+          if (!lastTs || ts - lastTs >= 200) {
+            CS_FETCH_PROBE._lastRetSendTs = ts;
+            send({ type: "qqw.explore.cs_fetch_ret", ok: true, ...rec });
+          }
+        } catch (e) {
+          try { send({ type: "qqw.explore.cs_fetch_ret", ok: false, error: String(e) }); } catch (_) {}
+        }
+      }
+    });
+    CS_FETCH_PROBE._ls.push(l0);
+    CS_FETCH_PROBE.installed = true;
+    return { ok: true, installed: true };
+  } catch (e) {
+    CS_FETCH_PROBE.err = String(e);
+    return { ok: false, error: CS_FETCH_PROBE.err };
+  }
+}
+
+function csFetchProbeGet() {
+  return { ok: true, installed: CS_FETCH_PROBE.installed, count: CS_FETCH_PROBE.count, last: CS_FETCH_PROBE.last, err: CS_FETCH_PROBE.err || "" };
+}
+
+function csFetchProbeOff() {
+  try {
+    const ls = CS_FETCH_PROBE._ls || [];
+    for (let i = 0; i < ls.length; i++) {
+      try { ls[i].detach(); } catch (_) {}
+    }
+  } catch (_) {}
+  CS_FETCH_PROBE._ls = [];
+  CS_FETCH_PROBE.installed = false;
+  return { ok: true };
+}
+
+function csFetchLastContextGet() {
+  try { return { ok: true, ...CS_CTX_LAST }; } catch (_) { return { ok: false, error: "failed" }; }
+}
+
+function csFetchRetGet() {
+  try { return { ok: true, ...CS_FETCH_RET }; } catch (_) { return { ok: false, error: "failed" }; }
+}
+
+function csFetchRetRelease() {
+  try {
+    const f = _objcGetRuntimeFns();
+    const p = ptr(String(CS_FETCH_RET.retainedPtr || "0x0"));
+    if (!p.isNull() && f.objc_release) {
+      try { f.objc_release(p); } catch (_) {}
+    }
+  } catch (_) {}
+  CS_FETCH_RET.retainedPtr = "0x0";
+  return { ok: true };
+}
+
+function csFetchDictPeek(maxN) {
+  try {
+    const dictPtr = ptr(String(CS_FETCH_RET.retainedPtr || "0x0"));
+    if (dictPtr.isNull()) return { ok: false, error: "no retained dict; trigger fetch first" };
+    const f = _cfGetFns();
+    if (!f.CFDictionaryGetCount || !f.CFDictionaryApplyFunction) return { ok: false, error: "CoreFoundation CFDictionary APIs missing" };
+    const n = Number(f.CFDictionaryGetCount(dictPtr)) | 0;
+    const cap = Math.max(1, Math.min(200, (maxN | 0) || 30));
+    const out = [];
+    const cb = new NativeCallback(function (k, v, ctx) {
+      try {
+        if (out.length >= cap) return;
+        const kp = ptr(k);
+        const vp = ptr(v);
+        out.push({
+          keyPtr: kp.toString(),
+          keyClass: _objcClassNameNoTouch(kp),
+          valuePtr: vp.toString(),
+          valueClass: _objcClassNameNoTouch(vp),
+        });
+      } catch (_) {}
+    }, "void", ["pointer", "pointer", "pointer"]);
+    f.CFDictionaryApplyFunction(dictPtr, cb, ptr("0x0"));
+    return { ok: true, count: n, shown: out.length, entries: out, dictPtr: dictPtr.toString(), dictClass: _objcClassNameNoTouch(dictPtr) };
+  } catch (e) {
+    return { ok: false, error: String(e) };
+  }
+}
+
+function csFetchValueGet() {
+  try { return { ok: true, ...CS_FETCH_VALUE }; } catch (_) { return { ok: false, error: "failed" }; }
+}
+
+function csFetchValueRelease() {
+  try {
+    const f = _objcGetRuntimeFns();
+    const p = ptr(String(CS_FETCH_VALUE.retainedValuePtr || "0x0"));
+    if (!p.isNull() && f.objc_release) {
+      try { f.objc_release(p); } catch (_) {}
+    }
+  } catch (_) {}
+  CS_FETCH_VALUE.retainedValuePtr = "0x0";
+  return { ok: true };
+}
+
+function csFetchValueCaptureFirst() {
+  try {
+    const dictPtr = ptr(String(CS_FETCH_RET.retainedPtr || "0x0"));
+    if (dictPtr.isNull()) return { ok: false, error: "no retained dict; trigger fetch first" };
+    const f = _cfGetFns();
+    if (!f.CFDictionaryGetCount || !f.CFDictionaryApplyFunction) return { ok: false, error: "CoreFoundation CFDictionary APIs missing" };
+    const n = Number(f.CFDictionaryGetCount(dictPtr)) | 0;
+    if (n <= 0) return { ok: false, error: "dict empty" };
+
+    let got = null;
+    const cb = new NativeCallback(function (k, v, ctx) {
+      try {
+        if (got) return;
+        const kp = ptr(k);
+        const vp = ptr(v);
+        got = { keyPtr: kp.toString(), keyClass: _objcClassNameNoTouch(kp), valuePtr: vp.toString(), valueClass: _objcClassNameNoTouch(vp) };
+      } catch (_) {}
+    }, "void", ["pointer", "pointer", "pointer"]);
+    f.CFDictionaryApplyFunction(dictPtr, cb, ptr("0x0"));
+    if (!got) return { ok: false, error: "no entry captured" };
+
+    let retained = ptr("0x0");
+    try {
+      const f2 = _objcGetRuntimeFns();
+      if (f2.objc_retain && f2.objc_release) {
+        const vp = ptr(got.valuePtr);
+        if (!vp.isNull()) retained = ptr(f2.objc_retain(vp));
+        const prev = ptr(String(CS_FETCH_VALUE.retainedValuePtr || "0x0"));
+        if (!prev.isNull()) {
+          try { f2.objc_release(prev); } catch (_) {}
+        }
+      }
+    } catch (_) {
+      retained = ptr("0x0");
+    }
+
+    const ts = nowMs();
+    CS_FETCH_VALUE.ts = ts;
+    CS_FETCH_VALUE.keyPtr = got.keyPtr;
+    CS_FETCH_VALUE.keyClass = got.keyClass;
+    CS_FETCH_VALUE.valuePtr = got.valuePtr;
+    CS_FETCH_VALUE.valueClass = got.valueClass;
+    CS_FETCH_VALUE.retainedValuePtr = retained.toString();
+
+    return { ok: true, ts: ts, dictPtr: dictPtr.toString(), dictClass: _objcClassNameNoTouch(dictPtr), count: n, ...CS_FETCH_VALUE };
+  } catch (e) {
+    return { ok: false, error: String(e) };
+  }
+}
+
+function csFetchValueIvars(maxN) {
+  try {
+    const p = ptr(String(CS_FETCH_VALUE.retainedValuePtr || "0x0"));
+    if (p.isNull()) return { ok: false, error: "no retained value; run csfetchvaluecapturefirst first" };
+    const lim = (maxN | 0) || 220;
+    const iv = _listIvarsNoTouch(p.toString(), lim);
+    return { ok: true, valuePtr: p.toString(), valueClass: _objcClassNameNoTouch(p), ivars: iv };
+  } catch (e) {
+    return { ok: false, error: String(e) };
+  }
+}
+
+function csFetchValueMethods(regex, maxN) {
+  try {
+    const p = ptr(String(CS_FETCH_VALUE.retainedValuePtr || "0x0"));
+    if (p.isNull()) return { ok: false, error: "no retained value; run csfetchvaluecapturefirst first" };
+    return _filterMethodsByRegex(p, regex, maxN);
+  } catch (e) {
+    return { ok: false, error: String(e) };
+  }
+}
+
+function _csGetWriteContextObj() {
+  try {
+    const p = ptr(String(CS_CTX_LAST.inContextPtr || "0x0"));
+    if (p.isNull()) return null;
+    return _safeObj(p);
+  } catch (_) {
+    return null;
+  }
+}
+
+function _csRunOnWriteContext(fn) {
+  try {
+    const moc = _csGetWriteContextObj();
+    if (!moc) return { ok: false, error: "missing writeContext (trigger save-note first)" };
+    if (objcHasSelector(moc, "performBlockAndWait:") && ObjC.Block) {
+      let out = null;
+      const blk = new ObjC.Block({ retType: "void", argTypes: [], implementation: function () { out = fn(moc); } });
+      try { moc.performBlockAndWait_(blk); } catch (_) { out = fn(moc); }
+      return out || { ok: false, error: "no result" };
+    }
+    return { ok: false, error: "writeContext missing performBlockAndWait:" };
+  } catch (e) {
+    return { ok: false, error: String(e) };
+  }
+}
+
+function csABContactGetFields() {
+  try {
+    const pContact = ptr(String(CS_FETCH_VALUE.retainedValuePtr || "0x0"));
+    if (pContact.isNull()) return { ok: false, error: "no retained value; run csfetchvaluecapturefirst first" };
+    return _csRunOnWriteContext(function () {
+      const c = _safeObj(pContact);
+      if (!c) return { ok: false, error: "contact object invalid", ptr: pContact.toString() };
+      const out = { ok: true, ptr: pContact.toString(), className: String(c.$className || "") };
+      try { if (objcHasSelector(c, "fullName")) out.fullName = String(c.fullName() || ""); } catch (_) {}
+      try { if (objcHasSelector(c, "givenName")) out.givenName = String(c.givenName() || ""); } catch (_) {}
+      try { if (objcHasSelector(c, "notes")) out.notes = String(c.notes() || ""); } catch (_) {}
+      try { if (objcHasSelector(c, "osAddressBookContactID")) out.osAddressBookContactID = String(c.osAddressBookContactID() || ""); } catch (_) {}
+      return out;
+    });
+  } catch (e) {
+    return { ok: false, error: String(e) };
+  }
+}
+
+function csABContactSetFullName(fullNameStr, allowExternalSideEffects, saveAfter) {
+  try {
+    const pContact = ptr(String(CS_FETCH_VALUE.retainedValuePtr || "0x0"));
+    if (pContact.isNull()) return { ok: false, error: "no retained value; run csfetchvaluecapturefirst first" };
+    const fullName = String(fullNameStr || "");
+    const allow = (Number(allowExternalSideEffects) | 0) ? 1 : 0;
+    const doSave = (saveAfter === undefined) ? 1 : ((Number(saveAfter) | 0) ? 1 : 0);
+    const ns = nsString(fullName);
+    if (!ns) return { ok: false, error: "fullName->NSString failed" };
+
+    return _csRunOnWriteContext(function (moc) {
+      const c = _safeObj(pContact);
+      if (!c) return { ok: false, error: "contact object invalid", ptr: pContact.toString() };
+      const out = { ok: true, ptr: pContact.toString(), className: String(c.$className || ""), allowExternalSideEffects: allow, saveAfter: doSave };
+      try { if (objcHasSelector(c, "fullName")) out.beforeFullName = String(c.fullName() || ""); } catch (_) {}
+
+      let used = "";
+      try {
+        if (objcHasSelector(c, "setFullName:allowExternalSideEffects:")) {
+          c.setFullName_allowExternalSideEffects_(ns, allow);
+          used = "setFullName:allowExternalSideEffects:";
+        } else if (objcHasSelector(c, "setFullName:")) {
+          c.setFullName_(ns);
+          used = "setFullName:";
+        }
+      } catch (e) {
+        return { ok: false, error: "set failed: " + String(e), before: out.beforeFullName || "" };
+      }
+      out.used = used || "";
+      try { if (objcHasSelector(c, "fullName")) out.afterFullName = String(c.fullName() || ""); } catch (_) {}
+
+      if (doSave) {
+        try {
+          if (!objcHasSelector(moc, "save:")) return { ok: false, error: "writeContext missing save:" };
+          const errPtr = Memory.alloc(Process.pointerSize);
+          Memory.writePointer(errPtr, ptr("0x0"));
+          const okSave = !!moc.save_(errPtr);
+          const eobj = _safeObj(Memory.readPointer(errPtr));
+          out.saved = okSave;
+          if (eobj) out.saveError = String(eobj);
+        } catch (e) {
+          return { ok: false, error: "save failed: " + String(e), used: out.used || "", after: out.afterFullName || "" };
+        }
+      } else {
+        out.saved = false;
+      }
+      return out;
+    });
+  } catch (e) {
+    return { ok: false, error: String(e) };
+  }
+}
+
+function csABContactSetGivenName(givenNameStr, saveAfter) {
+  try {
+    const pContact = ptr(String(CS_FETCH_VALUE.retainedValuePtr || "0x0"));
+    if (pContact.isNull()) return { ok: false, error: "no retained value; run csfetchvaluecapturefirst first" };
+    const givenName = String(givenNameStr || "");
+    const doSave = (saveAfter === undefined) ? 1 : ((Number(saveAfter) | 0) ? 1 : 0);
+    const ns = nsString(givenName);
+    if (!ns) return { ok: false, error: "givenName->NSString failed" };
+
+    return _csRunOnWriteContext(function (moc) {
+      const c = _safeObj(pContact);
+      if (!c) return { ok: false, error: "contact object invalid", ptr: pContact.toString() };
+      const out = { ok: true, ptr: pContact.toString(), className: String(c.$className || ""), saveAfter: doSave };
+      try { if (objcHasSelector(c, "givenName")) out.beforeGivenName = String(c.givenName() || ""); } catch (_) {}
+      try {
+        if (!objcHasSelector(c, "setGivenName:")) return { ok: false, error: "missing setGivenName:" };
+        c.setGivenName_(ns);
+      } catch (e) {
+        return { ok: false, error: "set failed: " + String(e), before: out.beforeGivenName || "" };
+      }
+      try { if (objcHasSelector(c, "givenName")) out.afterGivenName = String(c.givenName() || ""); } catch (_) {}
+
+      if (doSave) {
+        try {
+          if (!objcHasSelector(moc, "save:")) return { ok: false, error: "writeContext missing save:" };
+          const errPtr = Memory.alloc(Process.pointerSize);
+          Memory.writePointer(errPtr, ptr("0x0"));
+          const okSave = !!moc.save_(errPtr);
+          const eobj = _safeObj(Memory.readPointer(errPtr));
+          out.saved = okSave;
+          if (eobj) out.saveError = String(eobj);
+        } catch (e) {
+          return { ok: false, error: "save failed: " + String(e), after: out.afterGivenName || "" };
+        }
+      } else {
+        out.saved = false;
+      }
+      return out;
+    });
+  } catch (e) {
+    return { ok: false, error: String(e) };
+  }
+}
+
+function csABContactSetNotes(notesStr, saveAfter) {
+  try {
+    const pContact = ptr(String(CS_FETCH_VALUE.retainedValuePtr || "0x0"));
+    if (pContact.isNull()) return { ok: false, error: "no retained value; run csfetchvaluecapturefirst first" };
+    const notes = String(notesStr || "");
+    const doSave = (saveAfter === undefined) ? 1 : ((Number(saveAfter) | 0) ? 1 : 0);
+    const ns = nsString(notes);
+    if (!ns) return { ok: false, error: "notes->NSString failed" };
+
+    return _csRunOnWriteContext(function (moc) {
+      const c = _safeObj(pContact);
+      if (!c) return { ok: false, error: "contact object invalid", ptr: pContact.toString() };
+      const out = { ok: true, ptr: pContact.toString(), className: String(c.$className || ""), saveAfter: doSave };
+      try { if (objcHasSelector(c, "notes")) out.beforeNotes = String(c.notes() || ""); } catch (_) {}
+      try {
+        if (!objcHasSelector(c, "setNotes:")) return { ok: false, error: "missing setNotes:" };
+        c.setNotes_(ns);
+      } catch (e) {
+        return { ok: false, error: "set failed: " + String(e), before: out.beforeNotes || "" };
+      }
+      try { if (objcHasSelector(c, "notes")) out.afterNotes = String(c.notes() || ""); } catch (_) {}
+
+      if (doSave) {
+        try {
+          if (!objcHasSelector(moc, "save:")) return { ok: false, error: "writeContext missing save:" };
+          const errPtr = Memory.alloc(Process.pointerSize);
+          Memory.writePointer(errPtr, ptr("0x0"));
+          const okSave = !!moc.save_(errPtr);
+          const eobj = _safeObj(Memory.readPointer(errPtr));
+          out.saved = okSave;
+          if (eobj) out.saveError = String(eobj);
+        } catch (e) {
+          return { ok: false, error: "save failed: " + String(e), after: out.afterNotes || "" };
+        }
+      } else {
+        out.saved = false;
+      }
+      return out;
+    });
+  } catch (e) {
+    return { ok: false, error: String(e) };
+  }
+}
+
+function _csResolveChatManagerStable() {
+  try {
+    const ctxRes = _resolveCtxMainStableExplore();
+    if (!ctxRes || !ctxRes.ok || !ctxRes.ctx) return { ok: false, error: "no context", source: (ctxRes && ctxRes.source) ? ctxRes.source : "" };
+    const ctx = ctxRes.ctx;
+    let cm = null;
+    try {
+      if (ctx.$ivars) cm = ctx.$ivars._chatManager || ctx.$ivars.chatManager || null;
+    } catch (_) { cm = null; }
+    try {
+      if (!cm && objcHasSelector(ctx, "chatManager")) cm = ctx.chatManager();
+    } catch (_) { cm = null; }
+    const o = cm ? (cm instanceof ObjC.Object ? cm : new ObjC.Object(cm)) : null;
+    if (!o) return { ok: false, error: "chatManager nil", source: ctxRes.source || "" };
+    return { ok: true, chatManager: o, className: String(o.$className || ""), source: ctxRes.source || "" };
+  } catch (e) {
+    return { ok: false, error: String(e), source: "" };
+  }
+}
+
+function csNotifyContactStoreDidChange() {
+  try {
+    if (!objcAvailable()) return { ok: false, error: "objc_unavailable" };
+    const cmr = _csResolveChatManagerStable();
+    if (!cmr.ok) return cmr;
+    const cm = cmr.chatManager;
+    const sel = "notifyContactStoreDidChange";
+    if (!objcHasSelector(cm, sel)) return { ok: false, error: "chatManager missing notifyContactStoreDidChange", chatManagerClass: cmr.className, source: cmr.source };
+    let before = null;
+    let after = null;
+    try {
+      if (objcHasSelector(cm, "ignoreAddressBookChangeNotifications")) before = !!cm.ignoreAddressBookChangeNotifications();
+    } catch (_) { before = null; }
+    safeObjCInvoke(() => {
+      try { cm.notifyContactStoreDidChange(); } catch (_) {}
+    });
+    try {
+      if (objcHasSelector(cm, "ignoreAddressBookChangeNotifications")) after = !!cm.ignoreAddressBookChangeNotifications();
+    } catch (_) { after = null; }
+    return { ok: true, invoked: true, beforeIgnore: before, afterIgnore: after, chatManagerClass: cmr.className, source: cmr.source };
+  } catch (e) {
+    return { ok: false, error: String(e) };
+  }
+}
+
+function csABPersistEditsToSyncedContact() {
+  try {
+    if (globalThis.__QQW_CSAB_SYNCOS_ENABLED !== true) {
+      return { ok: false, error: "csabsyncos disabled (safety). run csabsyncosenable:1 then retry" };
+    }
+    const pStorage = ptr(String(globalThis.__QQW_CSAB_STORAGE_PTR || "0x0"));
+    const pContact = ptr(String(CS_FETCH_VALUE.retainedValuePtr || "0x0"));
+    const targetPtr = pStorage.isNull() ? pContact : pStorage;
+    if (targetPtr.isNull()) return { ok: false, error: "no retained target; run csabautofetchjid first" };
+    const c = _safeObj(targetPtr);
+    if (!c) return { ok: false, error: "target object invalid", ptr: targetPtr.toString() };
+
+    const cmr = _csResolveChatManagerStable();
+    if (!cmr.ok) return cmr;
+    const cm = cmr.chatManager;
+    if (!objcHasSelector(cm, "persistEditsToSyncedContact:completion:")) {
+      return { ok: false, error: "chatManager missing persistEditsToSyncedContact:completion:", chatManagerClass: cmr.className, source: cmr.source };
+    }
+
+    const out = { ok: true, targetClass: String(c.$className || ""), targetPtr: targetPtr.toString(), chatManagerClass: cmr.className, invoked: true, queued: true, source: cmr.source };
+    try { if (objcHasSelector(c, "osAddressBookContactID")) out.osAddressBookContactID = String(c.osAddressBookContactID() || ""); } catch (_) {}
+    try { if (objcHasSelector(c, "persistedUniqueID")) out.persistedUniqueID = String(c.persistedUniqueID() || ""); } catch (_) {}
+
+    try { globalThis.__QQW_CSAB_SYNCOS_LAST = { ts: nowMs(), ok: false, error: "not_run" }; } catch (_) {}
+    const qPtr = ptr(String(globalThis.__QQW_CSAB_CONTACTS_QUEUE_PTR || "0x0"));
+    const qObj = qPtr.isNull() ? null : _safeObj(qPtr);
+
+    const _run = function () {
+      let err = "";
+      try {
+        cm.persistEditsToSyncedContact_completion_(c, ptr("0x0"));
+      } catch (e) {
+        err = String(e);
+      }
+      try { globalThis.__QQW_CSAB_SYNCOS_LAST = { ts: nowMs(), ok: err ? false : true, error: err || "" }; } catch (_) {}
+    };
+
+    if (qObj) {
+      try {
+        const pSync = Module.findExportByName(null, "dispatch_sync");
+        if (pSync) {
+          const dispatch_sync = new NativeFunction(pSync, "void", ["pointer", "pointer"]);
+          const blk = new ObjC.Block({
+            retType: "void",
+            argTypes: [],
+            implementation: function () {
+              let pool = null;
+              try { pool = ObjC.classes.NSAutoreleasePool.alloc().init(); } catch (_) { pool = null; }
+              try { _run(); } finally { try { if (pool) pool.release(); } catch (_) {} }
+            }
+          });
+          dispatch_sync(ptr(qObj.handle), blk);
+          out.queued = false;
+          out.queueUsed = "dispatch_sync(_contactsSerialQueue)";
+        } else {
+          safeObjCInvoke(_run);
+          out.queueUsed = "mainQueue_fallback_no_dispatch_sync";
+        }
+      } catch (e) {
+        safeObjCInvoke(_run);
+        out.queueUsed = "mainQueue_fallback:" + String(e);
+      }
+    } else {
+      safeObjCInvoke(_run);
+      out.queueUsed = "mainQueue";
+    }
+    out.called = "persistEditsToSyncedContact:completion:";
+    return out;
+  } catch (e) {
+    return { ok: false, error: String(e) };
+  }
+}
+
+function csABSyncOSGetLast() {
+  try {
+    return { ok: true, last: globalThis.__QQW_CSAB_SYNCOS_LAST || null };
+  } catch (_) {
+    return { ok: true, last: null };
+  }
+}
+
+function csABSyncOSEnable(on) {
+  try {
+    globalThis.__QQW_CSAB_SYNCOS_ENABLED = (Number(on) | 0) ? true : false;
+    return { ok: true, enabled: globalThis.__QQW_CSAB_SYNCOS_ENABLED === true };
+  } catch (e) {
+    return { ok: false, error: String(e) };
+  }
+}
+
+function csABCNContactGet() {
+  try {
+    if (!objcAvailable()) return { ok: false, error: "objc_unavailable" };
+    const pContact = ptr(String(CS_FETCH_VALUE.retainedValuePtr || "0x0"));
+    if (pContact.isNull()) return { ok: false, error: "no retained value; run csabautofetchjid/csfetchvaluecapturefirst first" };
+    const c = _safeObj(pContact);
+    if (!c) return { ok: false, error: "contact object invalid", ptr: pContact.toString() };
+    if (!objcHasSelector(c, "osAddressBookContactID")) return { ok: false, error: "contact missing osAddressBookContactID" };
+    const raw = String(c.osAddressBookContactID() || "");
+    const ident = raw;
+    if (!ident) return { ok: false, error: "empty identifier", osAddressBookContactID: raw };
+
+    const CNContactStore = ObjC.classes.CNContactStore;
+    const NSMutableArray = ObjC.classes.NSMutableArray;
+    if (!CNContactStore || !NSMutableArray) return { ok: false, error: "Contacts framework unavailable" };
+
+    const store = CNContactStore.alloc().init();
+    const _fetch = (wantNote) => {
+      const keys = NSMutableArray.alloc().init();
+      try { keys.addObject_(nsString("givenName")); } catch (_) {}
+      try { keys.addObject_(nsString("familyName")); } catch (_) {}
+      try { keys.addObject_(nsString("nickname")); } catch (_) {}
+      if (wantNote) {
+        try { keys.addObject_(nsString("note")); } catch (_) {}
+      }
+      const errPtr = Memory.alloc(Process.pointerSize);
+      Memory.writePointer(errPtr, ptr("0x0"));
+      let cn0 = null;
+      try { cn0 = store.unifiedContactWithIdentifier_keysToFetch_error_(nsString(ident), keys, errPtr); } catch (e) { return { ok: false, errorObj: null, error: "CNContactStore lookup failed: " + String(e) }; }
+      const eobj = _safeObj(Memory.readPointer(errPtr));
+      const cn = cn0 ? (cn0 instanceof ObjC.Object ? cn0 : new ObjC.Object(cn0)) : null;
+      return { ok: !!cn, cn, errorObj: eobj, error: eobj ? String(eobj) : (cn ? "" : "CNContact nil"), wantNote: !!wantNote };
+    };
+
+    let r = _fetch(true);
+    if (!r.ok && r.error && String(r.error).indexOf("Unauthorized Keys") !== -1) {
+      r = _fetch(false);
+    }
+    if (!r.ok) return { ok: false, error: r.error || "CNContact nil", identifier: ident, osAddressBookContactID: raw };
+    const cn = r.cn;
+
+    const out = { ok: true, identifier: ident, osAddressBookContactID: raw, cnClass: String(cn.$className || "") };
+    try { if (objcHasSelector(cn, "givenName")) out.givenName = String(cn.givenName() || ""); } catch (_) {}
+    try { if (objcHasSelector(cn, "familyName")) out.familyName = String(cn.familyName() || ""); } catch (_) {}
+    try { if (objcHasSelector(cn, "nickname")) out.nickname = String(cn.nickname() || ""); } catch (_) {}
+    if (r.wantNote) {
+      try { if (objcHasSelector(cn, "note")) out.note = String(cn.note() || ""); } catch (_) {}
+    }
+    return out;
+  } catch (e) {
+    return { ok: false, error: String(e) };
+  }
+}
+
+function csABCNContactSet(givenNameStr, familyNameStr, noteStr) {
+  try {
+    if (!objcAvailable()) return { ok: false, error: "objc_unavailable" };
+    const pContact = ptr(String(CS_FETCH_VALUE.retainedValuePtr || "0x0"));
+    if (pContact.isNull()) return { ok: false, error: "no retained value; run csabautofetchjid/csfetchvaluecapturefirst first" };
+    const c = _safeObj(pContact);
+    if (!c) return { ok: false, error: "contact object invalid", ptr: pContact.toString() };
+    if (!objcHasSelector(c, "osAddressBookContactID")) return { ok: false, error: "contact missing osAddressBookContactID" };
+    const raw = String(c.osAddressBookContactID() || "");
+    const ident = raw;
+    if (!ident) return { ok: false, error: "empty identifier", osAddressBookContactID: raw };
+
+    const CNContactStore = ObjC.classes.CNContactStore;
+    const CNSaveRequest = ObjC.classes.CNSaveRequest;
+    const NSMutableArray = ObjC.classes.NSMutableArray;
+    if (!CNContactStore || !CNSaveRequest || !NSMutableArray) return { ok: false, error: "Contacts framework unavailable" };
+
+    const store = CNContactStore.alloc().init();
+    const keys = NSMutableArray.alloc().init();
+    try { keys.addObject_(nsString("givenName")); } catch (_) {}
+    try { keys.addObject_(nsString("familyName")); } catch (_) {}
+    try { keys.addObject_(nsString("nickname")); } catch (_) {}
+
+    const errPtr = Memory.alloc(Process.pointerSize);
+    Memory.writePointer(errPtr, ptr("0x0"));
+    const cn0 = store.unifiedContactWithIdentifier_keysToFetch_error_(nsString(ident), keys, errPtr);
+    const eobj = _safeObj(Memory.readPointer(errPtr));
+    const cn = cn0 ? (cn0 instanceof ObjC.Object ? cn0 : new ObjC.Object(cn0)) : null;
+    if (!cn) return { ok: false, error: eobj ? String(eobj) : "CNContact nil", identifier: ident, osAddressBookContactID: raw };
+
+    const before = { };
+    try { if (objcHasSelector(cn, "givenName")) before.givenName = String(cn.givenName() || ""); } catch (_) {}
+    try { if (objcHasSelector(cn, "familyName")) before.familyName = String(cn.familyName() || ""); } catch (_) {}
+    try { if (objcHasSelector(cn, "nickname")) before.nickname = String(cn.nickname() || ""); } catch (_) {}
+    if (noteStr !== undefined && noteStr !== null) before.noteIgnored = true;
+
+    const m = cn.mutableCopy();
+    const givenName = String(givenNameStr || "");
+    const familyName = String(familyNameStr || "");
+    try { if (objcHasSelector(m, "setGivenName:")) m.setGivenName_(nsString(givenName)); } catch (_) {}
+    try { if (objcHasSelector(m, "setFamilyName:")) m.setFamilyName_(nsString(familyName)); } catch (_) {}
+
+    const req = CNSaveRequest.alloc().init();
+    if (!objcHasSelector(req, "updateContact:")) return { ok: false, error: "CNSaveRequest missing updateContact:" };
+    req.updateContact_(m);
+
+    const err2 = Memory.alloc(Process.pointerSize);
+    Memory.writePointer(err2, ptr("0x0"));
+    const okSave = !!store.executeSaveRequest_error_(req, err2);
+    const e2 = _safeObj(Memory.readPointer(err2));
+    if (!okSave) return { ok: false, error: e2 ? String(e2) : "executeSaveRequest failed", identifier: ident, osAddressBookContactID: raw, before };
+
+    Memory.writePointer(errPtr, ptr("0x0"));
+    const cn1 = store.unifiedContactWithIdentifier_keysToFetch_error_(nsString(ident), keys, errPtr);
+    const e3 = _safeObj(Memory.readPointer(errPtr));
+    const cnAfter = cn1 ? (cn1 instanceof ObjC.Object ? cn1 : new ObjC.Object(cn1)) : null;
+    const after = { };
+    if (cnAfter) {
+      try { if (objcHasSelector(cnAfter, "givenName")) after.givenName = String(cnAfter.givenName() || ""); } catch (_) {}
+      try { if (objcHasSelector(cnAfter, "familyName")) after.familyName = String(cnAfter.familyName() || ""); } catch (_) {}
+      try { if (objcHasSelector(cnAfter, "nickname")) after.nickname = String(cnAfter.nickname() || ""); } catch (_) {}
+    }
+
+    return { ok: true, identifier: ident, osAddressBookContactID: raw, saved: true, before, after, reloadErr: e3 ? String(e3) : "" };
+  } catch (e) {
+    return { ok: false, error: String(e) };
+  }
+}
+
+function _csCNKeys(keysArr) {
+  const NSMutableArray = ObjC.classes.NSMutableArray;
+  const keys = NSMutableArray.alloc().init();
+  for (let i = 0; i < keysArr.length; i++) {
+    try { keys.addObject_(nsString(keysArr[i])); } catch (_) {}
+  }
+  return keys;
+}
+
+function _normalizePhoneE164Like(phoneStr) {
+  const s0 = String(phoneStr || "").trim();
+  if (!s0) return "";
+  let s = s0.replace(/[^\d+]/g, "");
+  if (!s) return "";
+  if (s.startsWith("00")) s = "+" + s.slice(2);
+  if (s.startsWith("+")) return "+" + s.slice(1).replace(/[^\d]/g, "");
+  return "+" + s.replace(/[^\d]/g, "");
+}
+
+function csABCNFindByPhone(phoneStr) {
+  try {
+    if (!objcAvailable()) return { ok: false, error: "objc_unavailable" };
+    const phone = _normalizePhoneE164Like(phoneStr);
+    if (!phone) return { ok: false, error: "missing phone" };
+    const CNContactStore = ObjC.classes.CNContactStore;
+    const CNContact = ObjC.classes.CNContact;
+    const CNPhoneNumber = ObjC.classes.CNPhoneNumber;
+    if (!CNContactStore || !CNContact || !CNPhoneNumber) return { ok: false, error: "Contacts framework unavailable" };
+
+    const store = CNContactStore.alloc().init();
+    const pn = CNPhoneNumber.alloc().initWithStringValue_(nsString(phone));
+    const pred = CNContact.predicateForContactsMatchingPhoneNumber_(pn);
+    const keys = _csCNKeys(["identifier", "givenName", "familyName", "nickname", "phoneNumbers"]);
+
+    const errPtr = Memory.alloc(Process.pointerSize);
+    Memory.writePointer(errPtr, ptr("0x0"));
+    const arr0 = store.unifiedContactsMatchingPredicate_keysToFetch_error_(pred, keys, errPtr);
+    const eobj = _safeObj(Memory.readPointer(errPtr));
+    const arr = arr0 ? (arr0 instanceof ObjC.Object ? arr0 : new ObjC.Object(arr0)) : null;
+    if (!arr) return { ok: false, error: eobj ? String(eobj) : "query failed" };
+    const n = Number(arr.count ? arr.count() : 0) | 0;
+    const out = { ok: true, phone, count: n, contacts: [] };
+    const maxN = Math.min(n, 3);
+    for (let i = 0; i < maxN; i++) {
+      try {
+        const cn = arr.objectAtIndex_(i);
+        const c = cn ? (cn instanceof ObjC.Object ? cn : new ObjC.Object(cn)) : null;
+        if (!c) continue;
+        const o = { };
+        try { if (objcHasSelector(c, "identifier")) o.identifier = String(c.identifier() || ""); } catch (_) {}
+        try { if (objcHasSelector(c, "givenName")) o.givenName = String(c.givenName() || ""); } catch (_) {}
+        try { if (objcHasSelector(c, "familyName")) o.familyName = String(c.familyName() || ""); } catch (_) {}
+        try { if (objcHasSelector(c, "nickname")) o.nickname = String(c.nickname() || ""); } catch (_) {}
+        out.contacts.push(o);
+      } catch (_) {}
+    }
+    return out;
+  } catch (e) {
+    return { ok: false, error: String(e) };
+  }
+}
+
+function csABCNCreateByPhone(phoneStr, givenNameStr) {
+  try {
+    if (!objcAvailable()) return { ok: false, error: "objc_unavailable" };
+    const phone = _normalizePhoneE164Like(phoneStr);
+    const givenName = String(givenNameStr || "");
+    if (!phone) return { ok: false, error: "missing phone" };
+
+    const CNContactStore = ObjC.classes.CNContactStore;
+    const CNContact = ObjC.classes.CNContact;
+    const CNPhoneNumber = ObjC.classes.CNPhoneNumber;
+    const CNSaveRequest = ObjC.classes.CNSaveRequest;
+    const CNMutableContact = ObjC.classes.CNMutableContact;
+    const CNLabeledValue = ObjC.classes.CNLabeledValue;
+    const NSArray = ObjC.classes.NSArray;
+    if (!CNContactStore || !CNContact || !CNPhoneNumber || !CNSaveRequest || !CNMutableContact || !CNLabeledValue || !NSArray) return { ok: false, error: "Contacts framework unavailable" };
+
+    const store = CNContactStore.alloc().init();
+    const pn = CNPhoneNumber.alloc().initWithStringValue_(nsString(phone));
+    const pred = CNContact.predicateForContactsMatchingPhoneNumber_(pn);
+    const keys = _csCNKeys(["identifier"]);
+
+    const errPtr = Memory.alloc(Process.pointerSize);
+    Memory.writePointer(errPtr, ptr("0x0"));
+    const arr0 = store.unifiedContactsMatchingPredicate_keysToFetch_error_(pred, keys, errPtr);
+    const eobj = _safeObj(Memory.readPointer(errPtr));
+    const arr = arr0 ? (arr0 instanceof ObjC.Object ? arr0 : new ObjC.Object(arr0)) : null;
+    if (!arr) return { ok: false, error: eobj ? String(eobj) : "query failed", phone };
+    const n = Number(arr.count ? arr.count() : 0) | 0;
+    if (n > 0) {
+      let id0 = "";
+      try {
+        const c0 = arr.objectAtIndex_(0);
+        const c = c0 ? (c0 instanceof ObjC.Object ? c0 : new ObjC.Object(c0)) : null;
+        if (c && objcHasSelector(c, "identifier")) id0 = String(c.identifier() || "");
+      } catch (_) {}
+      return { ok: false, error: "already exists", phone, existed: true, count: n, identifier: id0 };
+    }
+
+    const m = CNMutableContact.alloc().init();
+    try { if (objcHasSelector(m, "setGivenName:")) m.setGivenName_(nsString(givenName)); } catch (_) {}
+    const lv = CNLabeledValue.labeledValueWithLabel_value_(nsString("mobile"), pn);
+    const phones = NSArray.arrayWithObject_(lv);
+    try { if (objcHasSelector(m, "setPhoneNumbers:")) m.setPhoneNumbers_(phones); } catch (_) {}
+
+    const req = CNSaveRequest.alloc().init();
+    if (!objcHasSelector(req, "addContact:toContainerWithIdentifier:")) return { ok: false, error: "CNSaveRequest missing addContact:toContainerWithIdentifier:", phone };
+    req.addContact_toContainerWithIdentifier_(m, ptr("0x0"));
+
+    const err2 = Memory.alloc(Process.pointerSize);
+    Memory.writePointer(err2, ptr("0x0"));
+    const okSave = !!store.executeSaveRequest_error_(req, err2);
+    const e2 = _safeObj(Memory.readPointer(err2));
+    if (!okSave) return { ok: false, error: e2 ? String(e2) : "executeSaveRequest failed", phone, existed: false };
+
+    let identifier = "";
+    try { if (objcHasSelector(m, "identifier")) identifier = String(m.identifier() || ""); } catch (_) {}
+    return { ok: true, phone, existed: false, saved: true, identifier, givenName };
+  } catch (e) {
+    return { ok: false, error: String(e) };
+  }
+}
+
+function csABCNUpsertByPhone(phoneStr, givenNameStr, familyNameStr, noteStr) {
+  try {
+    if (!objcAvailable()) return { ok: false, error: "objc_unavailable" };
+    const phone = _normalizePhoneE164Like(phoneStr);
+    if (!phone) return { ok: false, error: "missing phone" };
+    const givenName = String(givenNameStr || "");
+    const familyName = String(familyNameStr || "");
+    const note = (noteStr === undefined || noteStr === null) ? "" : String(noteStr);
+
+    const CNContactStore = ObjC.classes.CNContactStore;
+    const CNContact = ObjC.classes.CNContact;
+    const CNPhoneNumber = ObjC.classes.CNPhoneNumber;
+    const CNSaveRequest = ObjC.classes.CNSaveRequest;
+    const CNMutableContact = ObjC.classes.CNMutableContact;
+    const CNLabeledValue = ObjC.classes.CNLabeledValue;
+    const NSArray = ObjC.classes.NSArray;
+    if (!CNContactStore || !CNContact || !CNPhoneNumber || !CNSaveRequest || !CNMutableContact || !CNLabeledValue || !NSArray) return { ok: false, error: "Contacts framework unavailable" };
+
+    const store = CNContactStore.alloc().init();
+    const pn = CNPhoneNumber.alloc().initWithStringValue_(nsString(phone));
+    const pred = CNContact.predicateForContactsMatchingPhoneNumber_(pn);
+    const keys = _csCNKeys(["identifier", "givenName", "familyName", "nickname", "phoneNumbers"]);
+
+    const errPtr = Memory.alloc(Process.pointerSize);
+    Memory.writePointer(errPtr, ptr("0x0"));
+    const arr0 = store.unifiedContactsMatchingPredicate_keysToFetch_error_(pred, keys, errPtr);
+    const eobj = _safeObj(Memory.readPointer(errPtr));
+    const arr = arr0 ? (arr0 instanceof ObjC.Object ? arr0 : new ObjC.Object(arr0)) : null;
+    if (!arr) return { ok: false, error: eobj ? String(eobj) : "query failed" };
+    const n = Number(arr.count ? arr.count() : 0) | 0;
+
+    const req = CNSaveRequest.alloc().init();
+    if (!objcHasSelector(req, "updateContact:") || !objcHasSelector(req, "addContact:toContainerWithIdentifier:")) {
+      return { ok: false, error: "CNSaveRequest missing updateContact/addContact" };
+    }
+
+    const out = { ok: false, phone, existed: n > 0, identifier: "", saved: false };
+
+    let m = null;
+    if (n > 0) {
+      const cn0 = arr.objectAtIndex_(0);
+      const cn = cn0 ? (cn0 instanceof ObjC.Object ? cn0 : new ObjC.Object(cn0)) : null;
+      if (!cn) return { ok: false, error: "first contact nil" };
+      try { if (objcHasSelector(cn, "identifier")) out.identifier = String(cn.identifier() || ""); } catch (_) {}
+      m = cn.mutableCopy();
+      req.updateContact_(m);
+    } else {
+      m = CNMutableContact.alloc().init();
+      const lv = CNLabeledValue.labeledValueWithLabel_value_(nsString("mobile"), pn);
+      const phones = NSArray.arrayWithObject_(lv);
+      try { if (objcHasSelector(m, "setPhoneNumbers:")) m.setPhoneNumbers_(phones); } catch (_) {}
+      req.addContact_toContainerWithIdentifier_(m, ptr("0x0"));
+    }
+
+    try { if (objcHasSelector(m, "setGivenName:")) m.setGivenName_(nsString(givenName)); } catch (_) {}
+    try { if (objcHasSelector(m, "setFamilyName:")) m.setFamilyName_(nsString(familyName)); } catch (_) {}
+    if (note) out.noteIgnored = true;
+
+    const err2 = Memory.alloc(Process.pointerSize);
+    Memory.writePointer(err2, ptr("0x0"));
+    const okSave = !!store.executeSaveRequest_error_(req, err2);
+    const e2 = _safeObj(Memory.readPointer(err2));
+    if (!okSave) return { ok: false, error: e2 ? String(e2) : "executeSaveRequest failed", phone, existed: n > 0, identifier: out.identifier };
+
+    out.saved = true;
+    try { if (!out.identifier && objcHasSelector(m, "identifier")) out.identifier = String(m.identifier() || ""); } catch (_) {}
+    out.ok = true;
+    return out;
+  } catch (e) {
+    return { ok: false, error: String(e) };
+  }
+}
+
+function csABSetGivenNameByChatJid(chatJidStr, givenNameStr, saveAfter) {
+  try {
+    try { csFetchProbeOff(); } catch (_) {}
+    try { contactsPipeProbeOff(); } catch (_) {}
+    try { contactsChainProbeOff(); } catch (_) {}
+    try { proxyCallProbeOff(); } catch (_) {}
+
+    if (!objcAvailable()) return { ok: false, error: "objc_unavailable" };
+    const targetJidStr = String(chatJidStr || "").trim();
+    if (!targetJidStr) return { ok: false, error: "missing chatJid" };
+    const givenName = String(givenNameStr || "");
+    const doSave = (saveAfter === undefined) ? 1 : ((Number(saveAfter) | 0) ? 1 : 0);
+
+    const env = _csResolveContactsStorageCtx();
+    if (!env.ok) return env;
+    const cs = env.contactsStorage;
+    const csq = env.contactsStorageQueries;
+    if (!cs) return { ok: false, error: "contactsStorage missing" };
+    if (!csq) return { ok: false, error: "contactsStorageQueries missing" };
+
+    const wc = _tryGetIvarObj(cs, ["_writeContext", "writeContext"]);
+    if (!wc) return { ok: false, error: "contactsStorage writeContext missing", contactsStorageClass: String(cs.$className || "") };
+    if (!objcHasSelector(wc, "performBlockAndWait:") || !ObjC.Block) return { ok: false, error: "writeContext missing performBlockAndWait:" };
+
+    const WAUserJID = ObjC.classes.WAUserJID;
+    const WAJID = ObjC.classes.WAJID;
+    let jidObj = null;
+    try {
+      if (WAUserJID) {
+        if (WAUserJID["+ jidOrLIDWithString:"]) jidObj = WAUserJID.jidOrLIDWithString_(nsString(targetJidStr));
+        else if (WAUserJID["+ withString:"]) jidObj = WAUserJID.withString_(nsString(targetJidStr));
+        else if (WAUserJID["+ withJIDString:"]) jidObj = WAUserJID.withJIDString_(nsString(targetJidStr));
+        else if (WAUserJID["+ userJIDWithString:"]) jidObj = WAUserJID.userJIDWithString_(nsString(targetJidStr));
+        else if (WAUserJID["+ jidWithString:"]) jidObj = WAUserJID.jidWithString_(nsString(targetJidStr));
+      }
+      if (!jidObj && WAJID && WAJID["+ withString:"]) jidObj = WAJID.withString_(nsString(targetJidStr));
+    } catch (e) {
+      return { ok: false, error: "jid build failed: " + String(e) };
+    }
+    if (!jidObj) return { ok: false, error: "could not create jid object" };
+
+    const out = {
+      ok: false,
+      chatJid: targetJidStr,
+      givenName,
+      saveAfter: doSave,
+      contactsStorageClass: String(cs.$className || ""),
+      contactsStorageQueriesClass: String(csq.$className || ""),
+      writeContextClass: String(wc.$className || ""),
+    };
+    try { out.writeContextPtr = ptr(wc.handle).toString(); } catch (_) { out.writeContextPtr = ""; }
+
+    let result = null;
+    const blk = new ObjC.Block({
+      retType: "void",
+      argTypes: [],
+      implementation: function () {
+        let pool = null;
+        try { pool = ObjC.classes.NSAutoreleasePool.alloc().init(); } catch (_) { pool = null; }
+        try {
+          const preferred = nsString("");
+          let ab0 = null;
+          if (targetJidStr.toLowerCase().endsWith("@lid") && objcHasSelector(csq, "addressBookContactForLID:preferredFullName:")) {
+            try { ab0 = csq.addressBookContactForLID_preferredFullName_(jidObj, preferred); out.usedABSel = "addressBookContactForLID:preferredFullName:"; } catch (_) { ab0 = null; }
+          }
+          if (!ab0 && objcHasSelector(csq, "addressBookContactForJID:preferredFullName:")) {
+            try { ab0 = csq.addressBookContactForJID_preferredFullName_(jidObj, preferred); out.usedABSel = "addressBookContactForJID:preferredFullName:"; } catch (_) { ab0 = null; }
+          }
+          const ab = ab0 ? (ab0 instanceof ObjC.Object ? ab0 : new ObjC.Object(ab0)) : null;
+          if (!ab) {
+            result = { ok: false, error: "addressBookContactFor* returned nil", chatJid: targetJidStr };
+            return;
+          }
+
+          let uid = "";
+          try {
+            if (objcHasSelector(ab, "uniqueID")) uid = String(ab.uniqueID() || "");
+            else if (objcHasSelector(ab, "persistedUniqueID")) uid = String(ab.persistedUniqueID() || "");
+          } catch (_) {}
+          if (!uid) {
+            result = { ok: false, error: "uniqueID empty", chatJid: targetJidStr, abClass: String(ab.$className || "") };
+            return;
+          }
+          out.uniqueID = uid;
+
+          if (!objcHasSelector(cs, "fetchAddressBookContactsForUniqueIDs:inContext:filteringPredicate:")) {
+            result = { ok: false, error: "contactsStorage missing fetchAddressBookContactsForUniqueIDs", chatJid: targetJidStr };
+            return;
+          }
+          const NSArray = ObjC.classes.NSArray;
+          const uids = NSArray.arrayWithObject_(nsString(uid));
+          const dict0 = cs.fetchAddressBookContactsForUniqueIDs_inContext_filteringPredicate_(uids, wc, ptr("0x0"));
+          const dict = dict0 ? (dict0 instanceof ObjC.Object ? dict0 : new ObjC.Object(dict0)) : null;
+          if (!dict) {
+            result = { ok: false, error: "fetch returned nil dict", chatJid: targetJidStr, uniqueID: uid };
+            return;
+          }
+          let vv = null;
+          try { if (objcHasSelector(dict, "objectForKey:")) vv = dict.objectForKey_(nsString(uid)); } catch (_) { vv = null; }
+          const c = vv ? (vv instanceof ObjC.Object ? vv : new ObjC.Object(vv)) : null;
+          if (!c) {
+            result = { ok: false, error: "dict missing value for uniqueID", chatJid: targetJidStr, uniqueID: uid };
+            return;
+          }
+          out.contactClass = String(c.$className || "");
+          out.contactPtr = ptr(c.handle).toString();
+
+          try { if (objcHasSelector(c, "osAddressBookContactID")) out.osAddressBookContactID = String(c.osAddressBookContactID() || ""); } catch (_) {}
+
+          try {
+            const f = _objcGetRuntimeFns();
+            if (f.objc_retain && f.objc_release) {
+              const prev = ptr(String(CS_FETCH_VALUE.retainedValuePtr || "0x0"));
+              if (!prev.isNull()) {
+                try { f.objc_release(prev); } catch (_) {}
+              }
+              const rp = ptr(f.objc_retain(ptr(c.handle)));
+              CS_FETCH_VALUE.retainedValuePtr = rp.toString();
+              CS_CTX_LAST.inContextPtr = ptr(wc.handle).toString();
+              out.retainedValuePtr = rp.toString();
+            }
+          } catch (_) {}
+
+          try { if (objcHasSelector(c, "givenName")) out.beforeGivenName = String(c.givenName() || ""); } catch (_) {}
+          try {
+            if (!objcHasSelector(c, "setGivenName:")) {
+              result = { ok: false, error: "missing setGivenName:", chatJid: targetJidStr, contactClass: out.contactClass || "" };
+              return;
+            }
+            c.setGivenName_(nsString(givenName));
+          } catch (e) {
+            result = { ok: false, error: "set failed: " + String(e), chatJid: targetJidStr, before: out.beforeGivenName || "" };
+            return;
+          }
+          try { if (objcHasSelector(c, "givenName")) out.afterGivenName = String(c.givenName() || ""); } catch (_) {}
+
+          if (doSave) {
+            try {
+              if (!objcHasSelector(wc, "save:")) {
+                result = { ok: false, error: "writeContext missing save:", chatJid: targetJidStr };
+                return;
+              }
+              const errPtr = Memory.alloc(Process.pointerSize);
+              Memory.writePointer(errPtr, ptr("0x0"));
+              const okSave = !!wc.save_(errPtr);
+              const eobj = _safeObj(Memory.readPointer(errPtr));
+              out.saved = okSave;
+              if (eobj) out.saveError = String(eobj);
+            } catch (e) {
+              result = { ok: false, error: "save failed: " + String(e), chatJid: targetJidStr };
+              return;
+            }
+          } else {
+            out.saved = false;
+          }
+          out.ok = true;
+          result = out;
+        } finally {
+          try { if (pool) pool.release(); } catch (_) {}
+        }
+      }
+    });
+
+    wc.performBlockAndWait_(blk);
+
+    try {
+      const r = result || null;
+      if (r && r.ok && r.osAddressBookContactID && doSave) {
+        try {
+          const CNContactStore = ObjC.classes.CNContactStore;
+          const CNSaveRequest = ObjC.classes.CNSaveRequest;
+          const NSMutableArray = ObjC.classes.NSMutableArray;
+          if (CNContactStore && CNSaveRequest && NSMutableArray) {
+            const store = CNContactStore.alloc().init();
+            const keys = NSMutableArray.alloc().init();
+            try { keys.addObject_(nsString("givenName")); } catch (_) {}
+            try { keys.addObject_(nsString("familyName")); } catch (_) {}
+            try { keys.addObject_(nsString("nickname")); } catch (_) {}
+
+            const errPtr = Memory.alloc(Process.pointerSize);
+            Memory.writePointer(errPtr, ptr("0x0"));
+            const cn0 = store.unifiedContactWithIdentifier_keysToFetch_error_(nsString(r.osAddressBookContactID), keys, errPtr);
+            const eobj = _safeObj(Memory.readPointer(errPtr));
+            const cn = cn0 ? (cn0 instanceof ObjC.Object ? cn0 : new ObjC.Object(cn0)) : null;
+            if (cn) {
+              try { if (objcHasSelector(cn, "givenName")) r.osBeforeGivenName = String(cn.givenName() || ""); } catch (_) {}
+              const m = cn.mutableCopy();
+              try { if (objcHasSelector(m, "setGivenName:")) m.setGivenName_(nsString(givenName)); } catch (_) {}
+              const req = CNSaveRequest.alloc().init();
+              if (objcHasSelector(req, "updateContact:")) {
+                req.updateContact_(m);
+                const err2 = Memory.alloc(Process.pointerSize);
+                Memory.writePointer(err2, ptr("0x0"));
+                const okSave = !!store.executeSaveRequest_error_(req, err2);
+                const e2 = _safeObj(Memory.readPointer(err2));
+                r.osSaved = okSave;
+                if (e2) r.osSaveError = String(e2);
+
+                Memory.writePointer(errPtr, ptr("0x0"));
+                const cn1 = store.unifiedContactWithIdentifier_keysToFetch_error_(nsString(r.osAddressBookContactID), keys, errPtr);
+                const cnAfter = cn1 ? (cn1 instanceof ObjC.Object ? cn1 : new ObjC.Object(cn1)) : null;
+                if (cnAfter) {
+                  try { if (objcHasSelector(cnAfter, "givenName")) r.osAfterGivenName = String(cnAfter.givenName() || ""); } catch (_) {}
+                }
+              } else {
+                r.osSaved = false;
+                r.osSaveError = "CNSaveRequest missing updateContact:";
+              }
+            } else {
+              r.osSaved = false;
+              r.osSaveError = eobj ? String(eobj) : "CNContact nil";
+            }
+          }
+        } catch (e) {
+          r.osSaved = false;
+          r.osSaveError = String(e);
+        }
+        result = r;
+      }
+    } catch (_) {}
+
+    return result || { ok: false, error: "no result" };
+  } catch (e) {
+    return { ok: false, error: String(e) };
+  }
+}
+
+function _tryGetIvarObj(obj, keys) {
+  try {
+    if (!obj || !obj.$ivars) return null;
+    for (let i = 0; i < keys.length; i++) {
+      const k = keys[i];
+      try {
+        const v = obj.$ivars[k];
+        if (v) return v instanceof ObjC.Object ? v : new ObjC.Object(v);
+      } catch (_) {}
+    }
+  } catch (_) {}
+  return null;
+}
+
+function _tryGetPropOrIvarObj(obj, selName, ivarKeys) {
+  try {
+    if (!obj) return null;
+    try {
+      if (selName && objcHasSelector(obj, selName)) {
+        const v = objcCallNoArg(obj, selName);
+        if (v) return v instanceof ObjC.Object ? v : new ObjC.Object(v);
+      }
+    } catch (_) {}
+    try {
+      const v2 = _tryGetIvarObj(obj, ivarKeys || []);
+      if (v2) return v2;
+    } catch (_) {}
+  } catch (_) {}
+  return null;
+}
+
+function _csResolveContactsStorageCtx() {
+  const ctxRes = _resolveCtxMainActive();
+  if (!ctxRes || !ctxRes.ok || !ctxRes.ctx) return { ok: false, error: "no context" };
+  const ctx = ctxRes.ctx;
+  const cm = _tryGetIvarObj(ctx, ["_contactsManager", "contactsManager"]);
+  const chatMgr = _tryGetIvarObj(ctx, ["_chatManager", "chatManager"]);
+  const cs = _tryGetPropOrIvarObj(ctx, "contactsStorage", ["_contactsStorage", "contactsStorage"])
+    || _tryGetPropOrIvarObj(chatMgr, "contactsStorage", ["_contactsStorage", "contactsStorage"])
+    || _tryGetPropOrIvarObj(cm, "contactsStorage", ["_contactsStorage", "contactsStorage"]);
+  const csq = _tryGetPropOrIvarObj(ctx, "contactsStorageQueries", ["_contactsStorageQueries", "contactsStorageQueries"])
+    || _tryGetPropOrIvarObj(chatMgr, "contactsStorageQueries", ["_contactsStorageQueries", "contactsStorageQueries"])
+    || _tryGetPropOrIvarObj(cm, "contactsStorageQueries", ["_contactsStorageQueries", "contactsStorageQueries"]);
+  return {
+    ok: true,
+    ctx,
+    contactsManager: cm ? String(cm.$className || "") : "",
+    chatManager: chatMgr ? String(chatMgr.$className || "") : "",
+    contactsStorage: cs || null,
+    contactsStorageQueries: csq || null,
+  };
+}
+
+function csABAutoFetchForJid(chatJidStr) {
+  try {
+    if (!objcAvailable()) return { ok: false, error: "objc_unavailable" };
+    const targetJidStr = String(chatJidStr || "").trim();
+    if (!targetJidStr) return { ok: false, error: "missing chatJid" };
+
+    const env = _csResolveContactsStorageCtx();
+    if (!env.ok) return env;
+    const cs = env.contactsStorage;
+    const csq = env.contactsStorageQueries;
+    if (!cs) return { ok: false, error: "contactsStorage missing", contactsManager: env.contactsManager, chatManager: env.chatManager };
+    if (!csq) return { ok: false, error: "contactsStorageQueries missing", contactsManager: env.contactsManager, chatManager: env.chatManager };
+
+    const wc = _tryGetIvarObj(cs, ["_writeContext", "writeContext"]);
+    if (!wc) return { ok: false, error: "contactsStorage writeContext missing", contactsStorageClass: String(cs.$className || "") };
+    if (!objcHasSelector(wc, "performBlockAndWait:") || !ObjC.Block) return { ok: false, error: "writeContext missing performBlockAndWait:" };
+
+    const WAUserJID = ObjC.classes.WAUserJID;
+    const WAJID = ObjC.classes.WAJID;
+    let jidObj = null;
+    try {
+      if (WAUserJID) {
+        if (WAUserJID["+ jidOrLIDWithString:"]) jidObj = WAUserJID.jidOrLIDWithString_(nsString(targetJidStr));
+        else if (WAUserJID["+ withString:"]) jidObj = WAUserJID.withString_(nsString(targetJidStr));
+        else if (WAUserJID["+ withJIDString:"]) jidObj = WAUserJID.withJIDString_(nsString(targetJidStr));
+        else if (WAUserJID["+ userJIDWithString:"]) jidObj = WAUserJID.userJIDWithString_(nsString(targetJidStr));
+        else if (WAUserJID["+ jidWithString:"]) jidObj = WAUserJID.jidWithString_(nsString(targetJidStr));
+      }
+      if (!jidObj && WAJID && WAJID["+ withString:"]) jidObj = WAJID.withString_(nsString(targetJidStr));
+    } catch (e) {
+      return { ok: false, error: "jid build failed: " + String(e) };
+    }
+    if (!jidObj) return { ok: false, error: "could not create jid object" };
+
+    const out = { ok: false, chatJid: targetJidStr, contactsStorageClass: String(cs.$className || ""), contactsStorageQueriesClass: String(csq.$className || ""), writeContextClass: String(wc.$className || "") };
+    try { out.contactsStoragePtr = ptr(cs.handle).toString(); } catch (_) { out.contactsStoragePtr = ""; }
+    try { out.contactsStorageQueriesPtr = ptr(csq.handle).toString(); } catch (_) { out.contactsStorageQueriesPtr = ""; }
+    try {
+      const q = _tryGetIvarObj(cs, ["_contactsSerialQueue", "contactsSerialQueue"]);
+      if (q) {
+        out.contactsSerialQueueClass = String(q.$className || "");
+        out.contactsSerialQueuePtr = ptr(q.handle).toString();
+        try {
+          const f = _objcGetRuntimeFns();
+          if (f.objc_retain && f.objc_release) {
+            const prev = ptr(String(globalThis.__QQW_CSAB_CONTACTS_QUEUE_PTR || "0x0"));
+            if (!prev.isNull()) {
+              try { f.objc_release(prev); } catch (_) {}
+            }
+            const rp = ptr(f.objc_retain(ptr(q.handle)));
+            globalThis.__QQW_CSAB_CONTACTS_QUEUE_PTR = rp.toString();
+          }
+        } catch (_) {}
+      }
+    } catch (_) {}
+
+    const blk = new ObjC.Block({
+      retType: "void",
+      argTypes: [],
+      implementation: function () {
+        let pool = null;
+        try { pool = ObjC.classes.NSAutoreleasePool.alloc().init(); } catch (_) { pool = null; }
+        try {
+          const preferred = nsString("");
+          let ab0 = null;
+          if (targetJidStr.toLowerCase().endsWith("@lid") && objcHasSelector(csq, "addressBookContactForLID:preferredFullName:")) {
+            try {
+              ab0 = csq.addressBookContactForLID_preferredFullName_(jidObj, preferred);
+              out.usedABSel = "addressBookContactForLID:preferredFullName:";
+            } catch (_) {
+              ab0 = null;
+            }
+          }
+          if (!ab0 && objcHasSelector(csq, "addressBookContactForJID:preferredFullName:")) {
+            try {
+              ab0 = csq.addressBookContactForJID_preferredFullName_(jidObj, preferred);
+              out.usedABSel = "addressBookContactForJID:preferredFullName:";
+            } catch (_) {
+              ab0 = null;
+            }
+          }
+          const ab = ab0 ? (ab0 instanceof ObjC.Object ? ab0 : new ObjC.Object(ab0)) : null;
+          if (ab) {
+            out.abClass = String(ab.$className || "");
+            out.abPtr = ptr(ab.handle).toString();
+            try {
+              const f = _objcGetRuntimeFns();
+              if (f.objc_retain && f.objc_release) {
+                const prev = ptr(String(globalThis.__QQW_CSAB_STORAGE_PTR || "0x0"));
+                if (!prev.isNull()) {
+                  try { f.objc_release(prev); } catch (_) {}
+                }
+                const rp = ptr(f.objc_retain(ptr(ab.handle)));
+                globalThis.__QQW_CSAB_STORAGE_PTR = rp.toString();
+                out.retainedStoragePtr = rp.toString();
+              }
+            } catch (_) {}
+            try {
+              if (objcHasSelector(ab, "uniqueID")) out.uniqueID = String(ab.uniqueID() || "");
+              if (objcHasSelector(ab, "persistedUniqueID")) out.persistedUniqueID = String(ab.persistedUniqueID() || "");
+            } catch (_) {}
+
+            const uid2 = String(out.uniqueID || out.persistedUniqueID || "");
+            if (uid2 && objcHasSelector(cs, "fetchAddressBookContactsForUniqueIDs:inContext:filteringPredicate:")) {
+              try {
+                const NSArray = ObjC.classes.NSArray;
+                const uids = NSArray.arrayWithObject_(nsString(uid2));
+                const dict0 = cs.fetchAddressBookContactsForUniqueIDs_inContext_filteringPredicate_(uids, wc, ptr("0x0"));
+                const dict = dict0 ? (dict0 instanceof ObjC.Object ? dict0 : new ObjC.Object(dict0)) : null;
+                out.dictClass = dict ? String(dict.$className || "") : "";
+                let vv = null;
+                try {
+                  if (dict && objcHasSelector(dict, "objectForKey:")) vv = dict.objectForKey_(nsString(uid2));
+                } catch (_) {}
+                const vvv = vv ? (vv instanceof ObjC.Object ? vv : new ObjC.Object(vv)) : null;
+                if (vvv) {
+                  out.used = "fetchAddressBookContactsForUniqueIDs";
+                  out.valueClass = String(vvv.$className || "");
+                  out.valuePtr = ptr(vvv.handle).toString();
+                  try {
+                    const f = _objcGetRuntimeFns();
+                    if (f.objc_retain && f.objc_release) {
+                      const prev = ptr(String(CS_FETCH_VALUE.retainedValuePtr || "0x0"));
+                      if (!prev.isNull()) {
+                        try { f.objc_release(prev); } catch (_) {}
+                      }
+                      const rp = ptr(f.objc_retain(ptr(vvv.handle)));
+                      CS_FETCH_VALUE.retainedValuePtr = rp.toString();
+                      CS_CTX_LAST.inContextPtr = ptr(wc.handle).toString();
+                      out.retainedValuePtr = rp.toString();
+                    }
+                  } catch (_) {}
+                  out.ok = true;
+                  return;
+                }
+              } catch (_) {}
+            }
+
+            out.used = "addressBookContactFor*";
+            out.valueClass = out.abClass;
+            out.valuePtr = out.abPtr;
+            try {
+              const f = _objcGetRuntimeFns();
+              if (f.objc_retain && f.objc_release) {
+                const prev = ptr(String(CS_FETCH_VALUE.retainedValuePtr || "0x0"));
+                if (!prev.isNull()) {
+                  try { f.objc_release(prev); } catch (_) {}
+                }
+                const rp = ptr(f.objc_retain(ptr(ab.handle)));
+                CS_FETCH_VALUE.retainedValuePtr = rp.toString();
+                CS_CTX_LAST.inContextPtr = ptr(wc.handle).toString();
+                out.retainedValuePtr = rp.toString();
+              }
+            } catch (_) {}
+            out.ok = true;
+            return;
+          }
+
+          let c0 = null;
+          if (objcHasSelector(csq, "contactForJID:includeUnknownContacts:")) {
+            c0 = csq.contactForJID_includeUnknownContacts_(jidObj, 1);
+            out.usedContactSel = "contactForJID:includeUnknownContacts:";
+          } else if (objcHasSelector(csq, "contactForJID:")) {
+            c0 = csq.contactForJID_(jidObj);
+            out.usedContactSel = "contactForJID:";
+          } else {
+            out.ok = false;
+            out.error = "contactsStorageQueries missing contactForJID selectors";
+            try {
+              const p = ptr(csq.handle);
+              out.contactSelHints = _filterMethodsByRegex(p, "contactFor", 40);
+            } catch (_) {}
+            return;
+          }
+          const c = c0 ? (c0 instanceof ObjC.Object ? c0 : new ObjC.Object(c0)) : null;
+          out.contactClass = c ? String(c.$className || "") : "";
+          if (!c) {
+            out.ok = false;
+            out.error = "addressBookContactFor* returned nil; contactForJID returned nil";
+            return;
+          }
+          let uid = "";
+          let uidSel = "";
+          try {
+            if (objcHasSelector(c, "persistedUniqueID")) {
+              uid = String(c.persistedUniqueID() || "");
+              uidSel = "persistedUniqueID";
+            } else if (objcHasSelector(c, "uniqueID")) {
+              uid = String(c.uniqueID() || "");
+              uidSel = "uniqueID";
+            }
+          } catch (_) {}
+          out.uniqueIDSel = uidSel;
+          out.persistedUniqueID = uid;
+          if (!uid) {
+            out.ok = false;
+            out.error = "uniqueID empty";
+            return;
+          }
+
+          if (!objcHasSelector(cs, "fetchAddressBookContactsForUniqueIDs:inContext:filteringPredicate:")) {
+            out.ok = false;
+            out.error = "contactsStorage missing fetchAddressBookContactsForUniqueIDs:inContext:filteringPredicate:";
+            return;
+          }
+
+          const NSArray = ObjC.classes.NSArray;
+          if (!NSArray || !NSArray["+ arrayWithObject:"]) {
+            out.ok = false;
+            out.error = "NSArray arrayWithObject missing";
+            return;
+          }
+          const uids = NSArray.arrayWithObject_(nsString(uid));
+          const dict0 = cs.fetchAddressBookContactsForUniqueIDs_inContext_filteringPredicate_(uids, wc, ptr("0x0"));
+          const dict = dict0 ? (dict0 instanceof ObjC.Object ? dict0 : new ObjC.Object(dict0)) : null;
+          out.dictClass = dict ? String(dict.$className || "") : "";
+          if (!dict) {
+            out.ok = false;
+            out.error = "fetch returned nil dict";
+            return;
+          }
+
+          let v = null;
+          try {
+            if (objcHasSelector(dict, "objectForKey:")) v = dict.objectForKey_(nsString(uid));
+          } catch (_) {}
+          const vv = v ? (v instanceof ObjC.Object ? v : new ObjC.Object(v)) : null;
+          out.valueClass = vv ? String(vv.$className || "") : "";
+          out.valuePtr = vv ? ptr(vv.handle).toString() : "0x0";
+          if (!vv) {
+            out.ok = false;
+            out.error = "dict missing value for persistedUniqueID";
+            return;
+          }
+
+          try {
+            const f = _objcGetRuntimeFns();
+            if (f.objc_retain && f.objc_release) {
+              const prev = ptr(String(CS_FETCH_VALUE.retainedValuePtr || "0x0"));
+              if (!prev.isNull()) {
+                try { f.objc_release(prev); } catch (_) {}
+              }
+              const rp = ptr(f.objc_retain(ptr(vv.handle)));
+              CS_FETCH_VALUE.retainedValuePtr = rp.toString();
+              CS_CTX_LAST.inContextPtr = ptr(wc.handle).toString();
+              out.retainedValuePtr = rp.toString();
+            }
+          } catch (_) {}
+          out.ok = true;
+        } catch (e) {
+          out.ok = false;
+          out.error = String(e);
+        } finally {
+          try { if (pool) pool.release(); } catch (_) {}
+        }
+      }
+    });
+
+    wc.performBlockAndWait_(blk);
+    return out;
+  } catch (e) {
+    return { ok: false, error: String(e) };
+  }
+}
+
+function _tryGetSingleton(cls) {
+  try {
+    const sels = [
+      "+ sharedInstance",
+      "+ sharedManager",
+      "+ shared",
+      "+ defaultManager",
+      "+ default",
+      "+ instance",
+    ];
+    for (let i = 0; i < sels.length; i++) {
+      const s = sels[i];
+      try {
+        if (cls && cls[s]) return _safeObj(cls[s]());
+      } catch (_) {}
+    }
+    return null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function _tryInvokeProxyForChatJID(target, chatJidObj, mocObj) {
+  try {
+    if (!target || !chatJidObj || !mocObj) return null;
+    const selKey = "proxyForChatJID:managedObjectContext:";
+    if (!objcHasSelector(target, selKey)) return null;
+    return _safeObj(target.proxyForChatJID_managedObjectContext_(chatJidObj, mocObj));
+  } catch (_) {
+    return null;
+  }
+}
+
+function getAddressBookProxyForChatJid(chatJidStr, limitClasses) {
+  return { ok: false, error: "disabled_for_safety; use proxy_call_probe to capture real receiver first" };
+}
+
+function getAddressBookProxyForChatJidWithContext(chatJidStr, inContextPtrStr, limitClasses) {
+  return { ok: false, error: "disabled_for_safety; use proxy_call_probe to capture real receiver first" };
+}
+
+function proxyCallProbeOn() {
+  if (!objcAvailable()) return { ok: false, error: "objc_unavailable" };
+  if (PROXY_CALL_PROBE.installed) return { ok: true, installed: true, count: PROXY_CALL_PROBE.count, err: PROXY_CALL_PROBE.err || "" };
+  PROXY_CALL_PROBE.err = "";
+  try {
+    const mod = Process.findModuleByName("WhatsApp");
+    if (!mod) return { ok: false, error: "WhatsApp module missing" };
+    const off = ptr("0x42cde74");
+    const addr = ptr(mod.base).add(off);
+    const l0 = Interceptor.attach(addr, {
+      onEnter(args) {
+        try {
+          const ts = nowMs();
+          const tid = (function () { try { return Process.getCurrentThreadId(); } catch (_) { return 0; } })();
+          const pSelf = ptr(args[0]);
+          const pChat = ptr(args[1]);
+          const pMoc = ptr(args[2]);
+          let ret = ptr("0x0");
+          let retMod = null;
+          let retOff = "";
+          try {
+            ret = ptr(this.returnAddress);
+            retMod = Process.findModuleByAddress(ret);
+            if (retMod && retMod.base) retOff = ret.sub(retMod.base).toString();
+          } catch (_) {}
+          const rec = {
+            ts,
+            tid,
+            addr: addr.toString(),
+            off: off.toString(),
+            selfPtr: pSelf.toString(),
+            chatJidPtr: pChat.toString(),
+            inContextPtr: pMoc.toString(),
+            returnAddress: ret.toString(),
+            returnModule: retMod ? { name: String(retMod.name || ""), base: ptr(retMod.base).toString(), off: retOff } : null,
+            selfClass: _objcClassNameNoTouch(pSelf),
+            chatJidClass: _objcClassNameNoTouch(pChat),
+            inContextClass: _objcClassNameNoTouch(pMoc),
+          };
+          PROXY_CALL_PROBE.last = rec;
+          PROXY_CALL_PROBE.count++;
+          try {
+            const needMoc = String(CS_CTX_LAST.inContextPtr || "0x0");
+            if (!needMoc || needMoc === "0x0") return;
+            if (rec.inContextPtr !== needMoc) return;
+            const lastTs = Number(PROXY_CALL_PROBE._lastSendTs || 0) | 0;
+            if (lastTs && ts - lastTs < 800) return;
+            PROXY_CALL_PROBE._lastSendTs = ts;
+            send({ type: "qqw.explore.proxy_call_probe", ok: true, ...rec });
+          } catch (_) {}
+        } catch (e) {
+          try {
+            const lastTs = Number(PROXY_CALL_PROBE._lastSendTs || 0) | 0;
+            if (lastTs && nowMs() - lastTs < 2000) return;
+            PROXY_CALL_PROBE._lastSendTs = nowMs();
+            send({ type: "qqw.explore.proxy_call_probe", ok: false, error: String(e) });
+          } catch (_) {}
+        }
+      }
+    });
+    PROXY_CALL_PROBE._ls.push(l0);
+    PROXY_CALL_PROBE.installed = true;
+    return { ok: true, installed: true, module: { name: String(mod.name || ""), base: ptr(mod.base).toString() }, addr: addr.toString(), off: off.toString() };
+  } catch (e) {
+    PROXY_CALL_PROBE.err = String(e);
+    return { ok: false, error: PROXY_CALL_PROBE.err };
+  }
+}
+
+function proxyCallProbeGet() {
+  return { ok: true, installed: PROXY_CALL_PROBE.installed, count: PROXY_CALL_PROBE.count, last: PROXY_CALL_PROBE.last, err: PROXY_CALL_PROBE.err || "" };
+}
+
+function proxyCallProbeOff() {
+  try {
+    const ls = PROXY_CALL_PROBE._ls || [];
+    for (let i = 0; i < ls.length; i++) {
+      try { ls[i].detach(); } catch (_) {}
+    }
+  } catch (_) {}
+  PROXY_CALL_PROBE._ls = [];
+  PROXY_CALL_PROBE.installed = false;
+  return { ok: true };
+}
+
+function contactsPipeProbeOn() {
+  if (!objcAvailable()) return { ok: false, error: "objc_unavailable" };
+  if (CONTACTS_PIPE_PROBE.installed) return { ok: true, installed: true, count: CONTACTS_PIPE_PROBE.count, err: CONTACTS_PIPE_PROBE.err || "" };
+  CONTACTS_PIPE_PROBE.err = "";
+  try {
+    const cls = ObjC.classes.WAContactsUploadManager;
+    if (!cls) return { ok: false, error: "WAContactsUploadManager missing" };
+    const sel = "- handleSyncManagerDidFinishUsync:";
+    const m = cls[sel];
+    if (!m || !m.implementation) return { ok: false, error: "method missing", selector: sel };
+    const l0 = Interceptor.attach(m.implementation, {
+      onEnter(args) {
+        try {
+          const ts = nowMs();
+          const tid = (function () { try { return Process.getCurrentThreadId(); } catch (_) { return 0; } })();
+          const pSelf = ptr(args[0]);
+          const pSel = ptr(args[1]);
+          const pArg = ptr(args[2]);
+          let ret = ptr("0x0");
+          let retMod = null;
+          let retOff = "";
+          try {
+            ret = ptr(this.returnAddress);
+            retMod = Process.findModuleByAddress(ret);
+            if (retMod && retMod.base) retOff = ret.sub(retMod.base).toString();
+          } catch (_) {}
+
+          const probe = {
+            ts: ts,
+            tid: tid,
+            selfPtr: pSelf.toString(),
+            selPtr: pSel.toString(),
+            arg0Ptr: pArg.toString(),
+            returnAddress: ret.toString(),
+            returnModule: retMod ? { name: String(retMod.name || ""), base: ptr(retMod.base).toString(), off: retOff } : null,
+            selfClass: _objcClassNameNoTouch(pSelf),
+            arg0Class: _objcClassNameNoTouch(pArg)
+          };
+
+          CONTACTS_PIPE_PROBE.last = probe;
+          CONTACTS_PIPE_PROBE.count++;
+          try {
+            const key = String(tid);
+            CONTACTS_PIPE_PROBE.lastByTid[key] = probe;
+            const keys = Object.keys(CONTACTS_PIPE_PROBE.lastByTid);
+            if (keys.length > 200) {
+              keys.sort((a, b) => (CONTACTS_PIPE_PROBE.lastByTid[a].ts || 0) - (CONTACTS_PIPE_PROBE.lastByTid[b].ts || 0));
+              for (let i = 0; i < keys.length - 120; i++) delete CONTACTS_PIPE_PROBE.lastByTid[keys[i]];
+            }
+          } catch (_) {}
+
+          try { send({ type: "qqw.explore.contacts_pipe_probe", ok: true, ...probe }); } catch (_) {}
+        } catch (e) {
+          try { send({ type: "qqw.explore.contacts_pipe_probe", ok: false, error: String(e) }); } catch (_) {}
+        }
+      }
+    });
+    CONTACTS_PIPE_PROBE._ls.push(l0);
+    CONTACTS_PIPE_PROBE.installed = true;
+    return { ok: true, installed: true };
+  } catch (e) {
+    CONTACTS_PIPE_PROBE.err = String(e);
+    return { ok: false, error: CONTACTS_PIPE_PROBE.err };
+  }
+}
+
+function contactsPipeProbeGet() {
+  return { ok: true, installed: CONTACTS_PIPE_PROBE.installed, count: CONTACTS_PIPE_PROBE.count, last: CONTACTS_PIPE_PROBE.last, err: CONTACTS_PIPE_PROBE.err || "" };
+}
+
+function contactsPipeProbeOff() {
+  try {
+    const ls = CONTACTS_PIPE_PROBE._ls || [];
+    for (let i = 0; i < ls.length; i++) {
+      try { ls[i].detach(); } catch (_) {}
+    }
+  } catch (_) {}
+  CONTACTS_PIPE_PROBE._ls = [];
+  CONTACTS_PIPE_PROBE.installed = false;
+  return { ok: true };
+}
+
+function _probeAttachByOff(mod, offStr, label) {
+  const out = { ok: false, label: String(label || ""), off: String(offStr || "") };
+  try {
+    if (!mod || !mod.base) return { ...out, error: "module missing" };
+    const off = ptr(String(offStr || "0x0"));
+    const addr = ptr(mod.base).add(off);
+    if (addr.isNull()) return { ...out, error: "addr null" };
+    const l = Interceptor.attach(addr, {
+      onEnter(args) {
+        try {
+          const ts = nowMs();
+          const tid = (function () { try { return Process.getCurrentThreadId(); } catch (_) { return 0; } })();
+          const rec = {
+            ts: ts,
+            tid: tid,
+            label: String(label || ""),
+            addr: addr.toString(),
+            off: String(offStr || ""),
+            a0: ptr(args[0]).toString(),
+            a1: ptr(args[1]).toString(),
+            a2: ptr(args[2]).toString(),
+            a3: ptr(args[3]).toString(),
+            a4: ptr(args[4]).toString(),
+            a5: ptr(args[5]).toString(),
+          };
+          CONTACTS_CHAIN_PROBE.last = rec;
+          CONTACTS_CHAIN_PROBE.lastAny = rec;
+          CONTACTS_CHAIN_PROBE.count++;
+          try {
+            const key = String(tid);
+            CONTACTS_CHAIN_PROBE.lastByTid[key] = rec;
+            const keys = Object.keys(CONTACTS_CHAIN_PROBE.lastByTid);
+            if (keys.length > 200) {
+              keys.sort((a, b) => (CONTACTS_CHAIN_PROBE.lastByTid[a].ts || 0) - (CONTACTS_CHAIN_PROBE.lastByTid[b].ts || 0));
+              for (let i = 0; i < keys.length - 120; i++) delete CONTACTS_CHAIN_PROBE.lastByTid[keys[i]];
+            }
+          } catch (_) {}
+          try {
+            if (CONTACTS_CHAIN_PROBE.emit) send({ type: "qqw.explore.contacts_chain_probe", ok: true, ...rec });
+          } catch (_) {}
+        } catch (e) {
+          try {
+            if (CONTACTS_CHAIN_PROBE.emit) send({ type: "qqw.explore.contacts_chain_probe", ok: false, error: String(e), label: String(label || "") });
+          } catch (_) {}
+        }
+      }
+    });
+    CONTACTS_CHAIN_PROBE._ls.push(l);
+    return { ok: true, label: String(label || ""), addr: addr.toString(), off: String(offStr || "") };
+  } catch (e) {
+    return { ...out, error: String(e) };
+  }
+}
+
+function contactsChainProbeOn() {
+  if (CONTACTS_CHAIN_PROBE.installed) return { ok: true, installed: true, count: CONTACTS_CHAIN_PROBE.count, err: CONTACTS_CHAIN_PROBE.err || "" };
+  CONTACTS_CHAIN_PROBE.err = "";
+  try {
+    const mod = Process.findModuleByName("WhatsApp");
+    if (!mod) return { ok: false, error: "WhatsApp module missing" };
+    const defs = [
+      { off: "0x35835e0", label: "sub_1035835E0" },
+      { off: "0x358373c", label: "sub_10358373C" },
+      { off: "0x3583d5c", label: "sub_103583D5C" },
+    ];
+    const installed = [];
+    for (let i = 0; i < defs.length; i++) {
+      const r = _probeAttachByOff(mod, defs[i].off, defs[i].label);
+      installed.push(r);
+    }
+    CONTACTS_CHAIN_PROBE.installed = true;
+    return { ok: true, installed: true, module: { name: String(mod.name || ""), base: ptr(mod.base).toString() }, hooks: installed };
+  } catch (e) {
+    CONTACTS_CHAIN_PROBE.err = String(e);
+    return { ok: false, error: CONTACTS_CHAIN_PROBE.err };
+  }
+}
+
+function contactsChainProbeGet() {
+  return { ok: true, installed: CONTACTS_CHAIN_PROBE.installed, count: CONTACTS_CHAIN_PROBE.count, last: CONTACTS_CHAIN_PROBE.last, err: CONTACTS_CHAIN_PROBE.err || "" };
+}
+
+function contactsChainProbeOff() {
+  try {
+    const ls = CONTACTS_CHAIN_PROBE._ls || [];
+    for (let i = 0; i < ls.length; i++) {
+      try { ls[i].detach(); } catch (_) {}
+    }
+  } catch (_) {}
+  CONTACTS_CHAIN_PROBE._ls = [];
+  CONTACTS_CHAIN_PROBE.installed = false;
+  return { ok: true };
+}
+
+function contactsChainProbeEmit(on) {
+  CONTACTS_CHAIN_PROBE.emit = !!on;
+  return { ok: true, emit: CONTACTS_CHAIN_PROBE.emit };
 }
 
 function installRevokeTrace() {
@@ -8957,6 +10826,336 @@ function crashsnifflaststep() {
   try { return { ok: true, lastStep: globalThis.__QQW_REACT2_LASTSTEP || null }; } catch (_) { return { ok: true, lastStep: null }; }
 }
 
+function msg10probeon(maxEvents, maxLastN, includeBacktrace) {
+  if (!objcAvailable()) return { ok: false, error: "objc_unavailable" };
+  if (MSG10_PROBE.installed) return { ok: true, installed: true, count: MSG10_PROBE.count, err: MSG10_PROBE.err || "" };
+  MSG10_PROBE.err = "";
+  MSG10_PROBE.count = 0;
+  MSG10_PROBE.lastN = [];
+  MSG10_PROBE.maxEvents = (maxEvents | 0) > 0 ? (maxEvents | 0) : 200;
+  MSG10_PROBE.maxLastN = (maxLastN | 0) > 0 ? (maxLastN | 0) : 50;
+  MSG10_PROBE.includeBacktrace = !!includeBacktrace;
+  MSG10_PROBE.byObj = {};
+  MSG10_PROBE.byObjKeys = [];
+  try {
+    MSG10_PROBE._sampleMod = 5;
+    MSG10_PROBE._sampleCtr = 0;
+    MSG10_PROBE._inProbe = false;
+    const selMT = ObjC.selector("messageType");
+    const selGE = ObjC.selector("groupEventType");
+    const selSetMT = ObjC.selector("setMessageType:");
+    const selSetGE = ObjC.selector("setGroupEventType:");
+    if (!selMT || !selGE) return { ok: false, error: "selectors missing" };
+    MSG10_PROBE._sel = { mt: selMT, ge: selGE, setmt: selSetMT, setge: selSetGE };
+
+    const objc_msgSend = Module.findExportByName(null, "objc_msgSend");
+    if (!objc_msgSend) return { ok: false, error: "objc_msgSend missing" };
+
+    const watchedGroupEventTypes = { 2: 1, 47: 1, 56: 1, 6: 1, 5: 1, 38: 1, 34: 1, 58: 1, 35: 1 };
+    const pickText = (o) => {
+      try {
+        const sels = ["previewText", "displayText", "summaryText", "accessibilityLabel", "text"];
+        for (let i = 0; i < sels.length; i++) {
+          const s = sels[i];
+          if (!objcHasSelector(o, s)) continue;
+          const v = o["- " + s]();
+          if (!v) continue;
+          const str = String(v || "").trim();
+          if (str) return str.slice(0, 400);
+        }
+      } catch (_) {}
+      return "";
+    };
+
+    MSG10_PROBE._h = Interceptor.attach(objc_msgSend, {
+      onEnter(args) {
+        try {
+          if (MSG10_PROBE._inProbe) return;
+          const s = args[1];
+          const sels = MSG10_PROBE._sel;
+          if (!s || !sels) return;
+          let kind = "";
+          if (s.equals(sels.mt)) kind = "mt";
+          else if (s.equals(sels.ge)) kind = "ge";
+          else if (sels.setmt && s.equals(sels.setmt)) kind = "setmt";
+          else if (sels.setge && s.equals(sels.setge)) kind = "setge";
+          else return;
+          const c = (MSG10_PROBE._sampleCtr | 0) + 1;
+          MSG10_PROBE._sampleCtr = c;
+          if ((c % MSG10_PROBE._sampleMod) !== 0) return;
+          this.__qqw_kind = kind;
+          this.__qqw_recv = args[0];
+          if (kind === "setmt" || kind === "setge") this.__qqw_v = args[2];
+        } catch (_) {}
+      },
+      onLeave(retval) {
+        try {
+          if (MSG10_PROBE._inProbe) return;
+          if (!this.__qqw_kind || !this.__qqw_recv) return;
+          const recvPtr = ptr(this.__qqw_recv).toString();
+          if (!recvPtr || recvPtr === "0x0") return;
+          let cn = "";
+          let obj = null;
+          try { obj = new ObjC.Object(this.__qqw_recv); cn = String(obj.$className || ""); } catch (_) { obj = null; cn = ""; }
+          const entry = MSG10_PROBE.byObj[recvPtr] || { cls: cn, msgType: null, ge: null, text: "", lastSentAt: 0 };
+          if (!entry.cls && cn) entry.cls = cn;
+
+          if (this.__qqw_kind === "mt" || this.__qqw_kind === "setmt") {
+            let v = 0;
+            try { v = (this.__qqw_kind === "mt" ? retval : this.__qqw_v).toInt32(); } catch (_) { v = 0; }
+            entry.msgType = v;
+            if (v === 10 && (entry.ge === null || entry.ge === undefined)) {
+              try {
+                if (obj && objcHasSelector(obj, "groupEventType")) {
+                  MSG10_PROBE._inProbe = true;
+                  const ge = Number(obj["- groupEventType"]()) | 0;
+                  MSG10_PROBE._inProbe = false;
+                  entry.ge = ge;
+                }
+              } catch (_) { MSG10_PROBE._inProbe = false; }
+            }
+          } else if (this.__qqw_kind === "ge" || this.__qqw_kind === "setge") {
+            let v = 0;
+            try { v = (this.__qqw_kind === "ge" ? retval : this.__qqw_v).toInt32(); } catch (_) { v = 0; }
+            entry.ge = v;
+          }
+
+          if (MSG10_PROBE.includeBacktrace && !entry.text && obj) {
+            const t = pickText(obj);
+            if (t) entry.text = t;
+          }
+
+          MSG10_PROBE.byObj[recvPtr] = entry;
+          if (MSG10_PROBE.byObjKeys.indexOf(recvPtr) === -1) {
+            MSG10_PROBE.byObjKeys.push(recvPtr);
+            if (MSG10_PROBE.byObjKeys.length > MSG10_PROBE.maxByObjKeys) {
+              const drop = MSG10_PROBE.byObjKeys.splice(0, MSG10_PROBE.byObjKeys.length - MSG10_PROBE.maxByObjKeys);
+              for (let i = 0; i < drop.length; i++) delete MSG10_PROBE.byObj[drop[i]];
+            }
+          }
+
+          const mt = entry.msgType;
+          const ge = entry.ge;
+          const should = (mt === 10) || (!!watchedGroupEventTypes[ge | 0]);
+          if (!should) return;
+          const now = nowMs();
+          if (entry.lastSentAt && (now - entry.lastSentAt) < 700) return;
+          entry.lastSentAt = now;
+          if (MSG10_PROBE.count >= MSG10_PROBE.maxEvents) return;
+          const evt = {
+            type: "qqw.explore.msg10probe",
+            ts: Date.now(),
+            recvPtr: recvPtr,
+            recvClass: entry.cls || cn,
+            sel: (this.__qqw_kind === "mt" || this.__qqw_kind === "setmt") ? "messageType" : "groupEventType",
+            msgType: mt,
+            groupEventType: ge,
+            text: entry.text || "",
+          };
+          MSG10_PROBE.lastN.push(evt);
+          if (MSG10_PROBE.lastN.length > MSG10_PROBE.maxLastN) MSG10_PROBE.lastN.splice(0, MSG10_PROBE.lastN.length - MSG10_PROBE.maxLastN);
+          MSG10_PROBE.count++;
+          send(evt);
+        } catch (_) {}
+      }
+    });
+
+    MSG10_PROBE.installed = true;
+    return { ok: true, installed: true, sampleMod: MSG10_PROBE._sampleMod, maxEvents: MSG10_PROBE.maxEvents, maxLastN: MSG10_PROBE.maxLastN, includeText: MSG10_PROBE.includeBacktrace ? 1 : 0 };
+  } catch (e) {
+    MSG10_PROBE.err = String(e);
+    try { if (MSG10_PROBE._h) MSG10_PROBE._h.detach(); } catch (_) {}
+    MSG10_PROBE._h = null;
+    MSG10_PROBE.installed = false;
+    return { ok: false, error: MSG10_PROBE.err };
+  }
+}
+
+function msg10probeoff() {
+  try { if (MSG10_PROBE._h) MSG10_PROBE._h.detach(); } catch (_) {}
+  MSG10_PROBE._h = null;
+  MSG10_PROBE.installed = false;
+  return { ok: true };
+}
+
+function msg10probestatus() {
+  return { ok: true, installed: MSG10_PROBE.installed, count: MSG10_PROBE.count, err: MSG10_PROBE.err || "", maxEvents: MSG10_PROBE.maxEvents, maxLastN: MSG10_PROBE.maxLastN };
+}
+
+function msg10probelast(maxN) {
+  const n = (maxN | 0) > 0 ? (maxN | 0) : 20;
+  const a = MSG10_PROBE.lastN || [];
+  return { ok: true, n: n, events: a.slice(Math.max(0, a.length - n)) };
+}
+
+function _boolArg(x) {
+  try {
+    const p = ptr(x);
+    if (!p || p.isNull()) return false;
+    return (p.toInt32() & 1) !== 0;
+  } catch (_) {
+    return false;
+  }
+}
+
+function _safeObj(ptr0) {
+  try {
+    const p = ptr(ptr0);
+    if (!p || p.isNull()) return null;
+    if (!objcAvailable()) return null;
+    return new ObjC.Object(p);
+  } catch (_) {
+    return null;
+  }
+}
+
+function _safeCall0(obj, selName) {
+  try {
+    if (!obj) return null;
+    const s = String(selName || "").trim();
+    if (!s) return null;
+    const m = obj[s];
+    if (!m) return null;
+    return m.call(obj);
+  } catch (_) {
+    return null;
+  }
+}
+
+function _safeCallStr0(obj, selName) {
+  try {
+    const v = _safeCall0(obj, selName);
+    if (v === null || v === undefined) return "";
+    return String(v);
+  } catch (_) {
+    return "";
+  }
+}
+
+function _safeCallInt0(obj, selName) {
+  try {
+    const v = _safeCall0(obj, selName);
+    if (v === null || v === undefined) return null;
+    if (typeof v === "number") return v | 0;
+    const p = ptr(v);
+    return p.toInt32();
+  } catch (_) {
+    return null;
+  }
+}
+
+function _safeCallBool0(obj, selName) {
+  try {
+    const v = _safeCall0(obj, selName);
+    if (v === null || v === undefined) return null;
+    if (typeof v === "boolean") return v;
+    if (typeof v === "number") return (v | 0) !== 0;
+    const p = ptr(v);
+    return (p.toInt32() & 1) !== 0;
+  } catch (_) {
+    return null;
+  }
+}
+
+function addcontactprobeon(maxEvents, maxLastN) {
+  try {
+    if (!objcAvailable()) return { ok: false, error: "objc_unavailable" };
+    try { if (ADDCONTACT_PROBE._h) ADDCONTACT_PROBE._h.detach(); } catch (_) {}
+    ADDCONTACT_PROBE._h = null;
+    ADDCONTACT_PROBE.err = "";
+    ADDCONTACT_PROBE.count = 0;
+    ADDCONTACT_PROBE.maxEvents = Math.max(10, Math.min(5000, (maxEvents | 0) || 200));
+    ADDCONTACT_PROBE.maxLastN = Math.max(5, Math.min(500, (maxLastN | 0) || 50));
+    ADDCONTACT_PROBE.lastN = [];
+
+    const cls = ObjC.classes.WAMessageContainerView;
+    if (!cls) return { ok: false, error: "class_not_found", className: "WAMessageContainerView" };
+    const m = cls["- shouldOfferAddToContactsForMessage:incomingGroupMessage:interactiveGroupEvent:"];
+    if (!m || !m.implementation) return { ok: false, error: "method_not_found" };
+    const imp = ptr(m.implementation);
+
+    ADDCONTACT_PROBE._h = Interceptor.attach(imp, {
+      onEnter(args) {
+        try {
+          this._t0 = nowMs();
+          this._self = ptr(args[0]);
+          this._msg = ptr(args[2]);
+          this._incomingGroup = _boolArg(args[3]);
+          this._interactive = _boolArg(args[4]);
+        } catch (_) {}
+      },
+      onLeave(retval) {
+        try {
+          const ok = _boolArg(retval);
+          ADDCONTACT_PROBE.count = (ADDCONTACT_PROBE.count | 0) + 1;
+          const msgPtr = this._msg || ptr("0x0");
+          const msgClass = _objcClassNameNoTouch(msgPtr);
+          const msgObj = _safeObj(msgPtr);
+          const ev = {
+            ts: nowMs(),
+            dt: (nowMs() - (this._t0 || 0)) | 0,
+            ok: ok,
+            self: (this._self || ptr("0x0")).toString(),
+            msg: msgPtr.toString(),
+            msgClass: msgClass,
+            incomingGroupMessage: !!this._incomingGroup,
+            interactiveGroupEvent: !!this._interactive,
+            isSenderUnknown: msgObj ? _safeCallBool0(msgObj, "isSenderUnknown") : null,
+            authorUserJID: msgObj ? _safeCallStr0(msgObj, "authorUserJID") : "",
+            stanzaID: msgObj ? (_safeCallStr0(msgObj, "stanzaID") || _safeCallStr0(msgObj, "stanzaId")) : "",
+            messageType: msgObj ? _safeCallInt0(msgObj, "messageType") : null,
+            groupEventType: msgObj ? _safeCallInt0(msgObj, "groupEventType") : null,
+          };
+          const a = ADDCONTACT_PROBE.lastN || [];
+          a.push(ev);
+          if (a.length > ADDCONTACT_PROBE.maxLastN) a.splice(0, a.length - ADDCONTACT_PROBE.maxLastN);
+          ADDCONTACT_PROBE.lastN = a;
+          if (ADDCONTACT_PROBE.count <= ADDCONTACT_PROBE.maxEvents) {
+            try { send({ type: "wa.add_to_contacts.offer", ev: ev, build: SCRIPT_BUILD_ID }); } catch (_) {}
+          }
+          if (ADDCONTACT_PROBE.count >= ADDCONTACT_PROBE.maxEvents) {
+            try { if (ADDCONTACT_PROBE._h) ADDCONTACT_PROBE._h.detach(); } catch (_) {}
+            ADDCONTACT_PROBE._h = null;
+            ADDCONTACT_PROBE.installed = false;
+          } else {
+            ADDCONTACT_PROBE.installed = true;
+          }
+        } catch (e) {
+          ADDCONTACT_PROBE.err = String(e);
+          try { if (ADDCONTACT_PROBE._h) ADDCONTACT_PROBE._h.detach(); } catch (_) {}
+          ADDCONTACT_PROBE._h = null;
+          ADDCONTACT_PROBE.installed = false;
+        }
+      }
+    });
+    ADDCONTACT_PROBE.installed = true;
+    return { ok: true, installed: true, imp: imp.toString(), maxEvents: ADDCONTACT_PROBE.maxEvents, maxLastN: ADDCONTACT_PROBE.maxLastN };
+  } catch (e) {
+    ADDCONTACT_PROBE.err = String(e);
+    try { if (ADDCONTACT_PROBE._h) ADDCONTACT_PROBE._h.detach(); } catch (_) {}
+    ADDCONTACT_PROBE._h = null;
+    ADDCONTACT_PROBE.installed = false;
+    return { ok: false, error: String(e) };
+  }
+}
+
+function addcontactprobeoff() {
+  try { if (ADDCONTACT_PROBE._h) ADDCONTACT_PROBE._h.detach(); } catch (_) {}
+  ADDCONTACT_PROBE._h = null;
+  ADDCONTACT_PROBE.installed = false;
+  return { ok: true };
+}
+
+function addcontactprobestatus() {
+  return { ok: true, installed: ADDCONTACT_PROBE.installed, count: ADDCONTACT_PROBE.count, err: ADDCONTACT_PROBE.err || "", maxEvents: ADDCONTACT_PROBE.maxEvents, maxLastN: ADDCONTACT_PROBE.maxLastN };
+}
+
+function addcontactprobelast(maxN) {
+  const n = (maxN | 0) > 0 ? (maxN | 0) : 20;
+  const a = ADDCONTACT_PROBE.lastN || [];
+  return { ok: true, n: n, events: a.slice(Math.max(0, a.length - n)) };
+}
+
 rpc.exports = {
   entries: () => ({ ok: true, build: SCRIPT_BUILD_ID, exports: Object.keys(rpc.exports).sort() }),
   build: () => SCRIPT_BUILD_ID,
@@ -9011,6 +11210,14 @@ rpc.exports = {
   statuspostvideo: (videoPath, captionText, messageOrigin) => statuspostvideo(videoPath, captionText, messageOrigin),
   crashsniff: () => installCrashSniffer(),
   crashsnifflaststep: () => crashsnifflaststep(),
+  msg10probeon: (maxEvents, maxLastN, includeBacktrace) => msg10probeon(maxEvents, maxLastN, includeBacktrace),
+  msg10probeoff: () => msg10probeoff(),
+  msg10probestatus: () => msg10probestatus(),
+  msg10probelast: (maxN) => msg10probelast(maxN),
+  addcontactprobeon: (maxEvents, maxLastN) => addcontactprobeon(maxEvents, maxLastN),
+  addcontactprobeoff: () => addcontactprobeoff(),
+  addcontactprobestatus: () => addcontactprobestatus(),
+  addcontactprobelast: (maxN) => addcontactprobelast(maxN),
   impof: (className, selName) => impof(className, selName),
   ppcrashprobe: (jid, useMainApp) => probeCrashRequestThumb(jid, !!useMainApp),
   ppsniffprobe: (jid, useMainApp) => {
@@ -9025,6 +11232,45 @@ rpc.exports = {
   revokeprobeon: () => installRevokeProbe(),
   revokeprobeget: () => revokeProbeStatus(),
   revokeprobeoff: () => revokeProbeOff(),
+  csfetchprobeon: () => csFetchProbeOn(),
+  csfetchprobeget: () => csFetchProbeGet(),
+  csfetchprobeoff: () => csFetchProbeOff(),
+  csfetchlastcontextget: () => csFetchLastContextGet(),
+  csfetchretget: () => csFetchRetGet(),
+  csfetchretrelease: () => csFetchRetRelease(),
+  csfetchdictpeek: (maxN) => csFetchDictPeek(maxN | 0),
+  csfetchvalueget: () => csFetchValueGet(),
+  csfetchvaluerelease: () => csFetchValueRelease(),
+  csfetchvaluecapturefirst: () => csFetchValueCaptureFirst(),
+  csfetchvalueivars: (maxN) => csFetchValueIvars(maxN | 0),
+  csfetchvaluemethods: (regex, maxN) => csFetchValueMethods(regex, maxN | 0),
+  csabgetfields: () => csABContactGetFields(),
+  csabsetfullname: (fullNameStr, allowExternalSideEffects, saveAfter) => csABContactSetFullName(fullNameStr, allowExternalSideEffects, saveAfter),
+  csabsetgivenname: (givenNameStr, saveAfter) => csABContactSetGivenName(givenNameStr, saveAfter),
+  csabsetnotes: (notesStr, saveAfter) => csABContactSetNotes(notesStr, saveAfter),
+  csabautofetchjid: (chatJidStr) => csABAutoFetchForJid(chatJidStr),
+  csabsetgivennamejid: (chatJidStr, givenNameStr, saveAfter) => csABSetGivenNameByChatJid(chatJidStr, givenNameStr, saveAfter),
+  notifycontactstoredidchange: () => csNotifyContactStoreDidChange(),
+  csabsyncos: () => csABPersistEditsToSyncedContact(),
+  csabsyncosenable: (on) => csABSyncOSEnable(on | 0),
+  csabsyncoslast: () => csABSyncOSGetLast(),
+  csabcnget: () => csABCNContactGet(),
+  csabcnset: (givenNameStr, familyNameStr, noteStr) => csABCNContactSet(givenNameStr, familyNameStr, noteStr),
+  csabcnfindphone: (phoneStr) => csABCNFindByPhone(phoneStr),
+  csabcncreatephone: (phoneStr, givenNameStr) => csABCNCreateByPhone(phoneStr, givenNameStr),
+  csabcnupsertphone: (phoneStr, givenNameStr, familyNameStr, noteStr) => csABCNUpsertByPhone(phoneStr, givenNameStr, familyNameStr, noteStr),
+  getabproxyforchatjid: (chatJidStr, limitClasses) => getAddressBookProxyForChatJid(chatJidStr, limitClasses | 0),
+  getabproxyforchatjidctx: (chatJidStr, inContextPtrStr, limitClasses) => getAddressBookProxyForChatJidWithContext(chatJidStr, inContextPtrStr, limitClasses | 0),
+  proxycallprobeon: () => proxyCallProbeOn(),
+  proxycallprobeget: () => proxyCallProbeGet(),
+  proxycallprobeoff: () => proxyCallProbeOff(),
+  contactspipeprobeon: () => contactsPipeProbeOn(),
+  contactspipeprobeget: () => contactsPipeProbeGet(),
+  contactspipeprobeoff: () => contactsPipeProbeOff(),
+  contactschainprobeon: () => contactsChainProbeOn(),
+  contactschainprobeget: () => contactsChainProbeGet(),
+  contactschainprobeoff: () => contactsChainProbeOff(),
+  contactschainprobeemit: (on) => contactsChainProbeEmit(!!on),
   selresponders: (selectorName, maxN) => selResponders(selectorName, maxN),
   quotedselectors: (className, regex, maxN) => quotedSelectors(className, regex, maxN),
   objselectors: (ptrStr, regex, maxN) => objSelectors(ptrStr, regex, maxN, false),
@@ -9136,6 +11382,22 @@ rpc.exports = {
 safeObjCInvoke(() => {
   try {
     send({ type: "qqw.explore.ready", build: SCRIPT_BUILD_ID, ts: nowMs(), objc: objcAvailable(), sqlite: SQLITE.ok, sqliteErr: SQLITE.err || "" });
+  } catch (_) {}
+  try {
+    const r = csFetchProbeOff();
+    send({ type: "qqw.explore.cs_fetch_probe_installed", ok: false, res: r || null, ts: nowMs() });
+  } catch (_) {}
+  try {
+    const r2 = contactsPipeProbeOff();
+    send({ type: "qqw.explore.contacts_pipe_probe_installed", ok: false, res: r2 || null, ts: nowMs() });
+  } catch (_) {}
+  try {
+    const r3 = contactsChainProbeOff();
+    send({ type: "qqw.explore.contacts_chain_probe_installed", ok: false, res: r3 || null, ts: nowMs() });
+  } catch (_) {}
+  try {
+    const r4 = proxyCallProbeOff();
+    send({ type: "qqw.explore.proxy_call_probe_installed", ok: false, res: r4 || null, ts: nowMs() });
   } catch (_) {}
 });
 
