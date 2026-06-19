@@ -203,6 +203,18 @@ type TxMsgActionPayload struct {
 	TimeoutMs      int    `json:"timeoutMs,omitempty"`
 }
 
+type TxStatusActionPayload struct {
+	OpID           string `json:"opId"`
+	TaskID         string `json:"taskId,omitempty"`
+	InstanceID     string `json:"instanceId,omitempty"`
+	Action         string `json:"action"`
+	ChatJID        string `json:"chatJid,omitempty"`
+	StatusStanzaID string `json:"statusStanzaId"`
+	Text           string `json:"text,omitempty"`
+	ParticipantJID string `json:"participantJid,omitempty"`
+	TimeoutMs      int    `json:"timeoutMs,omitempty"`
+}
+
 type TxAvatarURLPayload struct {
 	OpID      string `json:"opId"`
 	JID       string `json:"jid"`
@@ -1362,6 +1374,8 @@ func (a *Agent) readLoop(ctx context.Context, ws *websocket.Conn, sessionID stri
 			go a.handleTxAssetPrefetch(in)
 		case "tx_msg_action":
 			go a.handleTxMsgAction(in)
+		case "tx_status_action":
+			go a.handleTxStatusAction(in)
 		case "tx_avatar_url":
 			go a.handleTxAvatarURL(in)
 		case "tx_self_card":
@@ -2004,6 +2018,73 @@ func (a *Agent) handleTxMsgAction(in Envelope) {
 		return
 	}
 	a.logf("tx_msg_action: dispatched opId=%s action=%s jid=%s stanzaId=%s", p.OpID, p.Action, p.JID, p.StanzaID)
+}
+
+// handleTxStatusAction 将 broker 下发的状态动作转为本机 runner RPC。
+func (a *Agent) handleTxStatusAction(in Envelope) {
+	var p TxStatusActionPayload
+	if err := json.Unmarshal(in.Payload, &p); err != nil {
+		a.logf("tx_status_action: invalid payload: %v", err)
+		return
+	}
+	p.OpID = strings.TrimSpace(p.OpID)
+	p.TaskID = strings.TrimSpace(p.TaskID)
+	p.InstanceID = strings.TrimSpace(p.InstanceID)
+	p.Action = strings.TrimSpace(p.Action)
+	p.ChatJID = strings.TrimSpace(p.ChatJID)
+	p.StatusStanzaID = strings.TrimSpace(p.StatusStanzaID)
+	p.Text = strings.TrimSpace(p.Text)
+	p.ParticipantJID = strings.TrimSpace(p.ParticipantJID)
+	if p.OpID == "" || p.Action == "" || p.StatusStanzaID == "" || p.ParticipantJID == "" {
+		a.logf("tx_status_action: missing opId/action/statusStanzaId/participantJid")
+		return
+	}
+	if p.ChatJID == "" {
+		p.ChatJID = "status@broadcast"
+	}
+	if p.TimeoutMs <= 0 {
+		p.TimeoutMs = 20_000
+	}
+	a.logf("tx_status_action: dispatch begin opId=%s action=%s chatJid=%s statusStanzaId=%s participantJid=%s timeoutMs=%d", p.OpID, p.Action, p.ChatJID, p.StatusStanzaID, p.ParticipantJID, p.TimeoutMs)
+	if a.runnerPid.Load() == 0 {
+		_ = a.startRunner()
+	}
+	rpcURL := "http://127.0.0.1:17172/rpc/status/action"
+	body, _ := json.Marshal(map[string]any{
+		"opId":           p.OpID,
+		"taskId":         p.TaskID,
+		"instanceId":     p.InstanceID,
+		"action":         p.Action,
+		"chatJid":        p.ChatJID,
+		"statusStanzaId": p.StatusStanzaID,
+		"text":           p.Text,
+		"participantJid": p.ParticipantJID,
+		"timeoutMs":      p.TimeoutMs,
+	})
+	cctx, cancel := context.WithTimeout(context.Background(), time.Duration(p.TimeoutMs+3000)*time.Millisecond)
+	defer cancel()
+	req, err := http.NewRequestWithContext(cctx, http.MethodPost, rpcURL, bytes.NewReader(body))
+	if err != nil {
+		a.logf("tx_status_action: build request failed opId=%s action=%s err=%v", p.OpID, p.Action, err)
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		a.logf("tx_status_action: rpc failed opId=%s action=%s err=%v", p.OpID, p.Action, err)
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		bs, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		msg := strings.TrimSpace(string(bs))
+		if msg == "" {
+			msg = resp.Status
+		}
+		a.logf("tx_status_action: rpc status=%d opId=%s action=%s err=%s", resp.StatusCode, p.OpID, p.Action, msg)
+		return
+	}
+	a.logf("tx_status_action: dispatch ok opId=%s action=%s statusStanzaId=%s participantJid=%s", p.OpID, p.Action, p.StatusStanzaID, p.ParticipantJID)
 }
 
 func (a *Agent) handleTxAvatarURL(in Envelope) {

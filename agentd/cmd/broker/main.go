@@ -157,6 +157,18 @@ type TxMsgActionPayload struct {
 	TimeoutMs      int    `json:"timeoutMs,omitempty"`
 }
 
+type TxStatusActionPayload struct {
+	OpID           string `json:"opId"`
+	TaskID         string `json:"taskId,omitempty"`
+	InstanceID     string `json:"instanceId,omitempty"`
+	Action         string `json:"action"`
+	ChatJID        string `json:"chatJid,omitempty"`
+	StatusStanzaID string `json:"statusStanzaId"`
+	Text           string `json:"text,omitempty"`
+	ParticipantJID string `json:"participantJid,omitempty"`
+	TimeoutMs      int    `json:"timeoutMs,omitempty"`
+}
+
 type TxAvatarURLPayload struct {
 	OpID      string `json:"opId"`
 	JID       string `json:"jid"`
@@ -861,6 +873,61 @@ on conflict (device_id) do update set
 			return
 		}
 		logJSON("tx_msg_action_dispatched", map[string]any{"deviceId": deviceID, "opId": req.OpID, "action": req.Action, "jid": req.JID, "stanzaId": req.StanzaID})
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+		return
+	}
+	if len(parts) == 3 && parts[1] == "tx" && parts[2] == "status_action" {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		deviceID := strings.TrimSpace(parts[0])
+		if deviceID == "" {
+			http.Error(w, "deviceId required", http.StatusBadRequest)
+			return
+		}
+		sess := b.getSession(deviceID)
+		if sess == nil {
+			http.Error(w, "device offline", http.StatusNotFound)
+			return
+		}
+		var req TxStatusActionPayload
+		if err := readJSON(r, &req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		req.OpID = strings.TrimSpace(req.OpID)
+		req.TaskID = strings.TrimSpace(req.TaskID)
+		req.InstanceID = strings.TrimSpace(req.InstanceID)
+		req.Action = strings.TrimSpace(req.Action)
+		req.ChatJID = strings.TrimSpace(req.ChatJID)
+		req.StatusStanzaID = strings.TrimSpace(req.StatusStanzaID)
+		req.Text = strings.TrimSpace(req.Text)
+		req.ParticipantJID = strings.TrimSpace(req.ParticipantJID)
+		if req.OpID == "" || req.Action == "" || req.StatusStanzaID == "" || req.ParticipantJID == "" {
+			http.Error(w, "opId/action/statusStanzaId/participantJid required", http.StatusBadRequest)
+			return
+		}
+		if req.ChatJID == "" {
+			req.ChatJID = "status@broadcast"
+		}
+		if req.TimeoutMs <= 0 {
+			req.TimeoutMs = 20_000
+		}
+		payload, _ := json.Marshal(req)
+		env := Envelope{
+			V:        1,
+			Type:     "tx_status_action",
+			DeviceID: deviceID,
+			Session:  sess.session,
+			TS:       time.Now().UnixMilli(),
+			Payload:  payload,
+		}
+		if err := sess.send(r.Context(), env); err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		logJSON("tx_status_action_dispatched", map[string]any{"deviceId": deviceID, "opId": req.OpID, "action": req.Action, "statusStanzaId": req.StatusStanzaID})
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 		return
 	}

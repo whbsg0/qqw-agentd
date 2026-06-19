@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"log"
 	"net"
 	"net/http"
 	"strings"
@@ -32,6 +33,18 @@ type msgActionRPCReq struct {
 	Action         string `json:"action"`
 	JID            string `json:"jid"`
 	StanzaID       string `json:"stanzaId"`
+	Text           string `json:"text,omitempty"`
+	ParticipantJID string `json:"participantJid,omitempty"`
+	TimeoutMs      int    `json:"timeoutMs,omitempty"`
+}
+
+type statusActionRPCReq struct {
+	OpID           string `json:"opId"`
+	TaskID         string `json:"taskId,omitempty"`
+	InstanceID     string `json:"instanceId,omitempty"`
+	Action         string `json:"action"`
+	ChatJID        string `json:"chatJid,omitempty"`
+	StatusStanzaID string `json:"statusStanzaId"`
 	Text           string `json:"text,omitempty"`
 	ParticipantJID string `json:"participantJid,omitempty"`
 	TimeoutMs      int    `json:"timeoutMs,omitempty"`
@@ -83,6 +96,7 @@ func startRPCServer(addr string) {
 	mux.HandleFunc("/rpc/tx/send", handleRPCTxSend)
 	mux.HandleFunc("/rpc/tx/status", handleRPCTxStatus)
 	mux.HandleFunc("/rpc/msg/action", handleRPCMsgAction)
+	mux.HandleFunc("/rpc/status/action", handleRPCStatusAction)
 	mux.HandleFunc("/rpc/avatar/url", handleRPCAvatarURL)
 	mux.HandleFunc("/rpc/self/card", handleRPCSelfCard)
 	mux.HandleFunc("/rpc/contacts/note/upsert", handleRPCContactsNoteUpsert)
@@ -325,6 +339,65 @@ func handleRPCMsgAction(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// handleRPCStatusAction 将本地 RPC 请求转为脚本侧 `qqw.status_action` 消息。
+func handleRPCStatusAction(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req statusActionRPCReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+	req.OpID = strings.TrimSpace(req.OpID)
+	req.TaskID = strings.TrimSpace(req.TaskID)
+	req.InstanceID = strings.TrimSpace(req.InstanceID)
+	req.Action = strings.TrimSpace(req.Action)
+	req.ChatJID = strings.TrimSpace(req.ChatJID)
+	req.StatusStanzaID = strings.TrimSpace(req.StatusStanzaID)
+	req.Text = strings.TrimSpace(req.Text)
+	req.ParticipantJID = strings.TrimSpace(req.ParticipantJID)
+	if req.OpID == "" || req.Action == "" || req.StatusStanzaID == "" || req.ParticipantJID == "" {
+		http.Error(w, "opId/action/statusStanzaId/participantJid required", http.StatusBadRequest)
+		return
+	}
+	if req.ChatJID == "" {
+		req.ChatJID = "status@broadcast"
+	}
+	if req.TimeoutMs <= 0 {
+		req.TimeoutMs = 20_000
+	}
+	log.Printf("rpc_status_action: request opId=%s action=%s chatJid=%s statusStanzaId=%s participantJid=%s timeoutMs=%d", req.OpID, req.Action, req.ChatJID, req.StatusStanzaID, req.ParticipantJID, req.TimeoutMs)
+	if !scriptReady() {
+		log.Printf("rpc_status_action: script not ready opId=%s action=%s", req.OpID, req.Action)
+		http.Error(w, "script not ready", http.StatusServiceUnavailable)
+		return
+	}
+	msg := map[string]any{
+		"type": "qqw.status_action",
+		"payload": map[string]any{
+			"opId":           req.OpID,
+			"taskId":         req.TaskID,
+			"instanceId":     req.InstanceID,
+			"action":         req.Action,
+			"chatJid":        req.ChatJID,
+			"statusStanzaId": req.StatusStanzaID,
+			"text":           req.Text,
+			"participantJid": req.ParticipantJID,
+			"timeoutMs":      req.TimeoutMs,
+		},
+	}
+	b, _ := json.Marshal(msg)
+	if err := postToScriptJSON(string(b)); err != nil {
+		log.Printf("rpc_status_action: postToScriptJSON failed opId=%s action=%s err=%v", req.OpID, req.Action, err)
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	log.Printf("rpc_status_action: posted opId=%s action=%s statusStanzaId=%s", req.OpID, req.Action, req.StatusStanzaID)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
