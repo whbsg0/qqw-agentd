@@ -1,4 +1,3 @@
-
 name: build-agentd
 
 on:
@@ -14,45 +13,10 @@ jobs:
         with:
           go-version: "1.23.x"
 
-      - name: Build agentd (ios/arm64)
-        working-directory: agentd
-        run: |
-          go mod download
-          REF_TYPE="${{ github.ref_type }}"
-          REF_NAME="${{ github.ref_name }}"
-          VERSION=""
-          if [ "$REF_TYPE" = "tag" ]; then
-            VERSION="1:${REF_NAME#v}"
-          else
-            VERSION="1:0.0.0+run.${GITHUB_RUN_NUMBER}+sha.${GITHUB_SHA::7}"
-          fi
-          case "$VERSION" in
-            *-*) ;;
-            *) VERSION="${VERSION}-1" ;;
-          esac
-          SDKROOT="$(xcrun --sdk iphoneos --show-sdk-path)"
-          CC="$(xcrun --sdk iphoneos --find clang)"
-          CXX="$(xcrun --sdk iphoneos --find clang++)"
-          export SDKROOT CC CXX
-          export CGO_ENABLED=1 GOOS=ios GOARCH=arm64
-          export CGO_CFLAGS="-isysroot $SDKROOT -miphoneos-version-min=13.0"
-          export CGO_LDFLAGS="-isysroot $SDKROOT -miphoneos-version-min=13.0"
-          go build -trimpath -ldflags "-s -w -linkmode external -X main.buildVersion=$VERSION -X main.buildCommit=${GITHUB_SHA::7}" -o dist/agentd-ios-arm64 ./cmd/agentd
-          codesign --sign - --force --timestamp=none dist/agentd-ios-arm64
-          echo "=== verify Mach-O platform ==="
-          file dist/agentd-ios-arm64
-          otool -l dist/agentd-ios-arm64 | grep -n "LC_BUILD_VERSION" -A3 | head -n 30
-          PLATFORM="$(otool -l dist/agentd-ios-arm64 | awk '$1=="cmd" && $2=="LC_BUILD_VERSION"{f=1} f && $1=="platform"{print $2; exit}')"
-          if [ "$PLATFORM" != "2" ]; then
-            echo "ERROR: expected iOS platform=2, got platform=$PLATFORM"
-            exit 1
-          fi
-
-      - name: Build qqw-script-runner (ios/arm64)
+      - name: Prepare frida-core devkit (ios)
         working-directory: agentd
         run: |
           set -euo pipefail
-          go mod download
           FRIDA_CORE_VERSION="16.7.19"
           DEVKIT_DIR="$(pwd)/dist/frida-core-devkit"
           mkdir -p "$DEVKIT_DIR"
@@ -86,9 +50,10 @@ jobs:
           else
             DEVKIT_ROOT="$(dirname "$INCLUDE_DIR")"
           fi
+
           LIBDIR="$DEVKIT_ROOT"
           if [ -d "$DEVKIT_ROOT/lib" ]; then LIBDIR="$DEVKIT_ROOT/lib"; fi
-          INCLUDES="-I$DEVKIT_DIR/include"
+
           INCLUDES="-I$INCLUDE_DIR"
           for d in "$INCLUDE_DIR/glib-2.0" "$INCLUDE_DIR/gio-unix-2.0" "$INCLUDE_DIR/json-glib-1.0"; do
             if [ -d "$d" ]; then INCLUDES="$INCLUDES -I$d"; fi
@@ -96,6 +61,7 @@ jobs:
           for d in "$LIBDIR/glib-2.0/include" "$LIBDIR/gio-unix-2.0/include"; do
             if [ -d "$d" ]; then INCLUDES="$INCLUDES -I$d"; fi
           done
+
           LDFLAGS_EXTRA="-framework Foundation -framework CoreFoundation -framework Security"
           if [ -f "$LIBDIR/libfrida-core.a" ]; then
             LDFLAGS_EXTRA="$LDFLAGS_EXTRA $LIBDIR/libfrida-core.a"
@@ -107,13 +73,63 @@ jobs:
           else
             LDFLAGS_EXTRA="$LDFLAGS_EXTRA -L$LIBDIR -lfrida-core"
           fi
+
+          {
+            echo "FRIDA_IOS_CFLAGS<<EOF"
+            echo "$INCLUDES"
+            echo "EOF"
+            echo "FRIDA_IOS_LDFLAGS<<EOF"
+            echo "$LDFLAGS_EXTRA"
+            echo "EOF"
+          } >> "$GITHUB_ENV"
+
+      - name: Build agentd (ios/arm64)
+        working-directory: agentd
+        run: |
+          set -euo pipefail
+          go mod download
+          REF_TYPE="${{ github.ref_type }}"
+          REF_NAME="${{ github.ref_name }}"
+          VERSION=""
+          if [ "$REF_TYPE" = "tag" ]; then
+            VERSION="1:${REF_NAME#v}"
+          else
+            VERSION="1:0.0.0+run.${GITHUB_RUN_NUMBER}+sha.${GITHUB_SHA::7}"
+          fi
+          case "$VERSION" in
+            *-*) ;;
+            *) VERSION="${VERSION}-1" ;;
+          esac
           SDKROOT="$(xcrun --sdk iphoneos --show-sdk-path)"
           CC="$(xcrun --sdk iphoneos --find clang)"
           CXX="$(xcrun --sdk iphoneos --find clang++)"
           export SDKROOT CC CXX
           export CGO_ENABLED=1 GOOS=ios GOARCH=arm64
-          export CGO_CFLAGS="-isysroot $SDKROOT -miphoneos-version-min=13.0 $INCLUDES"
-          export CGO_LDFLAGS="-isysroot $SDKROOT -miphoneos-version-min=13.0 $LDFLAGS_EXTRA"
+          export CGO_CFLAGS="-isysroot $SDKROOT -miphoneos-version-min=13.0 $FRIDA_IOS_CFLAGS"
+          export CGO_LDFLAGS="-isysroot $SDKROOT -miphoneos-version-min=13.0 $FRIDA_IOS_LDFLAGS"
+          go build -trimpath -ldflags "-s -w -linkmode external -X main.buildVersion=$VERSION -X main.buildCommit=${GITHUB_SHA::7}" -o dist/agentd-ios-arm64 ./cmd/agentd
+          codesign --sign - --force --timestamp=none dist/agentd-ios-arm64
+          echo "=== verify Mach-O platform ==="
+          file dist/agentd-ios-arm64
+          otool -l dist/agentd-ios-arm64 | grep -n "LC_BUILD_VERSION" -A3 | head -n 30
+          PLATFORM="$(otool -l dist/agentd-ios-arm64 | awk '$1=="cmd" && $2=="LC_BUILD_VERSION"{f=1} f && $1=="platform"{print $2; exit}')"
+          if [ "$PLATFORM" != "2" ]; then
+            echo "ERROR: expected iOS platform=2, got platform=$PLATFORM"
+            exit 1
+          fi
+
+      - name: Build qqw-script-runner (ios/arm64)
+        working-directory: agentd
+        run: |
+          set -euo pipefail
+          go mod download
+          SDKROOT="$(xcrun --sdk iphoneos --show-sdk-path)"
+          CC="$(xcrun --sdk iphoneos --find clang)"
+          CXX="$(xcrun --sdk iphoneos --find clang++)"
+          export SDKROOT CC CXX
+          export CGO_ENABLED=1 GOOS=ios GOARCH=arm64
+          export CGO_CFLAGS="-isysroot $SDKROOT -miphoneos-version-min=13.0 $FRIDA_IOS_CFLAGS"
+          export CGO_LDFLAGS="-isysroot $SDKROOT -miphoneos-version-min=13.0 $FRIDA_IOS_LDFLAGS"
           go build -trimpath -ldflags "-s -w -linkmode external" -o dist/qqw-script-runner-ios-arm64 ./cmd/qqw-script-runner
           codesign --sign - --force --timestamp=none dist/qqw-script-runner-ios-arm64
           echo "=== verify Mach-O platform ==="
