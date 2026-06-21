@@ -16,6 +16,13 @@
     "startCmd": "/var/jb/usr/sbin/frida-server -l 127.0.0.1:27042"
   },
   "whatsApp": {
-    "chatStoragePath": "/path/to/ChatStorage.sqlite"
+    "chatStoragePath": "/path/to/ChatStorage.sqlite",
+    "bundleId": "net.whatsapp.WhatsApp",
+    "autoGuardEnabled": false,
+    "foregroundConfirmMs": 5000,
+    "foregroundStableMs": 3000,
+    "recoveryWindowMs": 600000,
+    "maxRecoveryAttempts": 5,
+    "healthCheckMs": 3000
   }
 }

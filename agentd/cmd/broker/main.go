@@ -18,6 +18,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -71,9 +72,25 @@ type ScriptHealthPayload struct {
 	LastError     string `json:"lastError,omitempty"`
 }
 
+type GuardHealthPayload struct {
+	Enabled               bool   `json:"enabled"`
+	State                 string `json:"state,omitempty"`
+	RunnerState           string `json:"runnerState,omitempty"`
+	ReasonCode            string `json:"reasonCode,omitempty"`
+	ListeningReady        bool   `json:"listeningReady"`
+	ProcessRunning        bool   `json:"processRunning"`
+	LastRecoveryAtMs      int64  `json:"lastRecoveryAtMs,omitempty"`
+	RecoveryAttempts      int    `json:"recoveryAttempts,omitempty"`
+	MaxRecoveryAttempts   int    `json:"maxRecoveryAttempts,omitempty"`
+	RemainingRetryCount   int    `json:"remainingRetryCount,omitempty"`
+	NextRetryAtMs         int64  `json:"nextRetryAtMs,omitempty"`
+	FrontmostQueryEnabled bool   `json:"frontmostQueryEnabled"`
+}
+
 type PingPayload struct {
 	Runner RunnerHealthPayload `json:"runner"`
 	Script ScriptHealthPayload `json:"script"`
+	Guard  GuardHealthPayload  `json:"guard"`
 }
 
 type OpenTunnelPayload struct {
@@ -715,6 +732,68 @@ on conflict (device_id) do update set
 			return
 		}
 		kind := "script_" + parts[2]
+		env := Envelope{
+			V:        1,
+			Type:     kind,
+			DeviceID: deviceID,
+			Session:  sess.session,
+			TS:       time.Now().UnixMilli(),
+		}
+		if err := sess.send(r.Context(), env); err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		logJSON(kind+"_dispatched", map[string]any{"deviceId": deviceID})
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+		return
+	}
+	if len(parts) == 3 && parts[1] == "whatsapp" && (parts[2] == "open" || parts[2] == "close" || parts[2] == "restart") {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		deviceID := strings.TrimSpace(parts[0])
+		if deviceID == "" {
+			http.Error(w, "deviceId required", http.StatusBadRequest)
+			return
+		}
+		sess := b.getSession(deviceID)
+		if sess == nil {
+			http.Error(w, "device offline", http.StatusNotFound)
+			return
+		}
+		kind := "whatsapp_" + parts[2]
+		env := Envelope{
+			V:        1,
+			Type:     kind,
+			DeviceID: deviceID,
+			Session:  sess.session,
+			TS:       time.Now().UnixMilli(),
+		}
+		if err := sess.send(r.Context(), env); err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		logJSON(kind+"_dispatched", map[string]any{"deviceId": deviceID})
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+		return
+	}
+	if len(parts) == 3 && parts[1] == "guard" && (parts[2] == "enable" || parts[2] == "disable" || parts[2] == "recover" || parts[2] == "reset") {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		deviceID := strings.TrimSpace(parts[0])
+		if deviceID == "" {
+			http.Error(w, "deviceId required", http.StatusBadRequest)
+			return
+		}
+		sess := b.getSession(deviceID)
+		if sess == nil {
+			http.Error(w, "device offline", http.StatusNotFound)
+			return
+		}
+		kind := "guard_" + parts[2]
 		env := Envelope{
 			V:        1,
 			Type:     kind,
@@ -1765,6 +1844,18 @@ func (b *Broker) recordSessionSeen(deviceID, sessionID, ip string, health *PingP
 	var scriptLastEventTs sql.NullInt64
 	var scriptLastPongTs sql.NullInt64
 	var scriptLastErr sql.NullString
+	var guardEnabled sql.NullBool
+	var guardState sql.NullString
+	var guardRunnerState sql.NullString
+	var guardReasonCode sql.NullString
+	var guardListeningReady sql.NullBool
+	var guardProcessRunning sql.NullBool
+	var guardLastRecoveryAt sql.NullInt64
+	var guardRecoveryAttempts sql.NullInt64
+	var guardMaxRecoveryAttempts sql.NullInt64
+	var guardRemainingRetryCount sql.NullInt64
+	var guardNextRetryAt sql.NullInt64
+	var guardFrontmostQueryEnabled sql.NullBool
 
 	if health != nil {
 		runnerPid = sql.NullInt64{Valid: true, Int64: health.Runner.Pid}
@@ -1780,6 +1871,18 @@ func (b *Broker) recordSessionSeen(deviceID, sessionID, ip string, health *PingP
 		scriptLastEventTs = sql.NullInt64{Valid: true, Int64: health.Script.LastEventTsMs}
 		scriptLastPongTs = sql.NullInt64{Valid: true, Int64: health.Script.LastPongTsMs}
 		scriptLastErr = sql.NullString{Valid: strings.TrimSpace(health.Script.LastError) != "", String: strings.TrimSpace(health.Script.LastError)}
+		guardEnabled = sql.NullBool{Valid: true, Bool: health.Guard.Enabled}
+		guardState = sql.NullString{Valid: strings.TrimSpace(health.Guard.State) != "", String: strings.TrimSpace(health.Guard.State)}
+		guardRunnerState = sql.NullString{Valid: strings.TrimSpace(health.Guard.RunnerState) != "", String: strings.TrimSpace(health.Guard.RunnerState)}
+		guardReasonCode = sql.NullString{Valid: strings.TrimSpace(health.Guard.ReasonCode) != "", String: strings.TrimSpace(health.Guard.ReasonCode)}
+		guardListeningReady = sql.NullBool{Valid: true, Bool: health.Guard.ListeningReady}
+		guardProcessRunning = sql.NullBool{Valid: true, Bool: health.Guard.ProcessRunning}
+		guardLastRecoveryAt = sql.NullInt64{Valid: true, Int64: health.Guard.LastRecoveryAtMs}
+		guardRecoveryAttempts = sql.NullInt64{Valid: true, Int64: int64(health.Guard.RecoveryAttempts)}
+		guardMaxRecoveryAttempts = sql.NullInt64{Valid: true, Int64: int64(health.Guard.MaxRecoveryAttempts)}
+		guardRemainingRetryCount = sql.NullInt64{Valid: true, Int64: int64(health.Guard.RemainingRetryCount)}
+		guardNextRetryAt = sql.NullInt64{Valid: true, Int64: health.Guard.NextRetryAtMs}
+		guardFrontmostQueryEnabled = sql.NullBool{Valid: true, Bool: health.Guard.FrontmostQueryEnabled}
 	}
 
 	if _, err := b.db.ExecContext(ctx, `
@@ -1798,12 +1901,26 @@ update agent_sessions set
   script_updated_at_ms=coalesce($13, script_updated_at_ms),
   script_last_event_ts_ms=coalesce($14, script_last_event_ts_ms),
   script_last_pong_ts_ms=coalesce($15, script_last_pong_ts_ms),
-  script_last_error=coalesce(nullif($16,''), script_last_error)
+  script_last_error=coalesce(nullif($16,''), script_last_error),
+  guard_enabled=coalesce($17, guard_enabled),
+  guard_state=coalesce(nullif($18,''), guard_state),
+  guard_runner_state=coalesce(nullif($19,''), guard_runner_state),
+  guard_reason_code=coalesce(nullif($20,''), guard_reason_code),
+  guard_listening_ready=coalesce($21, guard_listening_ready),
+  guard_process_running=coalesce($22, guard_process_running),
+  guard_last_recovery_at_ms=coalesce($23, guard_last_recovery_at_ms),
+  guard_recovery_attempts=coalesce($24, guard_recovery_attempts),
+  guard_max_recovery_attempts=coalesce($25, guard_max_recovery_attempts),
+  guard_remaining_retry_count=coalesce($26, guard_remaining_retry_count),
+  guard_next_retry_at_ms=coalesce($27, guard_next_retry_at_ms),
+  guard_frontmost_query_enabled=coalesce($28, guard_frontmost_query_enabled)
 where device_id=$1 and session_id=$2 and disconnected_at is null
 `, deviceID, sessionID, ip,
 		runnerPid, runnerRpcOk, runnerScriptReady, runnerScriptBuild, runnerScriptSha,
 		runnerStartedAt, runnerLastHealthAt, runnerLastHealthErr,
 		scriptPath, scriptUpdatedAt, scriptLastEventTs, scriptLastPongTs, scriptLastErr,
+		guardEnabled, guardState, guardRunnerState, guardReasonCode, guardListeningReady, guardProcessRunning,
+		guardLastRecoveryAt, guardRecoveryAttempts, guardMaxRecoveryAttempts, guardRemainingRetryCount, guardNextRetryAt, guardFrontmostQueryEnabled,
 	); err != nil {
 		if b.shouldLogDBErr(deviceID) {
 			logJSON("db_write_failed", map[string]any{"op": "agent_sessions_ping", "deviceId": deviceID, "sessionId": sessionID, "err": err.Error()})
@@ -1847,7 +1964,17 @@ func (b *Broker) maybeEmitWaAccountPatched(deviceID, status string, lastSeenMs i
 		}
 	}
 
-	key := status + "|" + scriptState
+	guardEnabled := false
+	guardState := ""
+	guardReasonCode := ""
+	guardListeningReady := false
+	if health != nil {
+		guardEnabled = health.Guard.Enabled
+		guardState = strings.TrimSpace(health.Guard.State)
+		guardReasonCode = strings.TrimSpace(health.Guard.ReasonCode)
+		guardListeningReady = health.Guard.ListeningReady
+	}
+	key := status + "|" + scriptState + "|" + strconv.FormatBool(guardEnabled) + "|" + guardState + "|" + guardReasonCode + "|" + strconv.FormatBool(guardListeningReady)
 	b.presenceEmitMu.Lock()
 	lastAt := b.lastPresenceEmitMs[deviceID]
 	lastKey := b.lastPresenceEmitKey[deviceID]
@@ -1877,6 +2004,18 @@ func (b *Broker) maybeEmitWaAccountPatched(deviceID, status string, lastSeenMs i
 		payload["scriptUpdatedAtMs"] = health.Script.UpdatedAtMs
 		payload["scriptLastEventTsMs"] = health.Script.LastEventTsMs
 		payload["scriptLastPongTsMs"] = health.Script.LastPongTsMs
+		payload["guardEnabled"] = health.Guard.Enabled
+		payload["guardState"] = strings.TrimSpace(health.Guard.State)
+		payload["guardRunnerState"] = strings.TrimSpace(health.Guard.RunnerState)
+		payload["guardReasonCode"] = strings.TrimSpace(health.Guard.ReasonCode)
+		payload["guardListeningReady"] = health.Guard.ListeningReady
+		payload["guardProcessRunning"] = health.Guard.ProcessRunning
+		payload["guardLastRecoveryAtMs"] = health.Guard.LastRecoveryAtMs
+		payload["guardRecoveryAttempts"] = health.Guard.RecoveryAttempts
+		payload["guardMaxRecoveryAttempts"] = health.Guard.MaxRecoveryAttempts
+		payload["guardRemainingRetryCount"] = health.Guard.RemainingRetryCount
+		payload["guardNextRetryAtMs"] = health.Guard.NextRetryAtMs
+		payload["guardFrontmostQueryEnabled"] = health.Guard.FrontmostQueryEnabled
 		if strings.TrimSpace(health.Script.LastError) != "" {
 			payload["scriptLastError"] = strings.TrimSpace(health.Script.LastError)
 		}

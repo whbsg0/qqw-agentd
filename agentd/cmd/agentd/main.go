@@ -50,7 +50,14 @@ type Config struct {
 		StartCmd      string `json:"startCmd"`
 	} `json:"frida"`
 	WhatsApp struct {
-		ChatStoragePath string `json:"chatStoragePath"`
+		ChatStoragePath     string `json:"chatStoragePath"`
+		BundleID            string `json:"bundleId"`
+		AutoGuardEnabled    bool   `json:"autoGuardEnabled"`
+		ForegroundConfirmMs int    `json:"foregroundConfirmMs"`
+		ForegroundStableMs  int    `json:"foregroundStableMs"`
+		RecoveryWindowMs    int    `json:"recoveryWindowMs"`
+		MaxRecoveryAttempts int    `json:"maxRecoveryAttempts"`
+		HealthCheckMs       int    `json:"healthCheckMs"`
 	} `json:"whatsApp"`
 }
 
@@ -286,6 +293,18 @@ type Agent struct {
 	runnerCmd *exec.Cmd
 	runnerPid atomic.Int64
 
+	guardLastActionTS     atomic.Int64
+	guardLastAction       atomic.Value
+	guardLastError        atomic.Value
+	guardWake             chan struct{}
+	guardStateMu          sync.RWMutex
+	guardState            guardRuntimeSnapshot
+	guardPersistMu        sync.Mutex
+	guardStorePath        string
+	guardRecoveryAttempts []int64
+	guardRecoveryBlocked  bool
+	guardForceRecover     bool
+
 	eventQueue *EventQueue
 }
 
@@ -331,11 +350,17 @@ func main() {
 		tunnels:      make(map[string]*Tunnel),
 		startedAt:    time.Now(),
 		reconnectNow: make(chan struct{}, 1),
+		guardWake:    make(chan struct{}, 1),
 		eventQueue:   NewEventQueue(filepath.Join(filepath.Dir(cfg.DeviceIDPath), "events")),
+	}
+	if err := a.initGuardPersistentState(cfg); err != nil {
+		fmt.Fprintln(os.Stderr, "guard state:", err)
+		os.Exit(1)
 	}
 
 	a.startControlServer(cfgPath)
 	go a.eventQueue.Run(context.Background(), deviceID, a.getCfg)
+	go a.runGuardLoop(context.Background())
 	a.runForever()
 }
 
@@ -384,6 +409,7 @@ func (a *Agent) startControlServer(cfgPath string) {
 			return
 		}
 		cfg := a.getCfg()
+		guardStatus := a.guardStatusSnapshot(cfg)
 		writeJSON(w, http.StatusOK, map[string]any{
 			"version":         buildVersion,
 			"commit":          buildCommit,
@@ -401,6 +427,7 @@ func (a *Agent) startControlServer(cfgPath string) {
 				"state":     strings.TrimSpace(valueOrEmptyString(a.lastDbSyncState.Load())),
 				"error":     strings.TrimSpace(valueOrEmptyString(a.lastDbSyncErr.Load())),
 			},
+			"guard": guardStatus,
 		})
 	})
 
@@ -414,6 +441,7 @@ func (a *Agent) startControlServer(cfgPath string) {
 			return
 		}
 		cfg := a.getCfg()
+		guardStatus := a.guardStatusSnapshot(cfg)
 		path := cfg.WhatsApp.ChatStoragePath
 		ok, size, modTS, errText := statReadableFile(path)
 		locErr, _ := a.lastWhatsAppLocateErr.Load().(string)
@@ -427,6 +455,8 @@ func (a *Agent) startControlServer(cfgPath string) {
 			"lastLocateErr":       locErr,
 			"chatStoragePathErr":  errText,
 			"deviceSecretPresent": cfg.DeviceSecret != "",
+			"bundleId":            cfg.WhatsApp.BundleID,
+			"guard":               guardStatus,
 		})
 	})
 
@@ -512,6 +542,130 @@ func (a *Agent) startControlServer(cfgPath string) {
 		default:
 			w.WriteHeader(http.StatusMethodNotAllowed)
 		}
+	})
+
+	mux.HandleFunc("/guard/status", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		if !authOK(r) {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		writeJSON(w, http.StatusOK, a.guardStatusSnapshot(a.getCfg()))
+	})
+
+	mux.HandleFunc("/guard/enable", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		if !authOK(r) {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		if err := a.setGuardEnabled(true); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	})
+
+	mux.HandleFunc("/guard/disable", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		if !authOK(r) {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		if err := a.setGuardEnabled(false); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	})
+
+	mux.HandleFunc("/guard/recover", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		if !authOK(r) {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		if err := a.requestGuardRecover(); err != nil {
+			writeJSON(w, http.StatusConflict, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	})
+
+	mux.HandleFunc("/guard/reset", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		if !authOK(r) {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		if err := a.resetGuardRecoveryState(); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	})
+
+	mux.HandleFunc("/whatsapp/open", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		if !authOK(r) {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		if err := a.launchWhatsApp(); err != nil {
+			writeJSON(w, http.StatusBadGateway, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	})
+
+	mux.HandleFunc("/whatsapp/close", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		if !authOK(r) {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		if err := a.closeWhatsApp(); err != nil {
+			writeJSON(w, http.StatusBadGateway, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	})
+
+	mux.HandleFunc("/whatsapp/restart", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		if !authOK(r) {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		if err := a.restartWhatsApp(); err != nil {
+			writeJSON(w, http.StatusBadGateway, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 	})
 
 	mux.HandleFunc("/quit", func(w http.ResponseWriter, r *http.Request) {
@@ -843,6 +997,19 @@ func (a *Agent) runnerBinaryPath() (string, error) {
 }
 
 func (a *Agent) startRunner() error {
+	cfg := a.getCfg()
+	requireForeground := cfg.WhatsApp.AutoGuardEnabled
+	waitForegroundMs := 0
+	if requireForeground {
+		waitForegroundMs = cfg.WhatsApp.ForegroundStableMs
+	}
+	return a.startRunnerWithOptions(requireForeground, waitForegroundMs)
+}
+
+// startRunnerWithOptions 按指定前台参数启动 runner。
+// 参数：requireForeground 表示是否要求 WhatsApp 在前台；waitForegroundMs 表示前台等待超时。
+// 返回：启动成功返回 nil，否则返回错误。
+func (a *Agent) startRunnerWithOptions(requireForeground bool, waitForegroundMs int) error {
 	a.runnerMu.Lock()
 	defer a.runnerMu.Unlock()
 
@@ -864,9 +1031,9 @@ func (a *Agent) startRunner() error {
 		"-fridaHost", strings.TrimSpace(cfg.Frida.Host),
 		"-fridaPort", strconv.Itoa(cfg.Frida.Port),
 		"-processName", "WhatsApp",
-		"-bundleId", "net.whatsapp.WhatsApp",
-		"-requireForeground=false",
-		"-waitForegroundMs=0",
+		"-bundleId", strings.TrimSpace(cfg.WhatsApp.BundleID),
+		"-requireForeground="+strconv.FormatBool(requireForeground),
+		"-waitForegroundMs="+strconv.Itoa(waitForegroundMs),
 		"-rpcAddr", "127.0.0.1:17172",
 		"-scriptPath", a.scriptPath,
 		"-eventsUrl", eventsURL,
@@ -929,6 +1096,230 @@ func (a *Agent) stopRunnerIfRunning() error {
 	}
 	a.runnerCmd = nil
 	a.runnerPid.Store(0)
+	return nil
+}
+
+// guardStatusSnapshot 返回当前第二阶段守护骨架状态。
+// 参数：cfg 为当前生效配置。
+// 返回：可直接写入 JSON 的守护状态快照。
+func (a *Agent) guardStatusSnapshot(cfg Config) map[string]any {
+	lastAction := strings.TrimSpace(valueOrEmptyString(a.guardLastAction.Load()))
+	lastError := strings.TrimSpace(valueOrEmptyString(a.guardLastError.Load()))
+	runtime := a.getGuardRuntimeSnapshot(cfg)
+	return map[string]any{
+		"enabled":               cfg.WhatsApp.AutoGuardEnabled,
+		"state":                 runtime.State,
+		"bundleId":              strings.TrimSpace(cfg.WhatsApp.BundleID),
+		"lastAction":            lastAction,
+		"lastActionTs":          a.guardLastActionTS.Load(),
+		"lastError":             lastError,
+		"runnerState":           runtime.RunnerState,
+		"reasonCode":            runtime.ReasonCode,
+		"listeningReady":        runtime.ListeningReady,
+		"processRunning":        runtime.ProcessRunning,
+		"lastRecoveryAtMs":      runtime.LastRecoveryAtMs,
+		"recoveryAttempts":      runtime.RecoveryAttempts,
+		"maxRecoveryAttempts":   runtime.MaxRecoveryAttempts,
+		"remainingRetryCount":   runtime.RemainingRetryCount,
+		"nextRetryAtMs":         runtime.NextRetryAtMs,
+		"frontmostQueryEnabled": runtime.FrontmostQueryEnabled,
+	}
+}
+
+// recordGuardAction 记录最近一次守护控制动作，供本地状态查询与手机端展示使用。
+// 参数：action 为动作名，err 为动作错误。
+// 返回：无。
+func (a *Agent) recordGuardAction(action string, err error) {
+	a.guardLastAction.Store(strings.TrimSpace(action))
+	a.guardLastActionTS.Store(time.Now().UnixMilli())
+	if err != nil {
+		a.guardLastError.Store(strings.TrimSpace(err.Error()))
+		return
+	}
+	a.guardLastError.Store("")
+}
+
+// persistAndSetConfig 将配置原子写回磁盘并切换到内存配置。
+// 参数：nextCfg 为要生效的新配置。
+// 返回：写回失败时返回错误。
+func (a *Agent) persistAndSetConfig(nextCfg Config) error {
+	if err := normalizeConfig(&nextCfg); err != nil {
+		return err
+	}
+	if err := a.persistConfig(nextCfg); err != nil {
+		return err
+	}
+	a.setCfg(nextCfg)
+	return nil
+}
+
+// setGuardEnabled 切换本地守护总开关，并在关闭时同步停掉 runner。
+// 参数：enabled 表示目标开关状态。
+// 返回：切换失败时返回错误。
+func (a *Agent) setGuardEnabled(enabled bool) error {
+	cfg := a.getCfg()
+	nextCfg := cfg
+	nextCfg.WhatsApp.AutoGuardEnabled = enabled
+	if enabled {
+		if err := a.clearGuardRecoveryState(); err != nil {
+			a.recordGuardAction("guard_enable", err)
+			return err
+		}
+	}
+	if err := a.persistAndSetConfig(nextCfg); err != nil {
+		a.recordGuardAction("guard_set", err)
+		return err
+	}
+	if !enabled {
+		if err := a.stopRunnerIfRunning(); err != nil {
+			a.recordGuardAction("guard_disable", err)
+			return err
+		}
+	}
+	if enabled {
+		a.recordGuardAction("guard_enable", nil)
+	} else {
+		a.recordGuardAction("guard_disable", nil)
+	}
+	a.wakeGuardLoop()
+	return nil
+}
+
+// requestGuardRecover 请求 supervisor 执行一次手工恢复。
+// 参数：无。
+// 返回：请求非法或当前被熔断时返回错误。
+func (a *Agent) requestGuardRecover() error {
+	cfg := a.getCfg()
+	if !cfg.WhatsApp.AutoGuardEnabled {
+		err := errors.New("guard disabled")
+		a.recordGuardAction("guard_recover", err)
+		return err
+	}
+	_, blocked := a.getGuardRecoveryState()
+	if blocked {
+		err := errors.New("guard blocked, reset required")
+		a.recordGuardAction("guard_recover", err)
+		return err
+	}
+	a.setGuardForceRecoverRequest(true)
+	a.recordGuardAction("guard_recover", nil)
+	a.wakeGuardLoop()
+	return nil
+}
+
+// resetGuardRecoveryState 清空 crash loop 计数和熔断状态，并唤醒 guard loop。
+// 参数：无。
+// 返回：清空失败时返回错误。
+func (a *Agent) resetGuardRecoveryState() error {
+	if err := a.clearGuardRecoveryState(); err != nil {
+		a.recordGuardAction("guard_reset", err)
+		return err
+	}
+	a.recordGuardAction("guard_reset", nil)
+	a.wakeGuardLoop()
+	return nil
+}
+
+// launchWhatsApp 使用固定工具链按 bundleId 拉起 WhatsApp。
+// 参数：无。
+// 返回：拉起成功返回 nil，否则返回最后一次失败原因。
+func (a *Agent) launchWhatsApp() error {
+	cfg := a.getCfg()
+	bundleID := strings.TrimSpace(cfg.WhatsApp.BundleID)
+	if bundleID == "" {
+		bundleID = "net.whatsapp.WhatsApp"
+	}
+	type launchCommand struct {
+		path string
+		args []string
+	}
+	candidates := []launchCommand{
+		{path: "/var/jb/usr/bin/uiopen", args: []string{"--bundle", bundleID}},
+		{path: "/usr/bin/uiopen", args: []string{"--bundle", bundleID}},
+		{path: "/var/jb/usr/bin/launchapp", args: []string{bundleID}},
+		{path: "/usr/bin/launchapp", args: []string{bundleID}},
+		{path: "/var/jb/usr/bin/open", args: []string{bundleID}},
+		{path: "/usr/bin/open", args: []string{bundleID}},
+	}
+	var lastErr error
+	for _, candidate := range candidates {
+		if firstExistingFile(candidate.path) == "" {
+			continue
+		}
+		cmd := exec.Command(candidate.path, candidate.args...)
+		cmd.Env = append(os.Environ(), "PATH=/var/jb/usr/bin:/var/jb/bin:/usr/bin:/bin:/usr/sbin:/sbin")
+		out, err := cmd.CombinedOutput()
+		if err == nil {
+			a.recordGuardAction("whatsapp_open", nil)
+			return nil
+		}
+		msg := strings.TrimSpace(string(out))
+		if msg != "" {
+			lastErr = fmt.Errorf("%s: %s", candidate.path, msg)
+		} else {
+			lastErr = fmt.Errorf("%s: %w", candidate.path, err)
+		}
+	}
+	if lastErr == nil {
+		lastErr = errors.New("no supported launch tool found")
+	}
+	a.recordGuardAction("whatsapp_open", lastErr)
+	return lastErr
+}
+
+// closeWhatsApp 通过固定进程名关闭 WhatsApp，并同步清理 runner。
+// 参数：无。
+// 返回：关闭失败时返回错误；未运行视为成功。
+func (a *Agent) closeWhatsApp() error {
+	if err := a.stopRunnerIfRunning(); err != nil {
+		a.recordGuardAction("whatsapp_close", err)
+		return err
+	}
+	candidates := []string{"/var/jb/usr/bin/killall", "/usr/bin/killall", "/bin/killall"}
+	var lastErr error
+	for _, candidate := range candidates {
+		if firstExistingFile(candidate) == "" {
+			continue
+		}
+		cmd := exec.Command(candidate, "-TERM", "WhatsApp")
+		cmd.Env = append(os.Environ(), "PATH=/var/jb/usr/bin:/var/jb/bin:/usr/bin:/bin:/usr/sbin:/sbin")
+		out, err := cmd.CombinedOutput()
+		if err == nil {
+			a.recordGuardAction("whatsapp_close", nil)
+			return nil
+		}
+		msg := strings.TrimSpace(string(out))
+		lower := strings.ToLower(msg + " " + err.Error())
+		if strings.Contains(lower, "no matching processes") || strings.Contains(lower, "not found") {
+			a.recordGuardAction("whatsapp_close", nil)
+			return nil
+		}
+		if msg != "" {
+			lastErr = fmt.Errorf("%s: %s", candidate, msg)
+		} else {
+			lastErr = fmt.Errorf("%s: %w", candidate, err)
+		}
+	}
+	if lastErr == nil {
+		lastErr = errors.New("killall not available")
+	}
+	a.recordGuardAction("whatsapp_close", lastErr)
+	return lastErr
+}
+
+// restartWhatsApp 以“停 runner -> 关 app -> 短等待 -> 开 app”的顺序重启 WhatsApp。
+// 参数：无。
+// 返回：任一步失败时返回错误。
+func (a *Agent) restartWhatsApp() error {
+	if err := a.closeWhatsApp(); err != nil {
+		return err
+	}
+	time.Sleep(1200 * time.Millisecond)
+	if err := a.launchWhatsApp(); err != nil {
+		a.recordGuardAction("whatsapp_restart", err)
+		return err
+	}
+	a.recordGuardAction("whatsapp_restart", nil)
 	return nil
 }
 
@@ -1245,9 +1636,24 @@ func (a *Agent) sendPing(ctx context.Context, ws *websocket.Conn, sessionID stri
 		LastPongTsMs  int64  `json:"lastPongTsMs,omitempty"`
 		LastError     string `json:"lastError,omitempty"`
 	}
+	type guardHealth struct {
+		Enabled               bool   `json:"enabled"`
+		State                 string `json:"state,omitempty"`
+		RunnerState           string `json:"runnerState,omitempty"`
+		ReasonCode            string `json:"reasonCode,omitempty"`
+		ListeningReady        bool   `json:"listeningReady"`
+		ProcessRunning        bool   `json:"processRunning"`
+		LastRecoveryAtMs      int64  `json:"lastRecoveryAtMs,omitempty"`
+		RecoveryAttempts      int    `json:"recoveryAttempts,omitempty"`
+		MaxRecoveryAttempts   int    `json:"maxRecoveryAttempts,omitempty"`
+		RemainingRetryCount   int    `json:"remainingRetryCount,omitempty"`
+		NextRetryAtMs         int64  `json:"nextRetryAtMs,omitempty"`
+		FrontmostQueryEnabled bool   `json:"frontmostQueryEnabled"`
+	}
 	type pingPayload struct {
 		Runner runnerHealth `json:"runner"`
 		Script scriptHealth `json:"script"`
+		Guard  guardHealth  `json:"guard"`
 	}
 
 	now := time.Now().UnixMilli()
@@ -1267,6 +1673,7 @@ func (a *Agent) sendPing(ctx context.Context, ws *websocket.Conn, sessionID stri
 		}
 	}
 	lastErr, _ := a.scriptLastError.Load().(string)
+	guard := a.getGuardRuntimeSnapshot(a.getCfg())
 	payload := pingPayload{
 		Runner: rh,
 		Script: scriptHealth{
@@ -1275,6 +1682,20 @@ func (a *Agent) sendPing(ctx context.Context, ws *websocket.Conn, sessionID stri
 			LastEventTsMs: a.scriptLastEventTS.Load(),
 			LastPongTsMs:  a.scriptLastPongTS.Load(),
 			LastError:     strings.TrimSpace(lastErr),
+		},
+		Guard: guardHealth{
+			Enabled:               a.getCfg().WhatsApp.AutoGuardEnabled,
+			State:                 strings.TrimSpace(guard.State),
+			RunnerState:           strings.TrimSpace(guard.RunnerState),
+			ReasonCode:            strings.TrimSpace(guard.ReasonCode),
+			ListeningReady:        guard.ListeningReady,
+			ProcessRunning:        guard.ProcessRunning,
+			LastRecoveryAtMs:      guard.LastRecoveryAtMs,
+			RecoveryAttempts:      guard.RecoveryAttempts,
+			MaxRecoveryAttempts:   guard.MaxRecoveryAttempts,
+			RemainingRetryCount:   guard.RemainingRetryCount,
+			NextRetryAtMs:         guard.NextRetryAtMs,
+			FrontmostQueryEnabled: guard.FrontmostQueryEnabled,
 		},
 	}
 	pb, _ := json.Marshal(payload)
@@ -1368,6 +1789,20 @@ func (a *Agent) readLoop(ctx context.Context, ws *websocket.Conn, sessionID stri
 			go a.handleScriptUpdate()
 		case "script_uninstall":
 			go a.handleScriptUninstall()
+		case "whatsapp_open":
+			go a.handleWhatsAppOpen()
+		case "whatsapp_close":
+			go a.handleWhatsAppClose()
+		case "whatsapp_restart":
+			go a.handleWhatsAppRestart()
+		case "guard_enable":
+			go a.handleGuardEnable()
+		case "guard_disable":
+			go a.handleGuardDisable()
+		case "guard_recover":
+			go a.handleGuardRecover()
+		case "guard_reset":
+			go a.handleGuardReset()
 		case "tx_send":
 			go a.handleTxSend(in)
 		case "tx_asset_prefetch":
@@ -1418,6 +1853,55 @@ func (a *Agent) handleScriptUninstall() {
 	a.scriptLastError.Store("")
 	a.scriptLastEventTS.Store(0)
 	a.scriptLastPongTS.Store(0)
+}
+
+// handleWhatsAppOpen 处理 broker 下发的 WhatsApp 打开命令。
+// 参数：无。
+// 返回：无。
+func (a *Agent) handleWhatsAppOpen() {
+	_ = a.launchWhatsApp()
+}
+
+// handleWhatsAppClose 处理 broker 下发的 WhatsApp 关闭命令。
+// 参数：无。
+// 返回：无。
+func (a *Agent) handleWhatsAppClose() {
+	_ = a.closeWhatsApp()
+}
+
+// handleWhatsAppRestart 处理 broker 下发的 WhatsApp 重启命令。
+// 参数：无。
+// 返回：无。
+func (a *Agent) handleWhatsAppRestart() {
+	_ = a.restartWhatsApp()
+}
+
+// handleGuardEnable 处理 broker 下发的守护开启命令。
+// 参数：无。
+// 返回：无。
+func (a *Agent) handleGuardEnable() {
+	_ = a.setGuardEnabled(true)
+}
+
+// handleGuardDisable 处理 broker 下发的守护关闭命令。
+// 参数：无。
+// 返回：无。
+func (a *Agent) handleGuardDisable() {
+	_ = a.setGuardEnabled(false)
+}
+
+// handleGuardRecover 处理 broker 下发的手工恢复命令。
+// 参数：无。
+// 返回：无。
+func (a *Agent) handleGuardRecover() {
+	_ = a.requestGuardRecover()
+}
+
+// handleGuardReset 处理 broker 下发的熔断重置命令。
+// 参数：无。
+// 返回：无。
+func (a *Agent) handleGuardReset() {
+	_ = a.resetGuardRecoveryState()
 }
 
 func (a *Agent) updateScriptAndRestart() (string, int64, error) {
@@ -2878,6 +3362,24 @@ func normalizeConfig(cfg *Config) error {
 	}
 	if cfg.Frida.Port == 0 {
 		cfg.Frida.Port = 27042
+	}
+	if strings.TrimSpace(cfg.WhatsApp.BundleID) == "" {
+		cfg.WhatsApp.BundleID = "net.whatsapp.WhatsApp"
+	}
+	if cfg.WhatsApp.ForegroundConfirmMs <= 0 {
+		cfg.WhatsApp.ForegroundConfirmMs = 5000
+	}
+	if cfg.WhatsApp.ForegroundStableMs <= 0 {
+		cfg.WhatsApp.ForegroundStableMs = 3000
+	}
+	if cfg.WhatsApp.RecoveryWindowMs <= 0 {
+		cfg.WhatsApp.RecoveryWindowMs = 10 * 60 * 1000
+	}
+	if cfg.WhatsApp.MaxRecoveryAttempts <= 0 {
+		cfg.WhatsApp.MaxRecoveryAttempts = 5
+	}
+	if cfg.WhatsApp.HealthCheckMs <= 0 {
+		cfg.WhatsApp.HealthCheckMs = 3000
 	}
 	return nil
 }
