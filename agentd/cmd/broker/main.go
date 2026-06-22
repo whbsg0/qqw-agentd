@@ -94,6 +94,7 @@ type QueueHealthPayload struct {
 	LastEnqueueAtMs int64  `json:"lastEnqueueAtMs,omitempty"`
 	LastFlushAtMs   int64  `json:"lastFlushAtMs,omitempty"`
 	LastFlushErr    string `json:"lastFlushErr,omitempty"`
+	InspectReport   string `json:"inspectReport,omitempty"`
 }
 
 type PingPayload struct {
@@ -1872,6 +1873,7 @@ func (b *Broker) recordSessionSeen(deviceID, sessionID, ip string, health *PingP
 	var queueLastEnqueueAt sql.NullInt64
 	var queueLastFlushAt sql.NullInt64
 	var queueLastFlushErr sql.NullString
+	var queueInspectReport sql.NullString
 
 	if health != nil {
 		runnerPid = sql.NullInt64{Valid: true, Int64: health.Runner.Pid}
@@ -1905,6 +1907,7 @@ func (b *Broker) recordSessionSeen(deviceID, sessionID, ip string, health *PingP
 		queueLastEnqueueAt = sql.NullInt64{Valid: true, Int64: health.Queue.LastEnqueueAtMs}
 		queueLastFlushAt = sql.NullInt64{Valid: true, Int64: health.Queue.LastFlushAtMs}
 		queueLastFlushErr = sql.NullString{Valid: strings.TrimSpace(health.Queue.LastFlushErr) != "", String: strings.TrimSpace(health.Queue.LastFlushErr)}
+		queueInspectReport = sql.NullString{Valid: strings.TrimSpace(health.Queue.InspectReport) != "", String: strings.TrimSpace(health.Queue.InspectReport)}
 	}
 
 	if _, err := b.db.ExecContext(ctx, `
@@ -1941,7 +1944,8 @@ update agent_sessions set
   queue_pending_bytes=coalesce($31, queue_pending_bytes),
   queue_last_enqueue_at_ms=coalesce($32, queue_last_enqueue_at_ms),
   queue_last_flush_at_ms=coalesce($33, queue_last_flush_at_ms),
-  queue_last_flush_err=coalesce(nullif($34,''), queue_last_flush_err)
+  queue_last_flush_err=coalesce(nullif($34,''), queue_last_flush_err),
+  queue_inspect_report=coalesce(nullif($35,''), queue_inspect_report)
 where device_id=$1 and session_id=$2 and disconnected_at is null
 `, deviceID, sessionID, ip,
 		runnerPid, runnerRpcOk, runnerScriptReady, runnerScriptBuild, runnerScriptSha,
@@ -1949,7 +1953,7 @@ where device_id=$1 and session_id=$2 and disconnected_at is null
 		scriptPath, scriptUpdatedAt, scriptLastEventTs, scriptLastPongTs, scriptLastErr,
 		guardEnabled, guardState, guardRunnerState, guardReasonCode, guardListeningReady, guardProcessRunning,
 		guardLastRecoveryAt, guardRecoveryAttempts, guardMaxRecoveryAttempts, guardRemainingRetryCount, guardNextRetryAt, guardFrontmostQueryEnabled,
-		queueOffsetBytes, queueFileSizeBytes, queuePendingBytes, queueLastEnqueueAt, queueLastFlushAt, queueLastFlushErr,
+		queueOffsetBytes, queueFileSizeBytes, queuePendingBytes, queueLastEnqueueAt, queueLastFlushAt, queueLastFlushErr, queueInspectReport,
 	); err != nil {
 		if b.shouldLogDBErr(deviceID) {
 			logJSON("db_write_failed", map[string]any{"op": "agent_sessions_ping", "deviceId": deviceID, "sessionId": sessionID, "err": err.Error()})

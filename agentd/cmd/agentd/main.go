@@ -819,6 +819,41 @@ func (a *Agent) startControlServer(cfgPath string) {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "queued": true})
 	})
 
+	mux.HandleFunc("/debug/events-queue/inspect", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		if !authOK(r) {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		limit := 50
+		if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
+			n, err := strconv.Atoi(raw)
+			if err != nil || n <= 0 || n > 200 {
+				writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "limit must be 1..200"})
+				return
+			}
+			limit = n
+		}
+		offset := a.eventQueue.CurrentOffset()
+		if raw := strings.TrimSpace(r.URL.Query().Get("offset")); raw != "" {
+			n, err := strconv.ParseInt(raw, 10, 64)
+			if err != nil || n < 0 {
+				writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "offset must be >= 0"})
+				return
+			}
+			offset = n
+		}
+		report, err := a.eventQueue.InspectBatchAtOffset(offset, limit)
+		if err != nil {
+			writeJSON(w, http.StatusBadGateway, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "report": report})
+	})
+
 	mux.HandleFunc("/script/status", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			w.WriteHeader(http.StatusMethodNotAllowed)
@@ -1657,6 +1692,7 @@ func (a *Agent) sendPing(ctx context.Context, ws *websocket.Conn, sessionID stri
 		LastEnqueueAtMs int64  `json:"lastEnqueueAtMs,omitempty"`
 		LastFlushAtMs   int64  `json:"lastFlushAtMs,omitempty"`
 		LastFlushErr    string `json:"lastFlushErr,omitempty"`
+		InspectReport   string `json:"inspectReport,omitempty"`
 	}
 	type pingPayload struct {
 		Runner runnerHealth `json:"runner"`
@@ -1715,6 +1751,7 @@ func (a *Agent) sendPing(ctx context.Context, ws *websocket.Conn, sessionID stri
 			LastEnqueueAtMs: queue.LastEnqueueAtMs,
 			LastFlushAtMs:   queue.LastFlushAtMs,
 			LastFlushErr:    strings.TrimSpace(queue.LastFlushErr),
+			InspectReport:   strings.TrimSpace(queue.InspectReport),
 		},
 	}
 	pb, _ := json.Marshal(payload)
