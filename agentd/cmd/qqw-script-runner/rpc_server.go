@@ -202,13 +202,14 @@ func handleRPCHealth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":           true,
-		"ts":           time.Now().UnixMilli(),
-		"startedAtMs":  runnerStartedAtMs,
-		"scriptReady":  scriptReady(),
-		"scriptPath":   strings.TrimSpace(runnerScriptPath),
-		"scriptSha256": strings.TrimSpace(runnerScriptSha256),
-		"scriptBuild":  strings.TrimSpace(runnerScriptBuild),
+		"ok":            true,
+		"ts":            time.Now().UnixMilli(),
+		"startedAtMs":   runnerStartedAtMs,
+		"scriptReady":   scriptReady(),
+		"scriptPath":    strings.TrimSpace(runnerScriptPath),
+		"scriptSha256":  strings.TrimSpace(runnerScriptSha256),
+		"scriptBuild":   strings.TrimSpace(runnerScriptBuild),
+		"lastHealthErr": getRunnerLastHealthErr(),
 	})
 }
 

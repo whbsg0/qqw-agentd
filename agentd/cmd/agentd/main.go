@@ -1670,6 +1670,7 @@ func (a *Agent) sendPing(ctx context.Context, ws *websocket.Conn, sessionID stri
 			rh.ScriptSha256 = strings.TrimSpace(h.ScriptSha256)
 			rh.ScriptBuild = strings.TrimSpace(h.ScriptBuild)
 			rh.StartedAtMs = h.StartedAtMs
+			rh.LastHealthErr = strings.TrimSpace(h.LastHealthErr)
 		}
 	}
 	lastErr, _ := a.scriptLastError.Load().(string)
@@ -1712,13 +1713,14 @@ func (a *Agent) sendPing(ctx context.Context, ws *websocket.Conn, sessionID stri
 }
 
 type runnerRPCHealthResp struct {
-	Ok           bool   `json:"ok"`
-	Ts           int64  `json:"ts"`
-	StartedAtMs  int64  `json:"startedAtMs"`
-	ScriptReady  bool   `json:"scriptReady"`
-	ScriptPath   string `json:"scriptPath"`
-	ScriptSha256 string `json:"scriptSha256"`
-	ScriptBuild  string `json:"scriptBuild"`
+	Ok            bool   `json:"ok"`
+	Ts            int64  `json:"ts"`
+	StartedAtMs   int64  `json:"startedAtMs"`
+	ScriptReady   bool   `json:"scriptReady"`
+	ScriptPath    string `json:"scriptPath"`
+	ScriptSha256  string `json:"scriptSha256"`
+	ScriptBuild   string `json:"scriptBuild"`
+	LastHealthErr string `json:"lastHealthErr"`
 }
 
 func (a *Agent) getRunnerRPCHealth() (runnerRPCHealthResp, error) {

@@ -8,15 +8,36 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 )
 
 var (
-	runnerStartedAtMs  int64
-	runnerScriptPath   string
-	runnerScriptSha256 string
-	runnerScriptBuild  string
+	runnerStartedAtMs   int64
+	runnerScriptPath    string
+	runnerScriptSha256  string
+	runnerScriptBuild   string
+	runnerHealthMu      sync.RWMutex
+	runnerLastHealthErr string
 )
+
+// setRunnerLastHealthErr 更新 runner 健康摘要中的最近错误文本，供 /rpc/health 与 agentd ping 透传取证。
+// 参数：msg 为最近一次错误摘要；空字符串表示当前无错误。
+// 返回：无。
+func setRunnerLastHealthErr(msg string) {
+	runnerHealthMu.Lock()
+	defer runnerHealthMu.Unlock()
+	runnerLastHealthErr = strings.TrimSpace(msg)
+}
+
+// getRunnerLastHealthErr 读取 runner 健康摘要中的最近错误文本。
+// 参数：无。
+// 返回：最近一次错误摘要；无错误时返回空字符串。
+func getRunnerLastHealthErr() string {
+	runnerHealthMu.RLock()
+	defer runnerHealthMu.RUnlock()
+	return strings.TrimSpace(runnerLastHealthErr)
+}
 
 func main() {
 	var fridaHost string
