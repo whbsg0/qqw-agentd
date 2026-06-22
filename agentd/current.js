@@ -4,7 +4,7 @@
   来源：wa_txrx_stable_unified_pinned.js（发送/接收全功能脚本）
   目标：不更改功能与逻辑，仅把“接收侧 send() 输出”改为长期稳定事件格式（与 qqw-contracts/device-events.md 对齐）
 */
-const SCRIPT_BUILD_ID = "2026-04-08.txrx_stable_unified_pinned_output_v2_rx_enabled_default";
+const SCRIPT_BUILD_ID = "2026-06-20.status_recover_align_v4";
 
 const _keepAliveBlocks = [];
 
@@ -59,6 +59,29 @@ function _objcCanCall(objOrCls, sel) {
   }
 }
 
+/**
+ * 安全调用无参 selector 并转成字符串，失败时返回空串。
+ * 参数:
+ * - obj: 目标 ObjC 对象。
+ * - sel: 无参 selector 名，不带 `- ` 前缀。
+ * 返回:
+ * - 调用结果的字符串表示；失败返回空字符串。
+ */
+function _safeStrCall(obj, sel) {
+  try {
+    const o = obj && obj.handle ? obj : _safeObj(obj);
+    const s = String(sel || "").trim();
+    if (!o || !s) return "";
+    let ret = null;
+    if (_objcCanCall(o, "- " + s)) ret = o["- " + s]();
+    else if (_objcCanCall(o, s)) ret = o[s]();
+    if (ret == null) return "";
+    return String(ret).trim();
+  } catch (_) {
+    return "";
+  }
+}
+
 function _ns(s) {
   try {
     if (!ObjC.available) return null;
@@ -67,6 +90,201 @@ function _ns(s) {
     return NSString.stringWithUTF8String_(Memory.allocUtf8String(String(s || "")));
   } catch (_) {
     return null;
+  }
+}
+
+/**
+ * 懒加载 Objective-C ivar 只读所需 runtime API。
+ * 参数:
+ * - 无。
+ * 返回:
+ * - `{ object_getClass, class_getName, class_copyIvarList, ivar_getName, ivar_getTypeEncoding, ivar_getOffset, free }`。
+ */
+function _statusModelRuntimeFns() {
+  try {
+    if (_statusModelRuntimeFns._cached) return _statusModelRuntimeFns._cached;
+    const base = RX_recoveryRuntimeFns ? RX_recoveryRuntimeFns() : {};
+    const get = (name, ret, args) => {
+      try {
+        const p = Module.findExportByName(null, name);
+        if (!p) return null;
+        return new NativeFunction(p, ret, args);
+      } catch (_) {
+        return null;
+      }
+    };
+    _statusModelRuntimeFns._cached = {
+      object_getClass: base && base.object_getClass ? base.object_getClass : get("object_getClass", "pointer", ["pointer"]),
+      class_getName: base && base.class_getName ? base.class_getName : get("class_getName", "pointer", ["pointer"]),
+      class_copyIvarList: get("class_copyIvarList", "pointer", ["pointer", "pointer"]),
+      ivar_getName: get("ivar_getName", "pointer", ["pointer"]),
+      ivar_getTypeEncoding: get("ivar_getTypeEncoding", "pointer", ["pointer"]),
+      ivar_getOffset: get("ivar_getOffset", "long", ["pointer"]),
+      free: get("free", "void", ["pointer"]),
+    };
+    return _statusModelRuntimeFns._cached;
+  } catch (_) {
+    return {};
+  }
+}
+
+/**
+ * 在不发送 selector 的前提下仅读取对象类名。
+ * 参数:
+ * - rawObj: 原始对象或指针。
+ * 返回:
+ * - 类名字符串；失败返回空串。
+ */
+function _objcClassNameNoTouch(rawObj) {
+  try {
+    const p = _toPtr(rawObj);
+    if (!p || p.isNull()) return "";
+    const f = _statusModelRuntimeFns();
+    if (!f.object_getClass || !f.class_getName) return "";
+    const cls = f.object_getClass(p);
+    if (!cls || cls.isNull()) return "";
+    const np = f.class_getName(cls);
+    if (!np || np.isNull()) return "";
+    return String(Memory.readCString(np) || "");
+  } catch (_) {
+    return "";
+  }
+}
+
+/**
+ * 只读列举对象 ivar 元数据，不创建额外业务对象。
+ * 参数:
+ * - objPtrStr: 对象指针字符串。
+ * - maxN: 最多返回的 ivar 数。
+ * 返回:
+ * - `{ ok, ptr, className, count, ivars }`。
+ */
+function _listIvarsNoTouch(objPtrStr, maxN) {
+  try {
+    const p = _toPtr(String(objPtrStr || "").trim() || "0x0");
+    if (!p || p.isNull()) return { ok: false, error: "null ptr" };
+    const f = _statusModelRuntimeFns();
+    if (!f.object_getClass || !f.class_getName || !f.class_copyIvarList || !f.ivar_getName || !f.ivar_getOffset) {
+      return { ok: false, error: "objc ivar api unavailable" };
+    }
+    const cls = f.object_getClass(p);
+    const cn = cls && !cls.isNull() ? String(Memory.readCString(f.class_getName(cls)) || "") : "";
+    const outCount = Memory.alloc(8);
+    Memory.writeU64(outCount, uint64(0));
+    const listPtr = f.class_copyIvarList(cls, outCount);
+    const n0 = Number(Memory.readU64(outCount)) | 0;
+    const cap = Math.max(1, Math.min(500, (maxN | 0) || 120));
+    const out = [];
+    if (listPtr && !listPtr.isNull() && n0 > 0) {
+      for (let i = 0; i < n0 && out.length < cap; i++) {
+        const iv = Memory.readPointer(listPtr.add(i * Process.pointerSize));
+        if (!iv || iv.isNull()) continue;
+        let name = "";
+        let typeEnc = "";
+        let off = 0;
+        try {
+          const np = f.ivar_getName(iv);
+          if (np && !np.isNull()) name = String(Memory.readCString(np) || "");
+        } catch (_) {}
+        try {
+          const tp = f.ivar_getTypeEncoding ? f.ivar_getTypeEncoding(iv) : null;
+          if (tp && !tp.isNull()) typeEnc = String(Memory.readCString(tp) || "");
+        } catch (_) {}
+        try { off = Number(f.ivar_getOffset(iv)) | 0; } catch (_) { off = 0; }
+        if (name) out.push({ name, off, type: typeEnc });
+      }
+    }
+    try { if (f.free && listPtr && !listPtr.isNull()) f.free(listPtr); } catch (_) {}
+    return { ok: true, ptr: p.toString(), className: cn, count: out.length, ivars: out };
+  } catch (e) {
+    return { ok: false, error: String(e) };
+  }
+}
+
+/**
+ * 判断内存区域是否可读。
+ * 参数:
+ * - p: 待检查指针。
+ * - minBytes: 至少要求连续可读的字节数。
+ * 返回:
+ * - `true/false`。
+ */
+function _isReadablePtr(p, minBytes) {
+  try {
+    const x = _toPtr(p);
+    if (!x || x.isNull()) return false;
+    const r = Process.findRangeByAddress(x);
+    if (!r) return false;
+    const prot = String(r.protection || "");
+    if (prot.indexOf("r") === -1) return false;
+    if (!minBytes || minBytes <= 0) return true;
+    const end = r.base.add(r.size);
+    return x.add(minBytes).compare(end) <= 0;
+  } catch (_) {
+    return false;
+  }
+}
+
+/**
+ * 调用历史成功链使用的 `parsedMessageKey -> WAMessageID` 原生 helper。
+ * 参数:
+ * - keyPtr: `statusNotificationMessageKey` 对象指针。
+ * 返回:
+ * - `WAMessageID` 指针；失败返回空指针。
+ */
+function _callMessageIDFromParsedMessageKey(keyPtr) {
+  try {
+    const kp = _toPtr(keyPtr);
+    if (!kp || kp.isNull()) return ptr("0x0");
+    const mod = RX_pickModuleByHints(["WhatsApp", "WhatsAppDecrypted", "WhatsApp_Decrypted"]);
+    if (!mod || !mod.base) return ptr("0x0");
+    const addr = mod.base.add(ptr("0x278ad74"));
+    if (!_isReadablePtr(addr, 4)) return ptr("0x0");
+    if (!globalThis.__QQW_MSGID_FROM_KEY_FN) {
+      globalThis.__QQW_MSGID_FROM_KEY_FN = new NativeFunction(addr, "pointer", ["pointer"]);
+    }
+    const out = globalThis.__QQW_MSGID_FROM_KEY_FN(kp);
+    return out ? ptr(out) : ptr("0x0");
+  } catch (_) {
+    return ptr("0x0");
+  }
+}
+
+/**
+ * 按 `WAMessageID` 从 chatStorage 取回本地消息。
+ * 参数:
+ * - storageObj: `WAChatStorage`。
+ * - messageIdObj: `WAMessageID`。
+ * - mocObj: `NSManagedObjectContext`。
+ * 返回:
+ * - `{ ok, msg, used, error }`。
+ */
+function _fetchMessageByMessageID(storageObj, messageIdObj, mocObj) {
+  try {
+    const st = storageObj && storageObj.handle ? storageObj : _safeObj(storageObj);
+    const mid = messageIdObj && messageIdObj.handle ? messageIdObj : _safeObj(messageIdObj);
+    const moc = mocObj && mocObj.handle ? mocObj : _safeObj(mocObj);
+    if (!st || !mid) return { ok: false, error: "storage/messageId nil" };
+    if (_objcCanCall(st, "- fetchMessageWithMessageID:")) {
+      try {
+        const m = _safeObj(st["- fetchMessageWithMessageID:"](mid));
+        if (m) return { ok: true, msg: m, used: "fetchMessageWithMessageID:" };
+      } catch (_) {}
+    }
+    if (moc && _objcCanCall(st, "- fetchMessageWithMessageID:inContext:")) {
+      try {
+        const m = _safeObj(st["- fetchMessageWithMessageID:inContext:"](mid, moc));
+        if (m) return { ok: true, msg: m, used: "fetchMessageWithMessageID:inContext:" };
+      } catch (_) {}
+    }
+    return {
+      ok: false,
+      error: "fetchMessageWithMessageID returned nil",
+      hasInContext: !!(moc && _objcCanCall(st, "- fetchMessageWithMessageID:inContext:")),
+      hasNoContext: _objcCanCall(st, "- fetchMessageWithMessageID:"),
+    };
+  } catch (e) {
+    return { ok: false, error: String(e) };
   }
 }
 
@@ -299,7 +517,7 @@ function csabcnupsertgivenphone(phoneStr, givenNameStr, phoneRawStr) {
       return { ok: false, build: SCRIPT_BUILD_ID, error: "Contacts.framework classes missing" };
     }
     if (!CNPhoneNumber.alloc || !CNPhoneNumber.alloc().initWithStringValue_) return { ok: false, build: SCRIPT_BUILD_ID, error: "CNPhoneNumber initWithStringValue missing", phone };
-    const pn = CNPhoneNumber.alloc().initWithStringValue_(_ns(phone));
+    const pn = CNPhoneNumber.alloc().initWithStringValue_(_ns(phoneForStore || phone));
     if (!pn) return { ok: false, build: SCRIPT_BUILD_ID, error: "CNPhoneNumber alloc failed", phone };
     if (!CNContact.predicateForContactsMatchingPhoneNumber_) return { ok: false, build: SCRIPT_BUILD_ID, error: "predicate missing", phone };
     const pred = CNContact.predicateForContactsMatchingPhoneNumber_(pn);
@@ -991,6 +1209,55 @@ function _getUIApplicationDelegate() {
   }
 }
 
+/**
+ * 以历史成功测试脚本同源方式解析稳定 `WAContextMain`。
+ * 参数:
+ * - 无。
+ * 返回:
+ * - `{ ok, ctx, source, error }`。
+ */
+function _resolveCtxMainStable() {
+  try {
+    if (!ObjC.available) return { ok: false, error: "ObjC not available", source: "" };
+    const cls = ObjC.classes.WAContextMain;
+    const sels = ["+ sharedInstance", "+ shared", "+ main", "+ sharedMain", "+ sharedContext", "+ defaultContext", "+ currentContext", "+ context"];
+    const isCtx = (obj) => {
+      try {
+        const o = obj && obj.handle ? obj : _safeObj(obj);
+        if (!o) return false;
+        const cn = String(o.$className || "");
+        if (cn === "WAContextMain") return true;
+        return !!(_objcCanCall(o, "- chatStorage") || _objcCanCall(o, "- messageSender"));
+      } catch (_) {
+        return false;
+      }
+    };
+    if (cls) {
+      for (let i = 0; i < sels.length; i++) {
+        const sel = String(sels[i] || "");
+        try {
+          if (!_objcCanCall(cls, sel)) continue;
+          const o = _safeObj(cls[sel]());
+          if (o && isCtx(o)) return { ok: true, ctx: o, source: "WAContextMain." + sel };
+        } catch (_) {}
+      }
+    }
+    const del = _getUIApplicationDelegate();
+    if (!del) return { ok: false, error: "UIApplication.delegate unavailable", source: "" };
+    let ctx = null;
+    try {
+      if (del.$ivars) ctx = del.$ivars._userContext || del.$ivars.userContext || del.$ivars._context || null;
+    } catch (_) {
+      ctx = null;
+    }
+    const o = _safeObj(ctx);
+    if (o && isCtx(o)) return { ok: true, ctx: o, source: "UIApplication.delegate.$ivars" };
+    return { ok: false, error: "no context", source: "" };
+  } catch (e) {
+    return { ok: false, error: String(e), source: "" };
+  }
+}
+
 function _resolveCoreFixed() {
   if (!ObjC.available) return { ok: false, error: "ObjC not available" };
   const del = _getUIApplicationDelegate();
@@ -1010,6 +1277,34 @@ function _resolveCoreFixed() {
   return { ok: true, ctxMain: ctx, storage: storage, sender: sender };
 }
 
+/**
+ * 仅为动态已读动作解析稳定主上下文，尽量对齐历史成功测试脚本入口。
+ * 参数:
+ * - 无。
+ * 返回:
+ * - `{ ok, ctxMain, storage, sender, source, error }`。
+ */
+function _resolveCoreForStatusRead() {
+  try {
+    if (!ObjC.available) return { ok: false, error: "ObjC not available", source: "" };
+    const ctxRes = _resolveCtxMainStable();
+    if (!ctxRes || !ctxRes.ok || !ctxRes.ctx) {
+      return { ok: false, error: ctxRes ? ctxRes.error : "no context", source: ctxRes ? String(ctxRes.source || "") : "" };
+    }
+    const ctx = ctxRes.ctx && ctxRes.ctx.handle ? ctxRes.ctx : _safeObj(ctxRes.ctx);
+    if (!ctx) return { ok: false, error: "stable ctxMain invalid", source: String(ctxRes.source || "") };
+    let storage = null;
+    let sender = null;
+    try { if (_objcCanCall(ctx, "- chatStorage")) storage = _safeObj(ctx["- chatStorage"]()); } catch (_) { storage = null; }
+    try { if (_objcCanCall(ctx, "- messageSender")) sender = _safeObj(ctx["- messageSender"]()); } catch (_) { sender = null; }
+    if (!storage) return { ok: false, error: "ctxMain.chatStorage nil", source: String(ctxRes.source || "") };
+    if (!sender) return { ok: false, error: "ctxMain.messageSender nil", source: String(ctxRes.source || "") };
+    return { ok: true, ctxMain: ctx, storage: storage, sender: sender, source: String(ctxRes.source || "") };
+  } catch (e) {
+    return { ok: false, error: String(e), source: "" };
+  }
+}
+
 function _makeWAChatJIDFromString(jidStr) {
   const s = String(jidStr || "").trim();
   if (!s) return null;
@@ -1023,16 +1318,673 @@ function _makeWAChatJIDFromString(jidStr) {
 }
 
 function _makeAuthorUserJIDFromString(jidStr) {
-  const s = String(jidStr || "").trim();
-  if (!s || s.indexOf("@") === -1) return null;
-  const ns = _ns(s);
-  if (!ns) return null;
-  const isLid = s.indexOf("@lid") !== -1;
-  const cls = isLid ? ObjC.classes.WALIDUserJID : ObjC.classes.WAUserJID;
-  if (!cls) return null;
-  const sel = "+ ifValidWithStringRepresentation:";
-  if (!_objcCanCall(cls, sel)) return null;
-  return _safeObj(cls[sel](ns));
+  try {
+    const s = String(jidStr || "").trim();
+    if (!s || s.indexOf("@") === -1) return null;
+    const ns = _ns(s);
+    if (!ns) return null;
+    const isLid = s.toLowerCase().endsWith("@lid");
+    const WALIDUserJID = ObjC.classes.WALIDUserJID;
+    const WAUserJID = ObjC.classes.WAUserJID;
+    const WAJID = ObjC.classes.WAJID;
+    let jidObj = null;
+    if (isLid && WALIDUserJID) {
+      if (_objcCanCall(WALIDUserJID, "+ ifValidWithStringRepresentation:")) jidObj = _safeObj(WALIDUserJID["+ ifValidWithStringRepresentation:"](ns));
+      if (!jidObj && _objcCanCall(WALIDUserJID, "+ withString:")) jidObj = _safeObj(WALIDUserJID["+ withString:"](ns));
+    }
+    if (!jidObj && WAUserJID) {
+      if (_objcCanCall(WAUserJID, "+ jidOrLIDWithString:")) jidObj = _safeObj(WAUserJID["+ jidOrLIDWithString:"](ns));
+      if (!jidObj && _objcCanCall(WAUserJID, "+ ifValidWithStringRepresentation:")) jidObj = _safeObj(WAUserJID["+ ifValidWithStringRepresentation:"](ns));
+      if (!jidObj && _objcCanCall(WAUserJID, "+ withString:")) jidObj = _safeObj(WAUserJID["+ withString:"](ns));
+      if (!jidObj && _objcCanCall(WAUserJID, "+ withJIDString:")) jidObj = _safeObj(WAUserJID["+ withJIDString:"](ns));
+      if (!jidObj && _objcCanCall(WAUserJID, "+ userJIDWithString:")) jidObj = _safeObj(WAUserJID["+ userJIDWithString:"](ns));
+      if (!jidObj && _objcCanCall(WAUserJID, "+ jidWithString:")) jidObj = _safeObj(WAUserJID["+ jidWithString:"](ns));
+    }
+    if (!jidObj && WAJID && _objcCanCall(WAJID, "+ withString:")) jidObj = _safeObj(WAJID["+ withString:"](ns));
+    return jidObj || null;
+  } catch (_) {
+    return null;
+  }
+}
+
+/**
+ * 为状态消息恢复构造最小作者候选集，仅做 `@lid <-> @s.whatsapp.net` 的有限对齐。
+ * 参数:
+ * - authorJid: 当前外层作者 JID。
+ * 返回:
+ * - `[{ raw, source }]`，按优先级排列的作者候选。
+ */
+function _buildStatusAuthorJidCandidates(authorJid) {
+  try {
+    const raw = String(authorJid || "").trim();
+    if (!raw || raw.indexOf("@") === -1) return [];
+    const seen = {};
+    const out = [];
+    const pushOne = function (jid, source) {
+      try {
+        const s = String(jid || "").trim();
+        if (!s || s.indexOf("@") === -1) return;
+        const k = String((typeof _normalizeJidString === "function" ? _normalizeJidString(s) : s) || "").trim().toLowerCase();
+        if (!k || seen[k]) return;
+        seen[k] = true;
+        out.push({
+          raw: s,
+          source: String(source || ""),
+          anyObj: _makeWAJIDForStatus(s) || null,
+          userObj: _makeAuthorUserJIDFromString(s) || null,
+        });
+      } catch (_) {}
+    };
+    pushOne(raw, "input");
+    const at = raw.indexOf("@");
+    const local = at > 0 ? raw.slice(0, at).trim() : "";
+    const domain = at > 0 ? raw.slice(at + 1).trim().toLowerCase() : "";
+    if (local && domain === "lid") pushOne(local + "@s.whatsapp.net", "lid_to_phone");
+    if (local && domain === "s.whatsapp.net") pushOne(local + "@lid", "phone_to_lid");
+    return out;
+  } catch (_) {
+    return [];
+  }
+}
+
+/**
+ * 读取对象指定 ivar 中的 ObjC 对象，失败时返回 null。
+ * 参数:
+ * - obj: 目标对象。
+ * - keys: 候选 ivar 名数组。
+ * 返回:
+ * - 命中的 ObjC 对象；失败返回 null。
+ */
+function _tryGetIvarObj(obj, keys) {
+  try {
+    const o = obj && obj.handle ? obj : _safeObj(obj);
+    if (!o || !o.$ivars || !Array.isArray(keys)) return null;
+    for (let i = 0; i < keys.length; i++) {
+      const k = String(keys[i] || "").trim();
+      if (!k) continue;
+      try {
+        const v = _safeObj(o.$ivars[k]);
+        if (v) return v;
+      } catch (_) {}
+    }
+  } catch (_) {}
+  return null;
+}
+
+/**
+ * 优先走 getter，其次从 ivar 中取 ObjC 对象。
+ * 参数:
+ * - owner: 宿主对象。
+ * - selNoArg: 无参 getter。
+ * - ivarKeys: 兜底 ivar 名数组。
+ * 返回:
+ * - 命中的 ObjC 对象；失败返回 null。
+ */
+function _tryGetPropOrIvarObj(owner, selNoArg, ivarKeys) {
+  try {
+    const o = owner && owner.handle ? owner : _safeObj(owner);
+    if (!o) return null;
+    if (selNoArg && _objcCanCall(o, "- " + String(selNoArg || "").trim())) {
+      const v0 = _safeObj(o["- " + String(selNoArg || "").trim()]());
+      if (v0) return v0;
+    }
+    if (selNoArg && _objcCanCall(o, String(selNoArg || "").trim())) {
+      const v1 = _safeObj(o[String(selNoArg || "").trim()]());
+      if (v1) return v1;
+    }
+    return _tryGetIvarObj(o, ivarKeys || []);
+  } catch (_) {}
+  return null;
+}
+
+/**
+ * 返回对象指针字符串，便于记录恢复路径。
+ * 参数:
+ * - obj: 目标对象。
+ * 返回:
+ * - `0x...`；失败返回空字符串。
+ */
+function _ptrStrOfObj(obj) {
+  try {
+    const o = obj && obj.handle ? obj : _safeObj(obj);
+    return o ? ptr(o).toString() : "";
+  } catch (_) {
+    return "";
+  }
+}
+
+/**
+ * 解析状态模型 provider，供状态库恢复支线读取状态域对象。
+ * 参数:
+ * - core: `_resolveCoreFixed()` 返回值。
+ * 返回:
+ * - `{ ok, provider, source, className }`
+ */
+function _resolveStatusModelProvider(core) {
+  try {
+    const ctx = core && core.ctxMain ? (core.ctxMain && core.ctxMain.handle ? core.ctxMain : _safeObj(core.ctxMain)) : null;
+    if (!ctx) return { ok: false, error: "ctxMain nil" };
+    const readPtrAtOffset = (obj, off) => {
+      try {
+        const o = obj && obj.handle ? obj : _safeObj(obj);
+        if (!o) return null;
+        const p = Memory.readPointer(ptr(o).add(off));
+        if (!p || p.isNull()) return null;
+        return _safeObj(p);
+      } catch (_) {
+        return null;
+      }
+    };
+    const pickProviderFromObj = (obj, src) => {
+      try {
+        const o = obj && obj.handle ? obj : _safeObj(obj);
+        if (!o) return null;
+        if (_objcCanCall(o, "- getStatusModelFor:") || _objcCanCall(o, "+ getStatusModelFor:") || o.getStatusModelFor_) {
+          return { ok: true, provider: o, source: src, className: String(o.$className || "") };
+        }
+        const cn = String(o.$className || "");
+        if (cn === "WAStatusStorage.StatusModelFetcher") {
+          const v30 = readPtrAtOffset(o, 0x30);
+          const v28 = v30 ? null : readPtrAtOffset(o, 0x28);
+          const r0 = pickProviderFromObj(v30 || v28, src + (v30 ? ".off0x30" : ".off0x28"));
+          if (r0) return r0;
+        }
+        if (cn === "WAStatusStorage.StatusMessageItemFetcher") {
+          const r1 = pickProviderFromObj(readPtrAtOffset(o, 0x38), src + ".off0x38");
+          if (r1) return r1;
+        }
+        if (cn === "WAStatusStorage.StatusMessageItemWriter") {
+          const r2 = pickProviderFromObj(readPtrAtOffset(o, 0x10), src + ".off0x10");
+          if (r2) return r2;
+        }
+        if (cn === "WAStatusStorage.WAStatusDatabaseValidationManager") {
+          const r3 = pickProviderFromObj(readPtrAtOffset(o, 0x30), src + ".off0x30");
+          if (r3) return r3;
+        }
+        const iv = _tryGetIvarObj(o, ["_statusModelProvider", "statusModelProvider", "_modelProvider", "modelProvider"]);
+        if (iv && (_objcCanCall(iv, "- getStatusModelFor:") || _objcCanCall(iv, "+ getStatusModelFor:") || iv.getStatusModelFor_)) {
+          return { ok: true, provider: iv, source: src + ".$ivars", className: String(iv.$className || "") };
+        }
+        if (_objcCanCall(o, "- statusModelProvider")) {
+          const v = _safeObj(o["- statusModelProvider"]());
+          if (v && (_objcCanCall(v, "- getStatusModelFor:") || _objcCanCall(v, "+ getStatusModelFor:") || v.getStatusModelFor_)) {
+            return { ok: true, provider: v, source: src + ".statusModelProvider", className: String(v.$className || "") };
+          }
+        }
+      } catch (_) {}
+      return null;
+    };
+    const roots = [
+      { obj: _tryGetPropOrIvarObj(ctx, "statusModelProvider", ["_statusModelProvider", "statusModelProvider"]), src: "ctxMain.statusModelProvider" },
+      { obj: _tryGetPropOrIvarObj(ctx, "statusStorage", ["_statusStorage", "statusStorage"]), src: "ctxMain.statusStorage" },
+      { obj: _tryGetPropOrIvarObj(ctx, "statusDatabaseValidationManager", ["_statusDatabaseValidationManager", "statusDatabaseValidationManager"]), src: "ctxMain.statusDatabaseValidationManager" },
+      { obj: ctx, src: "ctxMain" },
+    ];
+    for (let i = 0; i < roots.length; i++) {
+      const hit = pickProviderFromObj(roots[i].obj, roots[i].src);
+      if (hit) return hit;
+    }
+    return { ok: false, error: "statusModelProvider not found" };
+  } catch (e) {
+    return { ok: false, error: String(e) };
+  }
+}
+
+/**
+ * 通过历史已验证的 `getStatusModelFor:` 主桥恢复目标状态消息。
+ * 参数:
+ * - core: `_resolveCoreFixed()` 返回值。
+ * - statusIdStr: 目标状态 stanzaId/uuid。
+ * - authorJidStr: 历史成功链中使用的状态作者 JID。
+ * 返回:
+ * - `{ ok, msg, via, provider, statusModel, error }`
+ */
+function _fetchStatusMessageViaStatusModel(core, statusIdStr, authorJidStr) {
+  try {
+    const sid = String(statusIdStr || "").trim();
+    const author = String(authorJidStr || "").trim();
+    if (!sid) return { ok: false, error: "missing statusId" };
+    const provRes = _resolveStatusModelProvider(core);
+    if (!provRes || !provRes.ok) {
+      return { ok: false, error: provRes ? provRes.error : "statusModelProvider failed", provider: provRes || null };
+    }
+    const nsId = _ns(sid);
+    if (!nsId) return { ok: false, error: "statusId->NSString failed" };
+    let sm = null;
+    try {
+      const p = provRes.provider;
+      if (_objcCanCall(p, "+ getStatusModelFor:")) sm = p["+ getStatusModelFor:"](nsId);
+      else if (_objcCanCall(p, "- getStatusModelFor:")) sm = p["- getStatusModelFor:"](nsId);
+      else if (p && p.getStatusModelFor_ && typeof p.getStatusModelFor_ === "function") sm = p.getStatusModelFor_(nsId);
+    } catch (_) {
+      sm = null;
+    }
+    const smObj = sm && sm.handle ? sm : _safeObj(sm);
+    if (!smObj) {
+      return {
+        ok: false,
+        error: "getStatusModelFor returned nil",
+        provider: { className: String(provRes.className || ""), source: String(provRes.source || "") },
+      };
+    }
+    const statusMeta = { className: String(smObj.$className || ""), ptr: _ptrStrOfObj(smObj) };
+    const providerMeta = { className: String(provRes.className || ""), source: String(provRes.source || "") };
+    const isWAMessageClassName = function (className) {
+      try {
+        const cn = String(className || "");
+        if (!cn) return false;
+        if (cn.indexOf("WAMessageID") !== -1) return false;
+        return cn.indexOf("WAMessage") !== -1;
+      } catch (_) {
+        return false;
+      }
+    };
+    const isWAMessage = function (obj) {
+      try {
+        const o = obj && obj.handle ? obj : _safeObj(obj);
+        if (!o) return false;
+        return isWAMessageClassName(String(o.$className || ""));
+      } catch (_) {
+        return false;
+      }
+    };
+    const fetchByMessageId = function (midObj, via) {
+      try {
+        const mid = midObj && midObj.handle ? midObj : _safeObj(midObj);
+        if (!mid) return null;
+        const moc = _resolveManagedObjectContext(core);
+        const fres = _fetchMessageByMessageID(core ? core.storage : null, mid, moc);
+        if (!fres || !fres.ok || !fres.msg) return null;
+        const msgObj = fres.msg && fres.msg.handle ? fres.msg : _safeObj(fres.msg);
+        if (!msgObj || !isWAMessage(msgObj)) return null;
+        return {
+          ok: true,
+          msg: msgObj,
+          provider: providerMeta,
+          statusModel: statusMeta,
+          via: String(via || "") + String(fres.used ? ("." + fres.used) : ""),
+        };
+      } catch (_) {
+        return null;
+      }
+    };
+    const iv = _listIvarsNoTouch(_ptrStrOfObj(smObj), 260);
+    if (!iv || !iv.ok || !Array.isArray(iv.ivars)) {
+      return { ok: false, error: "list ivars failed", provider: providerMeta, statusModel: statusMeta };
+    }
+    const keep = [];
+    for (let i = 0; i < iv.ivars.length; i++) {
+      const it = iv.ivars[i];
+      const nm = String((it && it.name) ? it.name : "");
+      if (!nm) continue;
+      if (/(key|message|storage|manager|id)/i.test(nm)) keep.push(it);
+      if (keep.length >= 60) break;
+    }
+    const pSelf = _toPtr(smObj);
+    const probePtrAtOff = function (off) {
+      try {
+        const addr = pSelf.add(off | 0);
+        if (!_isReadablePtr(addr, Process.pointerSize)) return null;
+        const vp = Memory.readPointer(addr);
+        if (!vp || vp.isNull()) return { ptr: ptr("0x0"), className: "", ok: false };
+        let cn = "";
+        try {
+          if (_isReadablePtr(vp, Process.pointerSize)) cn = _objcClassNameNoTouch(vp);
+        } catch (_) {
+          cn = "";
+        }
+        let s = "";
+        if (cn && (cn.indexOf("String") !== -1 || cn.indexOf("NSString") !== -1)) {
+          try {
+            const so = _safeObj(vp);
+            s = so ? String(so || "") : "";
+          } catch (_) {
+            s = "";
+          }
+        }
+        return { ptr: vp, className: cn, ok: !!cn, string: s };
+      } catch (_) {
+        return null;
+      }
+    };
+    const pickIvarPtr = function (re) {
+      try {
+        for (let i = 0; i < keep.length; i++) {
+          const it = keep[i];
+          const nm = String((it && it.name) ? it.name : "");
+          const off = Number((it && it.off) ? it.off : 0) | 0;
+          if (!nm || off <= 0 || off > 0x900) continue;
+          if (!re.test(nm)) continue;
+          const pr = probePtrAtOff(off);
+          if (!pr || !pr.ok) continue;
+          return { name: nm, off, ptr: pr.ptr, className: pr.className, string: String(pr.string || "") };
+        }
+      } catch (_) {}
+      return null;
+    };
+    const msgHit =
+      pickIvarPtr(/^(?:_)?message$/i) ||
+      pickIvarPtr(/waMessage/i) ||
+      pickIvarPtr(/chatMessage/i);
+    if (msgHit && isWAMessageClassName(msgHit.className)) {
+      const msgObj = _safeObj(msgHit.ptr);
+      if (msgObj && isWAMessage(msgObj)) {
+        return { ok: true, msg: msgObj, provider: providerMeta, statusModel: statusMeta, via: "statusItem.ivarMessage" };
+      }
+    }
+    if (msgHit && !isWAMessageClassName(msgHit.className) && msgHit.className && msgHit.className.indexOf("String") !== -1) {
+      const msgText = String(msgHit.string || "").trim();
+      if (msgText) {
+        const midFromString = _makeWAMessageIDForStatus(msgText, author, "status@broadcast");
+        const fromString = fetchByMessageId(midFromString, "statusItem.messageString->WAMessageID->chatStorage");
+        if (fromString) return fromString;
+      }
+    }
+    const midHit = pickIvarPtr(/messageid/i);
+    if (midHit && String(midHit.className || "").indexOf("WAMessageID") !== -1) {
+      const fromMidIvar = fetchByMessageId(_safeObj(midHit.ptr), "statusItem.ivarMessageID->chatStorage");
+      if (fromMidIvar) return fromMidIvar;
+    }
+    const keyHit =
+      pickIvarPtr(/statusnotificationmessagekey/i) ||
+      pickIvarPtr(/notificationmessagekey/i) ||
+      pickIvarPtr(/parsedmessagekey/i) ||
+      pickIvarPtr(/messagekey/i);
+    if (keyHit) {
+      const midp = _callMessageIDFromParsedMessageKey(keyHit.ptr);
+      if (midp && !midp.isNull()) {
+        const midObj = _safeObj(midp);
+        if (midObj && String(_objcClassNameNoTouch(midp) || "").indexOf("WAMessageID") !== -1) {
+          const fromParsedKey = fetchByMessageId(midObj, "statusItem.statusNotificationMessageKey->native.sub_10278AD98->chatStorage");
+          if (fromParsedKey) return fromParsedKey;
+        }
+      }
+    }
+    return {
+      ok: false,
+      error: "status model resolved but WAMessage not resolved",
+      provider: providerMeta,
+      statusModel: statusMeta,
+    };
+  } catch (e) {
+    return { ok: false, error: String(e) };
+  }
+}
+
+/**
+ * 解析可执行 `statusUUID + senderUserJID` 查询的 status 宿主对象。
+ * 参数:
+ * - core: `_resolveCoreFixed()` 返回值。
+ * 返回:
+ * - `{ ok, host, source, selectors, className, ptr }`
+ */
+function _resolveStatusQueryHost(core) {
+  try {
+    const ctx = core && core.ctxMain ? (core.ctxMain && core.ctxMain.handle ? core.ctxMain : _safeObj(core.ctxMain)) : null;
+    if (!ctx) return { ok: false, error: "ctxMain nil" };
+    const readPtrAtOffset = (obj, off) => {
+      try {
+        const o = obj && obj.handle ? obj : _safeObj(obj);
+        if (!o) return null;
+        const p = Memory.readPointer(ptr(o).add(off));
+        if (!p || p.isNull()) return null;
+        return _safeObj(p);
+      } catch (_) {
+        return null;
+      }
+    };
+    const hasStatusFetchSelector = (obj) => {
+      try {
+        const o = obj && obj.handle ? obj : _safeObj(obj);
+        if (!o) return null;
+        const hits = [];
+        if (_objcCanCall(o, "- fetchStatusForUUID:senderJID:error:")) hits.push("fetchStatusForUUID:senderJID:error:");
+        if (_objcCanCall(o, "- fetchStatusforUUIDWithUuid:senderUserJid:error:")) hits.push("fetchStatusforUUIDWithUuid:senderUserJid:error:");
+        if (_objcCanCall(o, "- fetchStatusAddOnsOutgoingReactionWithStatusRowId:error:")) hits.push("fetchStatusAddOnsOutgoingReactionWithStatusRowId:error:");
+        return hits.length ? { host: o, selectors: hits, className: String(o.$className || ""), ptr: _ptrStrOfObj(o) } : null;
+      } catch (_) {
+        return null;
+      }
+    };
+    const pickHostFromObj = (obj, src, seen) => {
+      try {
+        const o = obj && obj.handle ? obj : _safeObj(obj);
+        if (!o) return null;
+        const key = _ptrStrOfObj(o);
+        if (!key || key === "0x0" || (seen && seen[key])) return null;
+        if (seen) seen[key] = 1;
+        const direct = hasStatusFetchSelector(o);
+        if (direct) return { ok: true, host: direct.host, selectors: direct.selectors, className: direct.className, ptr: direct.ptr, source: src };
+        const cn = String(o.$className || "");
+        if (cn === "WAStatusStorage.WAStatusDatabaseValidationManager") {
+          return pickHostFromObj(readPtrAtOffset(o, 0x38) || _tryGetIvarObj(o, ["_statusDatabase", "statusDatabase"]), src + ".statusDatabase", seen)
+            || pickHostFromObj(readPtrAtOffset(o, 0x30) || _tryGetIvarObj(o, ["_statusModelProvider", "statusModelProvider"]), src + ".statusModelProvider", seen);
+        }
+        if (cn === "WAStatusStorage.StatusStorage") {
+          return pickHostFromObj(_tryGetPropOrIvarObj(o, "statusDatabase", ["_statusDatabase", "statusDatabase"]), src + ".statusDatabase", seen)
+            || pickHostFromObj(_tryGetPropOrIvarObj(o, "fetcher", ["_fetcher", "fetcher"]), src + ".fetcher", seen)
+            || pickHostFromObj(_tryGetPropOrIvarObj(o, "writer", ["_writer", "writer"]), src + ".writer", seen);
+        }
+        if (cn === "WAStatusStorage.StatusModelFetcher") {
+          return pickHostFromObj(readPtrAtOffset(o, 0x20) || _tryGetIvarObj(o, ["_statusFetcher", "statusFetcher"]), src + ".statusFetcher", seen)
+            || pickHostFromObj(readPtrAtOffset(o, 0x18) || _tryGetIvarObj(o, ["_statusMessageItemFetcher", "statusMessageItemFetcher"]), src + ".statusMessageItemFetcher", seen)
+            || pickHostFromObj(readPtrAtOffset(o, 0x30) || _tryGetIvarObj(o, ["_statusModelProvider", "statusModelProvider"]) || readPtrAtOffset(o, 0x28), src + ".statusModelProvider", seen);
+        }
+        if (cn === "WAStatusStorage.StatusMessageItemFetcher") {
+          return pickHostFromObj(readPtrAtOffset(o, 0x20) || readPtrAtOffset(o, 0x18) || _tryGetIvarObj(o, ["_statusModelProvider", "statusModelProvider"]), src + ".statusModelProvider", seen);
+        }
+        if (cn.indexOf("StatusMessageItemProvider") !== -1) {
+          return pickHostFromObj(readPtrAtOffset(o, 0x38) || _tryGetIvarObj(o, ["_provider", "provider", "_statusModelProvider", "statusModelProvider"]), src + ".off0x38", seen);
+        }
+        const validationManager = _tryGetIvarObj(o, ["_statusDatabaseValidationManager", "statusDatabaseValidationManager"]);
+        if (validationManager) {
+          const vm = pickHostFromObj(validationManager, src + ".statusDatabaseValidationManager", seen);
+          if (vm) return vm;
+        }
+        const statusDb = _tryGetIvarObj(o, ["_statusDatabase", "statusDatabase"]);
+        if (statusDb) {
+          const hit = hasStatusFetchSelector(statusDb);
+          if (hit) return { ok: true, host: hit.host, selectors: hit.selectors, className: hit.className, ptr: hit.ptr, source: src + ".$ivars.statusDatabase" };
+        }
+      } catch (_) {}
+      return null;
+    };
+    const roots = [
+      { obj: _tryGetPropOrIvarObj(ctx, "statusDatabaseValidationManager", ["_statusDatabaseValidationManager", "statusDatabaseValidationManager"]), src: "ctxMain.statusDatabaseValidationManager" },
+      { obj: _tryGetPropOrIvarObj(ctx, "statusStorage", ["_statusStorage", "statusStorage"]), src: "ctxMain.statusStorage" },
+      { obj: _tryGetPropOrIvarObj(ctx, "statusModelProvider", ["_statusModelProvider", "statusModelProvider"]), src: "ctxMain.statusModelProvider" },
+      { obj: ctx, src: "ctxMain" },
+    ];
+    const providerRes = _resolveStatusModelProvider(core);
+    if (providerRes && providerRes.ok && providerRes.provider) roots.push({ obj: providerRes.provider, src: "statusModelProvider" });
+    const seen = {};
+    for (let i = 0; i < roots.length; i++) {
+      const hit = pickHostFromObj(roots[i].obj, roots[i].src, seen);
+      if (hit) return hit;
+    }
+    return { ok: false, error: "status query host not found" };
+  } catch (e) {
+    return { ok: false, error: String(e) };
+  }
+}
+
+/**
+ * 判断对象是否已是可直接取 `messageID` 的 status-like 对象。
+ * 参数:
+ * - obj: 候选对象。
+ * 返回:
+ * - `true/false`
+ */
+function _isStatusLikeObject(obj) {
+  try {
+    const base = obj && obj.handle ? obj : _safeObj(obj);
+    if (!base) return false;
+    const cn = String(base.$className || "");
+    if (!cn || cn.indexOf("DBModel") !== -1) return false;
+    if (cn.indexOf("WAStatus") !== -1 && _objcCanCall(base, "- messageID")) return true;
+    if (_objcCanCall(base, "- messageID") && (_objcCanCall(base, "- statusType") || _objcCanCall(base, "- statusBase"))) return true;
+  } catch (_) {}
+  return false;
+}
+
+/**
+ * 从 status DBModel/status-like 对象中提取行号。
+ * 参数:
+ * - obj: 候选对象。
+ * 返回:
+ * - 正整数 rowId；失败返回 0。
+ */
+function _extractStatusRowId(obj) {
+  try {
+    const base = obj && obj.handle ? obj : _safeObj(obj);
+    if (!base) return 0;
+    const sels = ["rowId", "rowID", "statusRowId", "statusRowID", "statusInfoRowId", "statusInfoRowID"];
+    for (let i = 0; i < sels.length; i++) {
+      try {
+        if (!_objcCanCall(base, "- " + sels[i])) continue;
+        const v = _objcCallNoArg(base, sels[i]);
+        const n = Number(String(v || "").trim());
+        if (Number.isFinite(n) && n > 0) return n | 0;
+      } catch (_) {}
+    }
+  } catch (_) {}
+  return 0;
+}
+
+/**
+ * 把 `WAStatusDBModel` 映射成可继续取 `messageID` 的 status-like 对象。
+ * 参数:
+ * - hostObj: 状态查询宿主。
+ * - dbModelObj: `fetchStatus...` 返回对象。
+ * 返回:
+ * - `{ ok, status, via, attempts }`
+ */
+function _mapStatusDBModelToStatus(hostObj, dbModelObj) {
+  try {
+    const base = dbModelObj && dbModelObj.handle ? dbModelObj : _safeObj(dbModelObj);
+    if (!base) return { ok: false, error: "dbModel nil" };
+    if (_isStatusLikeObject(base)) return { ok: true, status: base, via: "direct", attempts: [] };
+    const Mapper = ObjC.classes.WAStatusDBModelToWAStatusMapper;
+    if (!Mapper) return { ok: false, error: "WAStatusDBModelToWAStatusMapper missing" };
+    const fn = Mapper["+ mapToStatusViewModelFrom:with:"] || Mapper.mapToStatusViewModelFrom_with_;
+    const attempts = [];
+    if (!fn || typeof fn !== "function") return { ok: false, error: "mapToStatusViewModelFrom:with: missing", attempts: attempts };
+    try {
+      const arg2 = hostObj && hostObj.handle ? hostObj : _safeObj(hostObj);
+      if (!arg2) return { ok: false, error: "statusQueryHost invalid for mapper", attempts: attempts };
+      const ret = fn.call(Mapper, base, arg2);
+      const out = ret ? (ret && ret.handle ? ret : _safeObj(ret)) : null;
+      const ok = !!(out && _isStatusLikeObject(out));
+      attempts.push({ with: "statusQueryHost", ok: ok, className: out ? String(out.$className || "") : "", ptr: out ? _ptrStrOfObj(out) : "" });
+      if (ok) return { ok: true, status: out, via: "WAStatusDBModelToWAStatusMapper.mapToStatusViewModelFrom:with:", attempts: attempts };
+    } catch (e) {
+      attempts.push({ with: "statusQueryHost", ok: false, error: String(e) });
+    }
+    return { ok: false, error: "mapper returned non-WAStatus", attempts: attempts };
+  } catch (e) {
+    return { ok: false, error: String(e) };
+  }
+}
+
+/**
+ * 通过 `statusUUID + senderUserJID` 走状态数据库主线恢复状态域对象，再回捞本地 `WAMessage`。
+ * 参数:
+ * - core: `_resolveCoreFixed()` 返回值。
+ * - statusStanzaId: 目标状态 sid。
+ * - authorJid: 状态作者 JID。
+ * 返回:
+ * - `{ ok, messageFetch, mapResult, normalizedAuthorJid, attempts, host }`
+ */
+function _fetchStatusDomainObjects(core, statusStanzaId, authorJid) {
+  try {
+    const sid = String(statusStanzaId || "").trim();
+    const author = String(authorJid || "").trim();
+    if (!sid || !author) return { ok: false, error: "missing statusStanzaId/authorJid" };
+    const hostRes = _resolveStatusQueryHost(core);
+    if (!hostRes || !hostRes.ok || !hostRes.host) return { ok: false, error: hostRes ? String(hostRes.error || "status query host failed") : "status query host failed", host: hostRes || null };
+    const host = hostRes.host && hostRes.host.handle ? hostRes.host : _safeObj(hostRes.host);
+    if (!host) return { ok: false, error: "status query host invalid", host: hostRes || null };
+    const nsSid = _ns(sid);
+    const senderCandidates = _buildStatusAuthorJidCandidates(author);
+    const attempts = [];
+    const tryFetch = (selector, arg2, label, senderRaw, senderSource) => {
+      try {
+        if (!nsSid || !arg2 || !_objcCanCall(host, "- " + selector)) return null;
+        const fn = host["- " + selector] || host[selector];
+        if (!fn || typeof fn !== "function") return null;
+        const ret = fn.call(host, nsSid, arg2, ptr("0x0"));
+        const out = ret ? (ret && ret.handle ? ret : _safeObj(ret)) : null;
+        attempts.push({ selector: selector, arg2: label, senderJid: String(senderRaw || ""), senderSource: String(senderSource || ""), ok: !!out, className: out ? String(out.$className || "") : "", ptr: out ? _ptrStrOfObj(out) : "" });
+        return out;
+      } catch (e) {
+        attempts.push({ selector: selector, arg2: label, senderJid: String(senderRaw || ""), senderSource: String(senderSource || ""), ok: false, error: String(e) });
+        return null;
+      }
+    };
+    const trySelectorAcrossCandidates = (selector, useUserObj) => {
+      for (let i = 0; i < senderCandidates.length; i++) {
+        const c = senderCandidates[i] || {};
+        const arg2 = useUserObj ? c.userObj : c.anyObj;
+        const label = useUserObj ? "WAUserJID" : "WAJID";
+        const hit = tryFetch(selector, arg2, label, c.raw, c.source);
+        if (hit) return hit;
+      }
+      return null;
+    };
+    const dbModel =
+      trySelectorAcrossCandidates("fetchStatusForUUID:senderJID:error:", false) ||
+      trySelectorAcrossCandidates("fetchStatusForUUID:senderJID:error:", true) ||
+      trySelectorAcrossCandidates("fetchStatusforUUIDWithUuid:senderUserJid:error:", true);
+    const mapRes = dbModel ? _mapStatusDBModelToStatus(host, dbModel) : { ok: false, error: "dbModel unavailable", attempts: [] };
+    const statusObj = mapRes && mapRes.ok && mapRes.status ? (mapRes.status && mapRes.status.handle ? mapRes.status : _safeObj(mapRes.status)) : null;
+    const rowId = _extractStatusRowId(dbModel) || _extractStatusRowId(statusObj);
+    const messageFetch = statusObj ? _fetchMessageFromStatusLike(core, statusObj) : { ok: false, skipped: true, error: mapRes ? String(mapRes.error || "status mapping failed") : "status mapping failed" };
+    const normalizedAuthor = String(
+      _safeStrCall(statusObj, "authorJID") ||
+      _safeStrCall(statusObj, "authorUserJID") ||
+      _safeStrCall(dbModel, "senderUserJid") ||
+      author
+    ).trim();
+    return {
+      ok: !!(dbModel || statusObj || (messageFetch && messageFetch.ok)),
+      host: { source: String(hostRes.source || ""), selectors: hostRes.selectors || [], className: String(hostRes.className || ""), ptr: String(hostRes.ptr || "") },
+      attempts: attempts,
+      dbModel: dbModel,
+      rowId: rowId | 0,
+      status: statusObj,
+      mapResult: mapRes || null,
+      messageFetch: messageFetch,
+      senderCandidates: senderCandidates.map(function (x) { return { raw: String(x && x.raw || ""), source: String(x && x.source || "") }; }),
+      normalizedAuthorJid: normalizedAuthor || author,
+    };
+  } catch (e) {
+    return { ok: false, error: String(e) };
+  }
+}
+
+/**
+ * 通过 status-like 对象上的 `messageID` 回捞本地 `WAMessage`。
+ * 参数:
+ * - core: `_resolveCoreFixed()` 返回值。
+ * - statusObj: `WAStatus`/status-like 对象。
+ * 返回:
+ * - `{ ok, msg, used, messageID }`
+ */
+function _fetchMessageFromStatusLike(core, statusObj) {
+  try {
+    const st = statusObj && statusObj.handle ? statusObj : _safeObj(statusObj);
+    if (!st) return { ok: false, error: "status nil" };
+    if (!_objcCanCall(st, "- messageID")) return { ok: false, error: "status.messageID missing" };
+    const midObj = _safeObj(_objcCallNoArg(st, "messageID"));
+    if (!midObj) return { ok: false, error: "status.messageID returned nil" };
+    const fetchRes = _fetchMessageByMessageID(core.storage, midObj, _resolveManagedObjectContext(core));
+    if (fetchRes && fetchRes.ok && fetchRes.msg) {
+      return { ok: true, msg: fetchRes.msg && fetchRes.msg.handle ? fetchRes.msg : _safeObj(fetchRes.msg), used: String(fetchRes.used || ""), messageID: _statusActionMessageIdSummary(midObj) };
+    }
+    return { ok: false, error: String(fetchRes && fetchRes.error ? fetchRes.error : "fetchMessageByMessageID failed"), used: fetchRes ? String(fetchRes.used || "") : "", messageID: _statusActionMessageIdSummary(midObj) };
+  } catch (e) {
+    return { ok: false, error: String(e) };
+  }
 }
 
 function _resolveManagedObjectContext(core) {
@@ -1144,6 +2096,421 @@ function _fetchMessageByStanzaId(mcsObj, stanzaIdStr, participantJidStr, mocObj)
     } catch (_) {}
   }
   return null;
+}
+
+/**
+ * 从候选值列表中返回第一个非空结果。
+ * 参数:
+ * - values: 候选值数组。
+ * 返回:
+ * - 首个非空字符串/数字/布尔值/对象；都为空时返回 null。
+ */
+function _statusActionFirstNonEmpty(values) {
+  try {
+    if (!Array.isArray(values)) return null;
+    for (let i = 0; i < values.length; i++) {
+      const v = values[i];
+      if (v == null) continue;
+      if (typeof v === "string") {
+        const s = String(v || "").trim();
+        if (!s || s === "0x0" || s === "(null)" || s === "[object Object]") continue;
+        return s;
+      }
+      if (typeof v === "number") {
+        if (!Number.isFinite(v)) continue;
+        return v;
+      }
+      if (typeof v === "boolean") return v;
+      if (Array.isArray(v)) {
+        if (v.length <= 0) continue;
+        return v;
+      }
+      if (typeof v === "object") {
+        if (Object.keys(v).length <= 0) continue;
+        return v;
+      }
+    }
+  } catch (_) {}
+  return null;
+}
+
+/**
+ * 收敛 `WAMessageID` 的最小摘要，供状态 bridge 回收真实作者时使用。
+ * 参数:
+ * - midObj: `WAMessageID` 对象。
+ * 返回:
+ * - `{ uniqueKey }` 或 null。
+ */
+function _statusActionMessageIdSummary(midObj) {
+  try {
+    const mid = midObj && midObj.handle ? midObj : _safeObj(midObj);
+    if (!mid) return null;
+    return {
+      uniqueKey: _safeStrCall(mid, "uniqueKey") || "",
+    };
+  } catch (_) {
+    return null;
+  }
+}
+
+/**
+ * 收敛 `WAStatusMessageItem` 的最小关键字段。
+ * 参数:
+ * - itemObj: `WAStatusMessageItem` 对象。
+ * 返回:
+ * - `{ authorJID, originalAuthorUserJID, uniqueKey, messageID }` 或 null。
+ */
+function _statusActionStatusItemSummary(itemObj) {
+  try {
+    const it = itemObj && itemObj.handle ? itemObj : _safeObj(itemObj);
+    if (!it) return null;
+    return {
+      authorJID: _extractJidStringFromMaybeObj(_objcCanCall(it, "- authorJID") ? it["- authorJID"]() : null),
+      originalAuthorUserJID: _safeStrCall(it, "originalAuthorUserJID") || "",
+      uniqueKey: _safeStrCall(it, "uniqueKey") || "",
+      messageID: _statusActionMessageIdSummary(_objcCanCall(it, "- messageID") ? it["- messageID"]() : null),
+    };
+  } catch (_) {
+    return null;
+  }
+}
+
+/**
+ * 只读执行 `WAMessage -> WAStatusMessageItem` bridge，用于回收真实作者。
+ * 参数:
+ * - msgObj: 已恢复的 `WAMessage`。
+ * 返回:
+ * - `{ ok, fromMessage, initWithMessage, convertMessages }`。
+ */
+function _bridgeStatusMessageItemFromMessage(msgObj) {
+  try {
+    const msg = msgObj && msgObj.handle ? msgObj : _safeObj(msgObj);
+    if (!msg) return { ok: false, error: "message nil" };
+    const cls = ObjC.classes.WAStatusMessageItem;
+    if (!cls) return { ok: false, error: "WAStatusMessageItem class missing" };
+    const out = {
+      ok: false,
+      fromMessage: { ok: false, item: null, error: "selector missing" },
+      initWithMessage: { ok: false, item: null, error: "selector missing" },
+      convertMessages: { ok: false, first: null, count: 0, error: "selector missing" },
+    };
+    try {
+      if (cls["+ fromMessage:"] && typeof cls["+ fromMessage:"] === "function") {
+        const v = cls["+ fromMessage:"](msg);
+        const o = _safeObj(v);
+        out.fromMessage = o
+          ? { ok: true, item: _statusActionStatusItemSummary(o) }
+          : { ok: false, item: null, error: "returned nil" };
+      }
+    } catch (e) {
+      out.fromMessage = { ok: false, item: null, error: String(e) };
+    }
+    try {
+      const inst = cls.alloc ? cls.alloc() : null;
+      if (inst && _objcCanCall(inst, "- initWithMessage:")) {
+        const v = inst.initWithMessage_(msg);
+        const o = _safeObj(v);
+        out.initWithMessage = o
+          ? { ok: true, item: _statusActionStatusItemSummary(o) }
+          : { ok: false, item: null, error: "returned nil" };
+      }
+    } catch (e) {
+      out.initWithMessage = { ok: false, item: null, error: String(e) };
+    }
+    try {
+      if (cls["+ convertMessagesToStatusMessageItems:"] && typeof cls["+ convertMessagesToStatusMessageItems:"] === "function") {
+        const NSArray = ObjC.classes.NSArray;
+        const arr = NSArray && NSArray["+ arrayWithObject:"] ? NSArray["+ arrayWithObject:"](msg) : null;
+        const v = arr ? cls["+ convertMessagesToStatusMessageItems:"](arr) : null;
+        const o = _safeObj(v);
+        let count = 0;
+        let first = null;
+        if (o) {
+          try { count = Number(o.count ? o.count() : 0) | 0; } catch (_) { count = 0; }
+          if (count > 0 && _objcCanCall(o, "- objectAtIndex:")) {
+            try {
+              const f0 = o.objectAtIndex_(0);
+              const fo = _safeObj(f0);
+              if (fo) first = _statusActionStatusItemSummary(fo);
+            } catch (_) {}
+          }
+        }
+        out.convertMessages = o
+          ? { ok: true, first: first, count: count }
+          : { ok: false, first: null, count: 0, error: "returned nil" };
+      }
+    } catch (e) {
+      out.convertMessages = { ok: false, first: null, count: 0, error: String(e) };
+    }
+    out.ok = !!(
+      (out.fromMessage && out.fromMessage.ok) ||
+      (out.initWithMessage && out.initWithMessage.ok) ||
+      (out.convertMessages && out.convertMessages.ok)
+    );
+    if (!out.ok) out.error = "all WAStatusMessageItem bridges failed";
+    return out;
+  } catch (e) {
+    return { ok: false, error: String(e) };
+  }
+}
+
+/**
+ * 从 bridge 结果里回收真实状态作者 JID。
+ * 参数:
+ * - bridgeRes: `_bridgeStatusMessageItemFromMessage(...)` 返回值。
+ * - msgObj: 已恢复的 `WAMessage`。
+ * - fallbackAuthor: 回退作者 JID。
+ * 返回:
+ * - 真实 `authorJID/originalAuthorUserJID`；失败时回退到输入作者。
+ */
+function _resolveCanonicalStatusAuthorFromBridge(bridgeRes, msgObj, fallbackAuthor) {
+  try {
+    const bridge = bridgeRes || null;
+    const msg = msgObj && msgObj.handle ? msgObj : _safeObj(msgObj);
+    const fromMessageItem = bridge && bridge.fromMessage && bridge.fromMessage.ok ? bridge.fromMessage.item : null;
+    const initItem = bridge && bridge.initWithMessage && bridge.initWithMessage.ok ? bridge.initWithMessage.item : null;
+    const convertItem = bridge && bridge.convertMessages && bridge.convertMessages.ok ? bridge.convertMessages.first : null;
+    return String(_statusActionFirstNonEmpty([
+      fromMessageItem ? fromMessageItem.authorJID : "",
+      fromMessageItem ? fromMessageItem.originalAuthorUserJID : "",
+      initItem ? initItem.authorJID : "",
+      initItem ? initItem.originalAuthorUserJID : "",
+      convertItem ? convertItem.authorJID : "",
+      convertItem ? convertItem.originalAuthorUserJID : "",
+      msg ? (_safeStrCall(msg, "authorUserJID") || _safeStrCall(msg, "authorJID") || _safeStrCall(msg, "participantUserJID") || _safeStrCall(msg, "participantJID")) : "",
+      String(fallbackAuthor || "").trim(),
+    ]) || "").trim();
+  } catch (_) {
+    return String(fallbackAuthor || "").trim();
+  }
+}
+
+/**
+ * 构造状态动作所需的通用 `WAJID` 参与者对象。
+ * 参数:
+ * - jidStr: 作者 JID。
+ * 返回:
+ * - `WAJID/WAUserJID/WAChatJID` 对象；失败返回 null。
+ */
+function _makeWAJIDForStatus(jidStr) {
+  try {
+    const s = String(jidStr || "").trim();
+    if (!s) return null;
+    const ns = _ns(s);
+    if (!ns) return null;
+    const C = ObjC.classes.WAJID;
+    if (C && C["+ withString:"] && typeof C["+ withString:"] === "function") {
+      try {
+        const v = C["+ withString:"](ns);
+        if (v) return _safeObj(v);
+      } catch (_) {}
+    }
+    const u = _makeAuthorUserJIDFromString(s);
+    if (u) return u;
+    return _makeWAChatJIDFromString(s);
+  } catch (_) {
+    return null;
+  }
+}
+
+/**
+ * 构造状态消息对应的 `WAMessageID`。
+ * 参数:
+ * - stanzaIdStr: 状态 sid。
+ * - authorJidStr: 真实作者 JID。
+ * - statusChatJidStr: 状态会话 JID。
+ * 返回:
+ * - `WAMessageID` 对象；失败返回 null。
+ */
+function _makeWAMessageIDForStatus(stanzaIdStr, authorJidStr, statusChatJidStr) {
+  try {
+    const sid = String(stanzaIdStr || "").trim();
+    if (!sid) return null;
+    const author = String(authorJidStr || "").trim();
+    const midCls = ObjC.classes.WAMessageID;
+    if (!midCls || !midCls.alloc) return null;
+    const nsSid = _ns(sid);
+    if (!nsSid) return null;
+    const uniqueKey = author ? ("status@broadcast_" + sid + "_0_" + author) : "";
+    if (uniqueKey) {
+      try {
+        const nsUk = _ns(uniqueKey);
+        const mid0 = midCls.alloc();
+        if (nsUk && mid0 && _objcCanCall(mid0, "- initWithUniqueKey:")) {
+          const o0 = _safeObj(mid0.initWithUniqueKey_(nsUk));
+          if (o0) return o0;
+        }
+      } catch (_) {}
+    }
+    const statusChatJid = _makeWAChatJIDFromString(String(statusChatJidStr || "").trim() || "status@broadcast");
+    if (!statusChatJid) return null;
+    const pu = author ? _makeAuthorUserJIDFromString(author) : null;
+    const pj = author ? _makeWAJIDForStatus(author) : null;
+    try {
+      const mid1 = midCls.alloc();
+      if (mid1 && _objcCanCall(mid1, "- initWithStanzaID:chatJID:participantJID:")) {
+        const o1 = _safeObj(mid1.initWithStanzaID_chatJID_participantJID_(nsSid, statusChatJid, pu || pj || null));
+        if (o1) return o1;
+      }
+    } catch (_) {}
+    try {
+      const chat = statusChatJid && statusChatJid.handle ? statusChatJid : _safeObj(statusChatJid);
+      let remoteChatJIDEnum = null;
+      if (chat) {
+        if (_objcCanCall(chat, "- extendedType")) remoteChatJIDEnum = Number(chat["- extendedType"]()) | 0;
+        else if (_objcCanCall(chat, "- chatJIDEnum")) remoteChatJIDEnum = Number(chat["- chatJIDEnum"]()) | 0;
+        else {
+          const desc = _safeDescValue(chat);
+          const clsName = String(chat.$className || "");
+          if (clsName.indexOf("WABroadcastJID") !== -1 || String(desc || "").indexOf("status@broadcast") !== -1) remoteChatJIDEnum = 3;
+        }
+      }
+      const mid2 = midCls.alloc();
+      if (mid2 && remoteChatJIDEnum !== null && _objcCanCall(mid2, "- initWithRemoteChatJIDEnum:participantJID:fromMe:stanzaID:")) {
+        const o2 = _safeObj(mid2.initWithRemoteChatJIDEnum_participantJID_fromMe_stanzaID_(remoteChatJIDEnum, pu || pj || null, 1, nsSid));
+        if (o2) return o2;
+      }
+    } catch (_) {}
+    return null;
+  } catch (_) {
+    return null;
+  }
+}
+
+/**
+ * 按状态消息 `WAMessageID` 从 chatStorage 恢复目标 `WAMessage`。
+ * 参数:
+ * - core: `_resolveCoreFixed()` 返回的核心上下文。
+ * - statusStanzaId: 目标状态 sid。
+ * - participantJidStr: 状态作者 JID。
+ * 返回:
+ * - `{ ok, msg, via }`；失败返回错误详情。
+ */
+function _fetchStatusMessageByMessageID(core, statusStanzaId, participantJidStr) {
+  try {
+    const sid = String(statusStanzaId || "").trim();
+    const participant = String(participantJidStr || "").trim();
+    if (!sid) return { ok: false, error: "missing statusStanzaId" };
+    if (!core || !core.storage) return { ok: false, error: "chatStorage nil" };
+    const moc = _resolveManagedObjectContext(core);
+    if (!moc) return { ok: false, error: "managedObjectContext failed" };
+    const NSArray = ObjC.classes.NSArray;
+    if (!NSArray || !NSArray["+ arrayWithObject:"]) return { ok: false, error: "NSArray arrayWithObject unavailable" };
+    const storage = core.storage && core.storage.handle ? core.storage : _safeObj(core.storage);
+    if (!storage) return { ok: false, error: "chatStorage invalid" };
+    const emptyArr = (NSArray && NSArray["+ array"]) ? NSArray["+ array"]() : null;
+    const authorCandidates = _buildStatusAuthorJidCandidates(participant);
+    const attempts = [];
+    const pickFirst = (xs) => {
+      try {
+        const xo = xs && xs.handle ? xs : _safeObj(xs);
+        if (!xo) return null;
+        if (_objcCanCall(xo, "- anyObject")) {
+          const v0 = _safeObj(xo["- anyObject"]());
+          if (v0) return v0;
+        }
+        if (_objcCanCall(xo, "- firstObject")) {
+          const v1 = _safeObj(xo["- firstObject"]());
+          if (v1) return v1;
+        }
+        if (_objcCanCall(xo, "- objectAtIndex:")) {
+          const v2 = _safeObj(xo["- objectAtIndex:"](0));
+          if (v2) return v2;
+        }
+      } catch (_) {}
+      return null;
+    };
+    const callAndPick = (label, fn, senderRaw, senderSource) => {
+      try {
+        const out = fn();
+        const msg = pickFirst(out);
+        attempts.push({ via: label, senderJid: String(senderRaw || ""), senderSource: String(senderSource || ""), ok: !!msg });
+        if (msg) return { ok: true, msg: msg, via: label, senderJid: String(senderRaw || ""), senderSource: String(senderSource || "") };
+      } catch (e) {
+        attempts.push({ via: label, senderJid: String(senderRaw || ""), senderSource: String(senderSource || ""), ok: false, error: String(e) });
+      }
+      return null;
+    };
+    const candidates = authorCandidates.length > 0 ? authorCandidates : [{ raw: participant, source: "fallback" }];
+    for (let i = 0; i < candidates.length; i++) {
+      const c = candidates[i] || {};
+      const senderRaw = String(c.raw || "").trim();
+      const targetMid = _makeWAMessageIDForStatus(sid, senderRaw, "status@broadcast");
+      if (!targetMid) {
+        attempts.push({ via: "WAMessageID.build", senderJid: senderRaw, senderSource: String(c.source || ""), ok: false, error: "targetMessageID build failed" });
+        continue;
+      }
+      const mids = NSArray["+ arrayWithObject:"](targetMid);
+      if (!mids) {
+        attempts.push({ via: "NSArray.arrayWithObject", senderJid: senderRaw, senderSource: String(c.source || ""), ok: false, error: "messageID array build failed" });
+        continue;
+      }
+      if (_objcCanCall(storage, "- fetchMessagesWithMessageIDs:inContext:")) {
+        const r0 = callAndPick("WAChatStorage.fetchMessagesWithMessageIDs:inContext:", () => storage["- fetchMessagesWithMessageIDs:inContext:"](mids, moc), senderRaw, c.source);
+        if (r0) return r0;
+      }
+      if (emptyArr && _objcCanCall(storage, "- fetchMessagesWithMessageIDs:prefetchRelationships:inContext:")) {
+        const r1 = callAndPick("WAChatStorage.fetchMessagesWithMessageIDs:prefetchRelationships:inContext:", () => storage["- fetchMessagesWithMessageIDs:prefetchRelationships:inContext:"](mids, emptyArr, moc), senderRaw, c.source);
+        if (r1) return r1;
+      }
+      if (emptyArr && _objcCanCall(storage, "- fetchMessagesWithMessageIDs:prefetchRelationships:inContext:error:")) {
+        const errOut = Memory.alloc(Process.pointerSize);
+        Memory.writePointer(errOut, ptr("0x0"));
+        const r2 = callAndPick("WAChatStorage.fetchMessagesWithMessageIDs:prefetchRelationships:inContext:error:", () => storage["- fetchMessagesWithMessageIDs:prefetchRelationships:inContext:error:"](mids, emptyArr, moc, errOut), senderRaw, c.source);
+        if (r2) return r2;
+      }
+    }
+    return {
+      ok: false,
+      error: "fetchMessagesWithMessageIDs returned no message",
+      attempts: attempts,
+      senderCandidates: candidates.map(x => ({ raw: String(x && x.raw || ""), source: String(x && x.source || "") })),
+    };
+  } catch (e) {
+    return { ok: false, error: String(e) };
+  }
+}
+
+/**
+ * 复用历史成功的 recover 主线恢复目标动态消息。
+ * 参数:
+ * - core: `_resolveCoreFixed()` 返回的核心上下文。
+ * - statusStanzaId: 目标状态 sid。
+ * - participantJidStr: 外层作者 JID。
+ * 返回:
+ * - `{ ok, msg, via }`；仅保留历史稳定的 `messageID -> chatSession fetch` 直取路径。
+ */
+function _fetchStatusMessageByStanzaIdNoUI(core, statusStanzaId, participantJidStr) {
+  try {
+    const sid = String(statusStanzaId || "").trim();
+    const participant = String(participantJidStr || "").trim();
+    if (!sid) return { ok: false, error: "missing statusStanzaId" };
+    const byMid = _fetchStatusMessageByMessageID(core, sid, participant);
+    if (byMid && byMid.ok && byMid.msg) return byMid;
+    if (!core || !core.storage) return { ok: false, error: "chatStorage nil", byMessageID: byMid || null };
+    const statusJidObj = _makeWAChatJIDFromString("status@broadcast");
+    if (!statusJidObj) return { ok: false, error: "status@broadcast jid parse failed", byMessageID: byMid || null };
+    const csStatus = _fetchChatSession(core.storage, statusJidObj);
+    if (!csStatus) return { ok: false, error: "fetchChatSessionForJID status@broadcast failed", byMessageID: byMid || null };
+    const mcsStatus = _getMutableChatSession(csStatus);
+    if (!mcsStatus) return { ok: false, error: "mutableChatSession status@broadcast failed", byMessageID: byMid || null };
+    const moc = _resolveManagedObjectContext(core);
+    const byFetch = _fetchMessageByStanzaId(mcsStatus, sid, participant, moc);
+    if (byFetch && byFetch.msg) return { ok: true, msg: byFetch.msg, via: String(byFetch.via || "") };
+    if (_objcCanCall(mcsStatus, "- fetchMessagesWithStanzaIDs:")) {
+      const nsSid = _ns(sid);
+      const NSArray = ObjC.classes.NSArray;
+      const sidArr = (nsSid && NSArray && NSArray["+ arrayWithObject:"]) ? NSArray["+ arrayWithObject:"](nsSid) : null;
+      if (sidArr) {
+        const res = _safeObj(mcsStatus["- fetchMessagesWithStanzaIDs:"](sidArr));
+        const msgObj = res && _objcCanCall(res, "- firstObject") ? _safeObj(res["- firstObject"]()) : null;
+        if (msgObj) return { ok: true, msg: msgObj, via: "WAMutableChatSession.fetchMessagesWithStanzaIDs:" };
+      }
+    }
+    return { ok: false, error: "status message fetch returned nil", byMessageID: byMid || null };
+  } catch (e) {
+    return { ok: false, error: String(e) };
+  }
 }
 
 function _buildQuotedItemFromMessage(msgObj, quoteType) {
@@ -1492,7 +2859,7 @@ function sendquotetext(jidStr, stanzaIdStr, replyText, participantJidStr, messag
   return { ok: !!(w && w.ok), build: SCRIPT_BUILD_ID, stanzaId: sid, error: err };
 }
 
-function sendimage(jidStr, captionText, imagePath, messageOrigin) {
+function sendimage(jidStr, captionText, imagePath, messageOrigin, quoteStanzaId, participantJidStr) {
   const pend = _pendingNew("image", jidStr, 20000);
   const hk = _installMsgIdHook();
   if (!hk || !hk.ok) return { ok: false, build: SCRIPT_BUILD_ID, stanzaId: "", error: "hook install failed" };
@@ -1515,7 +2882,22 @@ function sendimage(jidStr, captionText, imagePath, messageOrigin) {
   const cap = capText ? _buildRichTextMaybe(capText) : null;
   if (capText && !cap) return { ok: false, build: SCRIPT_BUILD_ID, stanzaId: "", error: "WARichText build failed" };
   if (!_objcCanCall(core.sender, FIXED.sendImageSelector)) return { ok: false, build: SCRIPT_BUILD_ID, stanzaId: "", error: "send image selector missing" };
-  const att = _buildAttachmentsEmpty();
+  const qsid = String(quoteStanzaId || "").trim();
+  let qmsg = null;
+  let qi = null;
+  let att = null;
+  if (qsid) {
+    try {
+      const moc = _runOnMainQueueSync(() => _resolveManagedObjectContext(core), 2500);
+      const fm = _runOnMainQueueSync(() => _fetchMessageByStanzaId(mcs, qsid, participantJidStr, moc), 2500);
+      if (fm && fm.msg) {
+        qmsg = fm.msg;
+        qi = _buildQuotedItemFromMessage(qmsg, 1);
+        if (qi) att = _buildAttachmentsWithQuotedItem(qi);
+      }
+    } catch (_) {}
+  }
+  if (!att) att = _buildAttachmentsEmpty();
   if (!att) return { ok: false, build: SCRIPT_BUILD_ID, stanzaId: "", error: "build attachments failed" };
   const emptyArr = _nsArray0();
   if (!emptyArr) return { ok: false, build: SCRIPT_BUILD_ID, stanzaId: "", error: "empty NSArray build failed" };
@@ -1523,7 +2905,7 @@ function sendimage(jidStr, captionText, imagePath, messageOrigin) {
   if (!completion) return { ok: false, build: SCRIPT_BUILD_ID, stanzaId: "", error: "completion block create failed" };
   let mo = Number.isFinite(Number(messageOrigin)) ? (Number(messageOrigin) | 0) : 1;
   if (!(mo > 0)) mo = 1;
-  pend._keep = [img, sendable, cap, mcs, att, emptyArr];
+  pend._keep = [img, sendable, cap, mcs, att, emptyArr, qmsg, qi];
   pend._block_keep = completion;
   const sch = _scheduleOnMainQueue(() => {
     try {
@@ -1650,7 +3032,7 @@ function sendstatusimage(imagePath, captionText, messageOrigin) {
   return { ok: !!(w && w.ok), build: SCRIPT_BUILD_ID, stanzaId: sid, error: err };
 }
 
-function sendvideo(jidStr, captionText, videoPath, thumbnailPath, messageOrigin) {
+function sendvideo(jidStr, captionText, videoPath, thumbnailPath, messageOrigin, quoteStanzaId, participantJidStr) {
   const pend = _pendingNew("video", jidStr, 30000);
   const hk = _installMsgIdHook();
   if (!hk || !hk.ok) return { ok: false, build: SCRIPT_BUILD_ID, stanzaId: "", error: "hook install failed" };
@@ -1678,7 +3060,22 @@ function sendvideo(jidStr, captionText, videoPath, thumbnailPath, messageOrigin)
   const cap = capText ? _buildRichTextMaybe(capText) : null;
   if (capText && !cap) return { ok: false, build: SCRIPT_BUILD_ID, stanzaId: "", error: "WARichText build failed" };
   if (!_objcCanCall(core.sender, FIXED.sendVideoSelector)) return { ok: false, build: SCRIPT_BUILD_ID, stanzaId: "", error: "send video selector missing" };
-  const att = _buildAttachmentsEmpty();
+  const qsid = String(quoteStanzaId || "").trim();
+  let qmsg = null;
+  let qi = null;
+  let att = null;
+  if (qsid) {
+    try {
+      const moc = _runOnMainQueueSync(() => _resolveManagedObjectContext(core), 2500);
+      const fm = _runOnMainQueueSync(() => _fetchMessageByStanzaId(mcs, qsid, participantJidStr, moc), 2500);
+      if (fm && fm.msg) {
+        qmsg = fm.msg;
+        qi = _buildQuotedItemFromMessage(qmsg, 1);
+        if (qi) att = _buildAttachmentsWithQuotedItem(qi);
+      }
+    } catch (_) {}
+  }
+  if (!att) att = _buildAttachmentsEmpty();
   if (!att) return { ok: false, build: SCRIPT_BUILD_ID, stanzaId: "", error: "build attachments failed" };
   const emptyArr = _nsArray0();
   if (!emptyArr) return { ok: false, build: SCRIPT_BUILD_ID, stanzaId: "", error: "empty NSArray build failed" };
@@ -1686,7 +3083,7 @@ function sendvideo(jidStr, captionText, videoPath, thumbnailPath, messageOrigin)
   if (!completion) return { ok: false, build: SCRIPT_BUILD_ID, stanzaId: "", error: "completion block create failed" };
   let mo = Number.isFinite(Number(messageOrigin)) ? (Number(messageOrigin) | 0) : 1;
   if (!(mo > 0)) mo = 1;
-  pend._keep = [url, thumb, cap, mcs, att, emptyArr];
+  pend._keep = [url, thumb, cap, mcs, att, emptyArr, qmsg, qi];
   pend._block_keep = completion;
   const sch = _scheduleOnMainQueue(() => {
     try {
@@ -2126,7 +3523,8 @@ function csabsetgivennamejid_writecontext(chatJidStr, givenNameStr, saveToOSAddr
       osSaved: null,
       osSaveError: "",
       beforeGivenName: "",
-      afterGivenName: ""
+      afterGivenName: "",
+      afterRead: {}
     };
 
     let result = null;
@@ -2188,6 +3586,98 @@ function csabsetgivennamejid_writecontext(chatJidStr, givenNameStr, saveToOSAddr
             out.saved = okSave;
             if (eobj) out.saveError = String(eobj);
           }
+
+          try {
+            const afterRead = {};
+            const s0 = "- contactName";
+            if (_objcCanCall(c, s0)) {
+              const v = _safeObj(c[s0]());
+              if (v) afterRead.contactName = String(v);
+            }
+            const s1 = "- givenName";
+            if (_objcCanCall(c, s1)) {
+              const v = _safeObj(c[s1]());
+              if (v) afterRead.givenName = String(v);
+            }
+            const s2 = "- familyName";
+            if (_objcCanCall(c, s2)) {
+              const v = _safeObj(c[s2]());
+              if (v) afterRead.familyName = String(v);
+            }
+            const s3 = "- businessName";
+            if (_objcCanCall(c, s3)) {
+              const v = _safeObj(c[s3]());
+              if (v) afterRead.businessName = String(v);
+            }
+            const s4 = "- sectionTitle";
+            if (_objcCanCall(c, s4)) {
+              const v = _safeObj(c[s4]());
+              if (v) afterRead.sectionTitle = String(v);
+            }
+            const s5 = "- cachedFullName";
+            if (_objcCanCall(c, s5)) {
+              const v = _safeObj(c[s5]());
+              if (v) afterRead.cachedFullName = String(v);
+            }
+            const s6 = "- fullName";
+            if (_objcCanCall(c, s6)) {
+              const n = _safeObj(c[s6]());
+              if (n) afterRead.fullNameObjClass = String(n.$className || "");
+            }
+
+            try {
+              const preferred2 = _ns("");
+              let ab1 = null;
+              const isLid2 = targetJidStr.toLowerCase().endsWith("@lid");
+              const sL2 = "- addressBookContactForLID:preferredFullName:";
+              const sJ2 = "- addressBookContactForJID:preferredFullName:";
+              if (isLid2 && _objcCanCall(csq, sL2)) {
+                try { ab1 = _safeObj(csq[sL2](jidObj, preferred2)); } catch (_) { ab1 = null; }
+              }
+              if (!ab1 && _objcCanCall(csq, sJ2)) {
+                try { ab1 = _safeObj(csq[sJ2](jidObj, preferred2)); } catch (_) { ab1 = null; }
+              }
+              const ab2 = ab1 ? (ab1 instanceof ObjC.Object ? ab1 : new ObjC.Object(ab1)) : null;
+              if (ab2) {
+                let uid2 = "";
+                try {
+                  if (_objcCanCall(ab2, "- uniqueID")) uid2 = String(_safeObj(ab2["- uniqueID"]()) || "");
+                  else if (_objcCanCall(ab2, "- persistedUniqueID")) uid2 = String(_safeObj(ab2["- persistedUniqueID"]()) || "");
+                } catch (_) {}
+                if (uid2) {
+                  const fetchSel2 = "- fetchAddressBookContactsForUniqueIDs:inContext:filteringPredicate:";
+                  if (_objcCanCall(contactsStorage, fetchSel2)) {
+                    const NSArray2 = ObjC.classes.NSArray;
+                    if (NSArray2 && _objcCanCall(NSArray2, "+ arrayWithObject:")) {
+                      const uids2 = NSArray2.arrayWithObject_(_ns(uid2));
+                      const dict2 = _safeObj(contactsStorage[fetchSel2](uids2, wc, ptr("0x0")));
+                      if (dict2 && _objcCanCall(dict2, "- objectForKey:")) {
+                        const vv2 = _safeObj(dict2["- objectForKey:"](_ns(uid2)));
+                        const c2 = vv2 ? (vv2 instanceof ObjC.Object ? vv2 : new ObjC.Object(vv2)) : null;
+                        if (c2) {
+                          afterRead.refetchSel = isLid2 ? sL2 : sJ2;
+                          try {
+                            if (_objcCanCall(c2, s1)) {
+                              const v = _safeObj(c2[s1]());
+                              if (v) afterRead.refetchGivenName = String(v);
+                            }
+                          } catch (_) {}
+                          try {
+                            if (_objcCanCall(c2, s5)) {
+                              const v = _safeObj(c2[s5]());
+                              if (v) afterRead.refetchCachedFullName = String(v);
+                            }
+                          } catch (_) {}
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            } catch (_) {}
+
+            out.afterRead = afterRead;
+          } catch (_) {}
           result = { ok: true };
         } finally {
           try { if (pool) pool.release(); } catch (_) {}
@@ -2250,6 +3740,94 @@ function csabsetgivennamejid_writecontext(chatJidStr, givenNameStr, saveToOSAddr
   }
 }
 
+/**
+ * 通过 RPC 暴露“干净动态已读”能力，供 run_hook.py 的 `statusreadclean` 命令直接调用。
+ * 参数:
+ * - statusStanzaId: 目标动态 stanzaId。
+ * - participantJid: 目标动态作者 JID。
+ * - timeoutMs: 主线程执行超时毫秒数。
+ * 返回:
+ * - `{ ok, build, statusStanzaId, participantJid, used, fetchVia, error }`。
+ */
+function rpc_statusreadclean(statusStanzaId, participantJid, timeoutMs) {
+  try {
+    const sid = String(statusStanzaId || "").trim();
+    const pj = String(participantJid || "").trim();
+    const tm = Math.max(500, Number(timeoutMs) || 800);
+    if (!sid || !pj) return { ok: false, build: SCRIPT_BUILD_ID, error: "missing statusStanzaId/participantJid" };
+    const res = _statusActionRead(sid, pj, tm);
+    if (res && res.ok) {
+      return {
+        ok: true,
+        build: SCRIPT_BUILD_ID,
+        statusStanzaId: sid,
+        participantJid: pj,
+        used: String(res.used || ""),
+        fetchVia: String(res.fetchVia || ""),
+      };
+    }
+    return {
+      ok: false,
+      build: SCRIPT_BUILD_ID,
+      statusStanzaId: sid,
+      participantJid: pj,
+      error: res && res.error ? String(res.error) : "failed",
+      used: String(res && res.used ? res.used : ""),
+      fetchVia: String(res && res.fetchVia ? res.fetchVia : ""),
+      fetchDebug: res && res.fetchDebug ? res.fetchDebug : null,
+    };
+  } catch (e) {
+    return { ok: false, build: SCRIPT_BUILD_ID, error: String(e) };
+  }
+}
+
+/**
+ * 通过 RPC 暴露“干净动态文本回复”能力，供 run_hook.py 的 `statuscommentclean` 命令直接调用。
+ * 参数:
+ * - statusStanzaId: 被回复的动态 stanzaId。
+ * - commentText: 回复文本。
+ * - participantJid: 目标动态作者 JID。
+ * - timeoutMs: 主线程执行超时毫秒数。
+ * 返回:
+ * - `{ ok, build, statusStanzaId, participantJid, text, used, fetchVia, targetChatSessionVia, error }`。
+ */
+function rpc_statuscommentclean(statusStanzaId, commentText, participantJid, timeoutMs) {
+  try {
+    const sid = String(statusStanzaId || "").trim();
+    const text = String(commentText || "");
+    const pj = String(participantJid || "").trim();
+    const tm = Math.max(500, Number(timeoutMs) || 12000);
+    if (!sid || !pj) return { ok: false, build: SCRIPT_BUILD_ID, error: "missing statusStanzaId/participantJid" };
+    if (!text) return { ok: false, build: SCRIPT_BUILD_ID, error: "text required" };
+    const res = _statusActionReplyText(sid, text, pj, tm);
+    if (res && res.ok) {
+      return {
+        ok: true,
+        build: SCRIPT_BUILD_ID,
+        statusStanzaId: sid,
+        participantJid: pj,
+        text: text,
+        used: String(res.used || ""),
+        fetchVia: String(res.fetchVia || ""),
+        targetChatSessionVia: String(res.targetChatSessionVia || ""),
+      };
+    }
+    return {
+      ok: false,
+      build: SCRIPT_BUILD_ID,
+      statusStanzaId: sid,
+      participantJid: pj,
+      text: text,
+      error: res && res.error ? String(res.error) : "failed",
+      used: String(res && res.used ? res.used : ""),
+      fetchVia: String(res && res.fetchVia ? res.fetchVia : ""),
+      targetChatSessionVia: String(res && res.targetChatSessionVia ? res.targetChatSessionVia : ""),
+    };
+  } catch (e) {
+    return { ok: false, build: SCRIPT_BUILD_ID, error: String(e) };
+  }
+}
+
 rpc.exports = {
   entries,
   waitready,
@@ -2261,6 +3839,7 @@ rpc.exports = {
   sendstatustext,
   sendstatusimage,
   sendstatusvideo,
+  contactqueryjid: _contactsQueryObservedPartnerNameByJid,
   notifycontactstoredidchange: _contactsNotifyContactStoreDidChange,
   csabsetgivennamejidwc: csabsetgivennamejid_writecontext,
   statusposttext(text, messageOrigin, creationEntryPoint) {
@@ -2283,6 +3862,8 @@ rpc.exports = {
   avatarurl,
   selfnameactive,
   selfcard,
+  statusreadclean: rpc_statusreadclean,
+  statuscommentclean: rpc_statuscommentclean,
   makeread(jid, stanzaId, participantJid, timeoutMs) {
     try {
       const j = String(jid || "").trim();
@@ -4142,6 +5723,10 @@ function _contactsAddEmitResult(opId, chatJid, phoneE164, givenName, res, extraE
     const status = String((res && res.status) ? res.status : (ok ? "ok" : "failed"));
     const err = ok ? "" : String((res && res.error) ? res.error : (extraErr ? extraErr : "failed"));
     const refresh = (res && res.refresh && typeof res.refresh === "object") ? res.refresh : null;
+    const waOk = (res && res.waOk !== undefined) ? !!res.waOk : ok;
+    const osOk = (res && res.osOk !== undefined) ? !!res.osOk : ok;
+    const observedPartnerName = String((res && res.observedPartnerName) ? res.observedPartnerName : "");
+    const observedPartnerNameKind = String((res && res.observedPartnerNameKind) ? res.observedPartnerNameKind : "");
     send({
       type: "wa.tx.contact_add.result",
       build: SCRIPT_BUILD_ID,
@@ -4157,9 +5742,380 @@ function _contactsAddEmitResult(opId, chatJid, phoneE164, givenName, res, extraE
       error: err,
       existed: !!(res && res.existed),
       identifier: String((res && res.identifier) ? res.identifier : ""),
+      waOk: waOk,
+      osOk: osOk,
+      observedPartnerName: observedPartnerName,
+      observedPartnerNameKind: observedPartnerNameKind,
       refresh: refresh
     });
   } catch (_) {}
+}
+
+function looksLikePhonePartnerName(s) {
+  const t = String(s || "").trim();
+  if (!t) return false;
+  let digits = 0;
+  for (let i = 0; i < t.length; i++) {
+    const c = t.charCodeAt(i);
+    if (c >= 48 && c <= 57) {
+      digits++;
+      continue;
+    }
+    if (c === 32 || c === 43 || c === 45 || c === 40 || c === 41) continue;
+    return false;
+  }
+  return digits >= 5;
+}
+
+function _contactsQueryObservedPartnerNameByJid(chatJidStr) {
+  try {
+    if (!ObjC.available) return { ok: false, build: SCRIPT_BUILD_ID, error: "ObjC not available" };
+    const targetJidStr = String(chatJidStr || "").trim();
+    if (!targetJidStr) return { ok: false, build: SCRIPT_BUILD_ID, error: "missing chatJid" };
+    const r = _runOnMainQueueSync(function () {
+      const core = _resolveCoreFixed();
+      if (!core || !core.ok) return { ok: false, build: SCRIPT_BUILD_ID, error: core ? String(core.error || "core failed") : "core failed" };
+      const ctxMain = core.ctxMain;
+      const chatManager = (_objcCanCall(ctxMain, "- chatManager")) ? _safeObj(ctxMain["- chatManager"]()) : null;
+
+      const getIvar = (obj, keys) => {
+        try {
+          const o = obj && obj.handle ? obj : _safeObj(obj);
+          if (!o || !o.$ivars) return null;
+          for (let i = 0; i < keys.length; i++) {
+            const k = keys[i];
+            try {
+              const v = _safeObj(o.$ivars[k]);
+              if (v) return v;
+            } catch (_) {}
+          }
+        } catch (_) {}
+        return null;
+      };
+      const getPropOrIvar = (owner, selNoArg, ivarKeys) => {
+        try {
+          const o = owner && owner.handle ? owner : _safeObj(owner);
+          if (!o) return null;
+          if (selNoArg && _objcCanCall(o, selNoArg)) {
+            const v = _safeObj(o[selNoArg]());
+            if (v) return v;
+          }
+          const iv = getIvar(o, ivarKeys || []);
+          if (iv) return iv;
+        } catch (_) {}
+        return null;
+      };
+
+      const csq = getPropOrIvar(ctxMain, "- contactsStorageQueries", ["_contactsStorageQueries", "contactsStorageQueries"])
+        || getPropOrIvar(chatManager, "- contactsStorageQueries", ["_contactsStorageQueries", "contactsStorageQueries"]);
+      if (!csq) return { ok: false, build: SCRIPT_BUILD_ID, error: "contactsStorageQueries missing" };
+
+      const cs = getPropOrIvar(ctxMain, "- contactsStorage", ["_contactsStorage", "contactsStorage"])
+        || getPropOrIvar(chatManager, "- contactsStorage", ["_contactsStorage", "contactsStorage"])
+        || getIvar(ctxMain, ["_contactsManager", "contactsManager"]);
+      const contactsStorage = (cs && cs.handle && String(cs.$className || "").indexOf("Contacts") !== -1) ? cs : getPropOrIvar(cs, "- contactsStorage", ["_contactsStorage", "contactsStorage"]) || cs;
+      if (!contactsStorage) return { ok: false, build: SCRIPT_BUILD_ID, error: "contactsStorage missing" };
+
+      const wc = getIvar(contactsStorage, ["_writeContext", "writeContext"]) || getPropOrIvar(contactsStorage, "- writeContext", ["_writeContext", "writeContext"]);
+      if (!wc) return { ok: false, build: SCRIPT_BUILD_ID, error: "contactsStorage writeContext missing" };
+
+      const jidObj = (function () {
+        try {
+          const s = String(targetJidStr || "").trim();
+          if (!s) return null;
+          const ns = _ns(s);
+          if (!ns) return null;
+          const WAUserJID = ObjC.classes.WAUserJID;
+          const WAJID = ObjC.classes.WAJID;
+          let o = null;
+          if (WAUserJID) {
+            if (_objcCanCall(WAUserJID, "+ jidOrLIDWithString:")) o = _safeObj(WAUserJID["+ jidOrLIDWithString:"](ns));
+            else if (_objcCanCall(WAUserJID, "+ withString:")) o = _safeObj(WAUserJID["+ withString:"](ns));
+            else if (_objcCanCall(WAUserJID, "+ withJIDString:")) o = _safeObj(WAUserJID["+ withJIDString:"](ns));
+            else if (_objcCanCall(WAUserJID, "+ userJIDWithString:")) o = _safeObj(WAUserJID["+ userJIDWithString:"](ns));
+            else if (_objcCanCall(WAUserJID, "+ jidWithString:")) o = _safeObj(WAUserJID["+ jidWithString:"](ns));
+          }
+          if (!o && WAJID && _objcCanCall(WAJID, "+ withString:")) o = _safeObj(WAJID["+ withString:"](ns));
+          if (!o) o = _makeAuthorUserJIDFromString(s);
+          return o || null;
+        } catch (_) {
+          return null;
+        }
+      })();
+      if (!jidObj) return { ok: false, build: SCRIPT_BUILD_ID, error: "invalid chatJid" };
+
+      const prefer = _ns("");
+      const isLid = String(targetJidStr || "").toLowerCase().endsWith("@lid");
+      const dbg = {
+        csqClass: String(csq.$className || ""),
+        hasContactIndentifierForJID: _objcCanCall(csq, "- contactIndentifierForJID:preferredFullName:"),
+        hasAddressBookContactForJID: _objcCanCall(csq, "- addressBookContactForJID:preferredFullName:"),
+        hasContactIndentifierForLID: _objcCanCall(csq, "- contactIndentifierForLID:preferredFullName:"),
+        hasAddressBookContactForLID: _objcCanCall(csq, "- addressBookContactForLID:preferredFullName:")
+      };
+
+      try {
+        const jidChat = _makeWAChatJIDFromString(targetJidStr);
+        if (!jidChat) {
+          dbg.chatSession = { ok: false, error: "WAChatJID parse failed" };
+        } else {
+          const cs = (core && core.storage) ? _fetchChatSession(core.storage, jidChat) : null;
+          const cs0 = cs && cs.handle ? cs : _safeObj(cs);
+          if (!cs0) {
+            dbg.chatSession = { ok: false, error: "fetchChatSession nil" };
+          } else {
+            const afterRead = {};
+            try { afterRead.chatSessionClass = String(cs0.$className || ""); } catch (_) {}
+            try {
+              const s0 = "- partnerName";
+              if (_objcCanCall(cs0, s0)) {
+                const v = _safeObj(cs0[s0]());
+                if (v) afterRead.partnerName = String(v);
+              }
+            } catch (_) {}
+            try {
+              const s1 = "- displayName";
+              if (_objcCanCall(cs0, s1)) {
+                const v = _safeObj(cs0[s1]());
+                if (v) afterRead.displayName = String(v);
+              }
+            } catch (_) {}
+            try {
+              const s2 = "- pushName";
+              if (_objcCanCall(cs0, s2)) {
+                const v = _safeObj(cs0[s2]());
+                if (v) afterRead.pushName = String(v);
+              }
+            } catch (_) {}
+            const pn = String(afterRead.partnerName || "").trim();
+            const observedPartnerName = pn;
+            const observedPartnerNameKind = observedPartnerName ? (looksLikePhonePartnerName(observedPartnerName) ? "phone_like" : "name_like") : "empty";
+            dbg.chatSession = { ok: true };
+            return { ok: true, build: SCRIPT_BUILD_ID, chatJid: targetJidStr, uniqueID: "", afterRead: afterRead, observedPartnerName: observedPartnerName, observedPartnerNameKind: observedPartnerNameKind, debug: dbg };
+          }
+        }
+      } catch (_) {}
+
+      let uid = (function () {
+        try {
+          const sel = isLid ? "- contactIndentifierForLID:preferredFullName:" : "- contactIndentifierForJID:preferredFullName:";
+          if (!_objcCanCall(csq, sel)) return "";
+          const v = _safeObj(csq[sel](jidObj, prefer));
+          return v ? String(v) : "";
+        } catch (_) {
+          return "";
+        }
+      })();
+      uid = String(uid || "").trim();
+      if (!uid) {
+        try {
+          let ab0 = null;
+          const sJ = isLid ? "- addressBookContactForLID:preferredFullName:" : "- addressBookContactForJID:preferredFullName:";
+          if (_objcCanCall(csq, sJ)) {
+            try { ab0 = _safeObj(csq[sJ](jidObj, prefer)); } catch (_) { ab0 = null; }
+          }
+          const ab = ab0 ? (ab0 instanceof ObjC.Object ? ab0 : new ObjC.Object(ab0)) : null;
+          if (ab) {
+            try {
+              dbg.abClass = String(ab.$className || "");
+            } catch (_) {}
+            let uid2 = "";
+            try {
+              if (_objcCanCall(ab, "- uniqueID")) uid2 = String(_safeObj(ab["- uniqueID"]()) || "");
+              else if (_objcCanCall(ab, "- persistedUniqueID")) uid2 = String(_safeObj(ab["- persistedUniqueID"]()) || "");
+            } catch (_) {}
+            if (!uid2) {
+              try {
+                const s0 = "- contactIdentifier";
+                if (_objcCanCall(ab, s0)) uid2 = String(_safeObj(ab[s0]()) || "");
+              } catch (_) {}
+            }
+            uid = String(uid2 || "").trim();
+          }
+        } catch (_) {}
+      }
+      if (!uid) {
+        try {
+          const picked = (function () {
+            const out = { ok: false, retriever: null, retrSel: "", abPropsFrom: "", abPropsClass: "", debug: {} };
+            const abPropsSel = "- abProperties";
+            const ucSel = "- userContext";
+            const retrSels = [
+              "- username_contact_lid_based_retrieving",
+              "- username_contact_lid_based_retrieving_usync"
+            ];
+            const cands = [
+              { k: "ctxMain.abProperties", owner: ctxMain, viaUserContext: false },
+              { k: "ctxMain.userContext.abProperties", owner: ctxMain, viaUserContext: true },
+              { k: "chatManager.userContext.abProperties", owner: chatManager, viaUserContext: true }
+            ];
+            for (let i = 0; i < cands.length; i++) {
+              const c = cands[i];
+              const o0 = c.owner && c.owner.handle ? c.owner : _safeObj(c.owner);
+              const ownerClass = o0 ? String(o0.$className || "") : "";
+              out.debug[c.k] = { ownerClassName: ownerClass, hasUserContext: false, userContextClass: "", hasAbProperties: false, abPropsClass: "", retrSels: {} };
+              if (!o0) continue;
+              let owner2 = o0;
+              if (c.viaUserContext) {
+                out.debug[c.k].hasUserContext = _objcCanCall(owner2, ucSel);
+                if (!out.debug[c.k].hasUserContext) continue;
+                const uc = _safeObj(owner2[ucSel]());
+                out.debug[c.k].userContextClass = uc ? String(uc.$className || "") : "";
+                if (!uc) continue;
+                owner2 = uc;
+              }
+              out.debug[c.k].hasAbProperties = _objcCanCall(owner2, abPropsSel);
+              if (!out.debug[c.k].hasAbProperties) continue;
+              const ab = _safeObj(owner2[abPropsSel]());
+              out.debug[c.k].abPropsClass = ab ? String(ab.$className || "") : "";
+              if (!ab) continue;
+              for (let si = 0; si < retrSels.length; si++) {
+                const rs = retrSels[si];
+                const hasSel = _objcCanCall(ab, rs);
+                out.debug[c.k].retrSels[rs] = { hasSel: hasSel, retrieverNil: true };
+                if (!hasSel) continue;
+                const r0 = _safeObj(ab[rs]());
+                out.debug[c.k].retrSels[rs].retrieverNil = !r0;
+                if (!r0) continue;
+                out.ok = true;
+                out.retriever = r0;
+                out.retrSel = rs;
+                out.abPropsFrom = c.k;
+                out.abPropsClass = out.debug[c.k].abPropsClass;
+                return out;
+              }
+            }
+            return out;
+          })();
+
+          const retriever = picked && picked.ok ? picked.retriever : null;
+          const retrSel = picked && picked.ok ? String(picked.retrSel || "") : "";
+          const retrFetchSel = isLid ? "- contactForLID:includeUnknownContacts:" : "- contactForJID:includeUnknownContacts:";
+          const jidObj2 = _makeAuthorUserJIDFromString(targetJidStr);
+          if (retriever && jidObj2 && _objcCanCall(retriever, retrFetchSel)) {
+            const c3 = _safeObj(retriever[retrFetchSel](jidObj2, 1));
+            if (c3) {
+              const afterRead = {};
+              try {
+                const s0 = "- contactName";
+                if (_objcCanCall(c3, s0)) {
+                  const v = _safeObj(c3[s0]());
+                  if (v) afterRead.contactName = String(v);
+                }
+              } catch (_) {}
+              try {
+                const s5 = "- cachedFullName";
+                if (_objcCanCall(c3, s5)) {
+                  const v = _safeObj(c3[s5]());
+                  if (v) afterRead.cachedFullName = String(v);
+                }
+              } catch (_) {}
+              try {
+                const s3 = "- businessName";
+                if (_objcCanCall(c3, s3)) {
+                  const v = _safeObj(c3[s3]());
+                  if (v) afterRead.businessName = String(v);
+                }
+              } catch (_) {}
+              const observedPartnerName = String(afterRead.cachedFullName || afterRead.contactName || afterRead.businessName || "").trim();
+              const observedPartnerNameKind = observedPartnerName ? (looksLikePhonePartnerName(observedPartnerName) ? "phone_like" : "name_like") : "empty";
+              dbg.fallback = { used: true, retrSel: retrSel, retrFetchSel: retrFetchSel, abPropsFrom: String(picked.abPropsFrom || ""), abPropsClass: String(picked.abPropsClass || ""), pickDebug: picked.debug };
+              return { ok: true, build: SCRIPT_BUILD_ID, chatJid: targetJidStr, uniqueID: "", afterRead: afterRead, observedPartnerName: observedPartnerName, observedPartnerNameKind: observedPartnerNameKind, debug: dbg };
+            }
+          }
+          try {
+            dbg.fallback = { used: false, reason: "no uid and retriever nil", pickDebug: picked && picked.debug ? picked.debug : {} };
+          } catch (_) {
+            dbg.fallback = { used: false, reason: "no uid and retriever nil", pickDebug: {} };
+          }
+        } catch (_) {}
+        try {
+          const jidChat = _makeWAChatJIDFromString(targetJidStr);
+          if (!jidChat) {
+            dbg.chatSession = { ok: false, error: "WAChatJID parse failed" };
+          } else {
+            const cs = (core && core.storage) ? _fetchChatSession(core.storage, jidChat) : null;
+            const cs0 = cs && cs.handle ? cs : _safeObj(cs);
+            if (!cs0) {
+              dbg.chatSession = { ok: false, error: "fetchChatSession nil" };
+            } else {
+              const afterRead = {};
+              try { afterRead.chatSessionClass = String(cs0.$className || ""); } catch (_) {}
+              try {
+                const s0 = "- partnerName";
+                if (_objcCanCall(cs0, s0)) {
+                  const v = _safeObj(cs0[s0]());
+                  if (v) afterRead.partnerName = String(v);
+                }
+              } catch (_) {}
+              try {
+                const s1 = "- displayName";
+                if (_objcCanCall(cs0, s1)) {
+                  const v = _safeObj(cs0[s1]());
+                  if (v) afterRead.displayName = String(v);
+                }
+              } catch (_) {}
+              try {
+                const s2 = "- pushName";
+                if (_objcCanCall(cs0, s2)) {
+                  const v = _safeObj(cs0[s2]());
+                  if (v) afterRead.pushName = String(v);
+                }
+              } catch (_) {}
+              const pn = String(afterRead.partnerName || "").trim();
+              const observedPartnerName = pn;
+              const observedPartnerNameKind = observedPartnerName ? (looksLikePhonePartnerName(observedPartnerName) ? "phone_like" : "name_like") : "empty";
+              dbg.chatSession = { ok: true };
+              return { ok: true, build: SCRIPT_BUILD_ID, chatJid: targetJidStr, uniqueID: "", afterRead: afterRead, observedPartnerName: observedPartnerName, observedPartnerNameKind: observedPartnerNameKind, debug: dbg };
+            }
+          }
+        } catch (_) {}
+        return { ok: false, build: SCRIPT_BUILD_ID, error: "uniqueID empty", debug: dbg };
+      }
+
+      const fetchSel = "- fetchAddressBookContactsForUniqueIDs:inContext:filteringPredicate:";
+      if (!_objcCanCall(contactsStorage, fetchSel)) return { ok: false, build: SCRIPT_BUILD_ID, error: "contactsStorage missing fetchAddressBookContactsForUniqueIDs", debug: dbg };
+      const NSArray = ObjC.classes.NSArray;
+      if (!NSArray || !_objcCanCall(NSArray, "+ arrayWithObject:")) return { ok: false, build: SCRIPT_BUILD_ID, error: "NSArray missing arrayWithObject", debug: dbg };
+      const uids = NSArray.arrayWithObject_(_ns(uid));
+      const dict0 = _safeObj(contactsStorage[fetchSel](uids, wc, ptr("0x0")));
+      if (!dict0) return { ok: false, build: SCRIPT_BUILD_ID, error: "fetch returned nil dict", debug: dbg };
+      if (!_objcCanCall(dict0, "- objectForKey:")) return { ok: false, build: SCRIPT_BUILD_ID, error: "dict missing objectForKey", debug: dbg };
+      const vv = _safeObj(dict0["- objectForKey:"](_ns(uid)));
+      const c = vv ? (vv instanceof ObjC.Object ? vv : new ObjC.Object(vv)) : null;
+      if (!c) return { ok: false, build: SCRIPT_BUILD_ID, error: "dict missing value for uniqueID", debug: dbg };
+
+      const afterRead = {};
+      try {
+        const s0 = "- contactName";
+        if (_objcCanCall(c, s0)) {
+          const v = _safeObj(c[s0]());
+          if (v) afterRead.contactName = String(v);
+        }
+      } catch (_) {}
+      try {
+        const s5 = "- cachedFullName";
+        if (_objcCanCall(c, s5)) {
+          const v = _safeObj(c[s5]());
+          if (v) afterRead.cachedFullName = String(v);
+        }
+      } catch (_) {}
+      try {
+        const s6 = "- fullName";
+        if (_objcCanCall(c, s6)) {
+          const n = _safeObj(c[s6]());
+          if (n) afterRead.fullNameObjClass = String(n.$className || "");
+        }
+      } catch (_) {}
+
+      const observedPartnerName = String(afterRead.cachedFullName || afterRead.contactName || "").trim();
+      const observedPartnerNameKind = observedPartnerName ? (looksLikePhonePartnerName(observedPartnerName) ? "phone_like" : "name_like") : "empty";
+      return { ok: true, build: SCRIPT_BUILD_ID, chatJid: targetJidStr, uniqueID: uid, afterRead: afterRead, observedPartnerName: observedPartnerName, observedPartnerNameKind: observedPartnerNameKind, debug: dbg };
+    }, 5000);
+    return r && r.ok !== undefined ? r : { ok: false, build: SCRIPT_BUILD_ID, error: (r && r.error) ? r.error : "failed" };
+  } catch (e) {
+    return { ok: false, build: SCRIPT_BUILD_ID, error: String(e) };
+  }
 }
 
 function _contactsNotifyContactStoreDidChange() {
@@ -4213,8 +6169,82 @@ function _contactsAddHandleMsg(message) {
       const digits = _normalizePhoneE164Like(phoneE164).replace(/[^\d]/g, "");
       const phoneJid = digits ? (digits + "@s.whatsapp.net") : "";
       const rr = _contactsNotifyContactStoreDidChange();
-      const wr = phoneJid ? csabsetgivennamejid_writecontext(phoneJid, givenName || "联系人", 1) : { ok: false, build: SCRIPT_BUILD_ID, error: "phoneJid empty", chatJid: "" };
-      res.refresh = { notifyContactStoreDidChange: rr, writeContext: wr, phoneJid: phoneJid };
+      const _sleepMs = (ms) => {
+        try {
+          const s = Math.max(0, Number(ms) || 0) / 1000.0;
+          const NSThread = ObjC.classes.NSThread;
+          if (NSThread && _objcCanCall(NSThread, "+ sleepForTimeInterval:")) {
+            NSThread["+ sleepForTimeInterval:"](s);
+            return true;
+          }
+        } catch (_) {}
+        return false;
+      };
+      const _isNameLike = (q) => {
+        try {
+          return !!(q && q.ok && String(q.observedPartnerNameKind || "").toLowerCase() === "name_like");
+        } catch (_) {
+          return false;
+        }
+      };
+      const attempts = [];
+      const tryOnce = (jidStr) => {
+        const j = String(jidStr || "").trim();
+        if (!j) return null;
+        const q = _contactsQueryObservedPartnerNameByJid(j);
+        try {
+          attempts.push({ jid: j, ok: !!(q && q.ok), kind: String((q && q.observedPartnerNameKind) ? q.observedPartnerNameKind : ""), observedPartnerName: String((q && q.observedPartnerName) ? q.observedPartnerName : ""), error: String((q && q.error) ? q.error : "") });
+        } catch (_) {}
+        return q;
+      };
+      const delaysMs = [0, 250, 800, 1600, 3000, 6000];
+      const startedAtMs = Date.now();
+      let queryJid = "";
+      let qr = null;
+      let qrAlt = null;
+      for (let i = 0; i < delaysMs.length; i++) {
+        const targetMs = delaysMs[i];
+        const elapsedMs = Math.max(0, (Date.now() - startedAtMs) | 0);
+        const waitMs = (targetMs | 0) - elapsedMs;
+        if (waitMs > 0) _sleepMs(waitMs);
+        let q1 = null;
+        if (chatJid) q1 = tryOnce(chatJid);
+        if (_isNameLike(q1)) {
+          queryJid = chatJid;
+          qr = q1;
+          break;
+        }
+        let q2 = null;
+        if (phoneJid && phoneJid !== chatJid) q2 = tryOnce(phoneJid);
+        qrAlt = q2 || qrAlt;
+        if (_isNameLike(q2)) {
+          queryJid = phoneJid;
+          qr = q2;
+          break;
+        }
+        if (!qr) {
+          queryJid = chatJid || phoneJid;
+          qr = q1 || q2 || qr;
+        }
+      }
+      if (!qr) {
+        queryJid = chatJid || phoneJid;
+        qr = queryJid ? { ok: false, build: SCRIPT_BUILD_ID, error: "query failed", chatJid: String(queryJid || "") } : { ok: false, build: SCRIPT_BUILD_ID, error: "queryJid empty", chatJid: "" };
+      }
+      res.refresh = { notifyContactStoreDidChange: rr, query: qr, queryAlt: qrAlt, phoneJid: phoneJid, queryJid: queryJid, attempts: attempts };
+      try {
+        const okOs = !!(res && res.ok);
+        const okWa = !!(qr && qr.ok && String(qr.observedPartnerNameKind || "").toLowerCase() === "name_like");
+        res.osOk = okOs;
+        res.waOk = okWa;
+        let pn = "";
+        try {
+          pn = String((qr && qr.observedPartnerName) ? qr.observedPartnerName : "");
+        } catch (_) { pn = ""; }
+        pn = String(pn || "").trim();
+        res.observedPartnerName = pn;
+        res.observedPartnerNameKind = pn ? (looksLikePhonePartnerName(pn) ? "phone_like" : "name_like") : "empty";
+      } catch (_) {}
     }
   } catch (_) {}
   _contactsAddEmitResult(opId, chatJid, phoneE164, givenName, res, null);
@@ -4235,8 +6265,9 @@ function _txHandleMsg(message) {
   const kind = String(p.kind || "");
   const jid = String(p.jid || p.chatJid || "");
   const text = String(p.text || "");
-  const quoteStanzaId = String(p.quoteStanzaId || p.quote_stanza_id || "");
-  const participantJid = String(p.participantJid || p.participant_jid || "");
+  const rt = (p && p.replyTo && typeof p.replyTo === "object") ? p.replyTo : null;
+  const quoteStanzaId = String(p.quoteStanzaId || p.quote_stanza_id || (rt ? (rt.quotedStanzaId || rt.quoted_stanza_id || "") : "") || "");
+  const participantJid = String(p.participantJid || p.participant_jid || (rt ? (rt.participantJid || rt.participant_jid || "") : "") || "");
   const mediaRef = (p && p.mediaRef && typeof p.mediaRef === "object") ? p.mediaRef : null;
   let messageOrigin = Number.isFinite(p.messageOrigin) ? Number(p.messageOrigin) : 1;
   let creationEntryPoint = Number.isFinite(p.creationEntryPoint) ? Number(p.creationEntryPoint) : 1;
@@ -4256,13 +6287,13 @@ function _txHandleMsg(message) {
     } else if (kind === "quote") {
       res = sendquotetext(jid, quoteStanzaId, text, participantJid, messageOrigin, creationEntryPoint);
     } else if (kind === "image") {
-      res = sendimage(jid, String(p.caption || ""), String(p.path || p.imagePath || ""), messageOrigin);
+      res = sendimage(jid, String(p.caption || ""), String(p.path || p.imagePath || ""), messageOrigin, quoteStanzaId, participantJid);
     } else if (kind === "status_image") {
       res = sendstatusimage(String(p.path || p.imagePath || ""), String(p.caption || ""), messageOrigin);
     } else if (kind === "status_video") {
       res = sendstatusvideo(String(p.path || p.videoPath || ""), String(p.caption || ""), String(p.thumbnailPath || ""), messageOrigin);
     } else if (kind === "video") {
-      res = sendvideo(jid, String(p.caption || ""), String(p.path || p.videoPath || ""), String(p.thumbnailPath || ""), messageOrigin);
+      res = sendvideo(jid, String(p.caption || ""), String(p.path || p.videoPath || ""), String(p.thumbnailPath || ""), messageOrigin, quoteStanzaId, participantJid);
     } else if (kind === "audio") {
       res = sendaudio(jid, String(p.path || p.audioPath || ""), Number(p.durationSec || 0), messageOrigin);
     } else if (kind === "product_asset") {
@@ -4273,11 +6304,11 @@ function _txHandleMsg(message) {
       const isVideo = (ext === ".mp4" || ext === ".mov" || ext === ".m4v");
       const isAudio = (ext === ".ogg" || ext === ".opus" || ext === ".m4a" || ext === ".aac" || ext === ".mp3" || ext === ".wav" || ext === ".amr");
       if (isVideo) {
-        res = sendvideo(jid, String(p.caption || ""), pth, String(p.thumbnailPath || ""), messageOrigin);
+        res = sendvideo(jid, String(p.caption || ""), pth, String(p.thumbnailPath || ""), messageOrigin, quoteStanzaId, participantJid);
       } else if (isAudio) {
         res = sendaudio(jid, pth, Number(p.durationSec || 0), messageOrigin);
       } else {
-        res = sendimage(jid, String(p.caption || ""), pth, messageOrigin);
+        res = sendimage(jid, String(p.caption || ""), pth, messageOrigin, quoteStanzaId, participantJid);
       }
     } else {
       res = { ok: false, stanzaId: "", error: "unknown kind" };
@@ -4425,9 +6456,540 @@ function _msgLoop() {
 
 try { setImmediate(_msgLoop); } catch (_) {}
 
-const RX_STATE = { installed: false, error: null, installedAt: null, waVersion: null, mode: "", objcHooks: null };
-const RX_SAMPLE = { enabled: false, msg_kind: "unknown", quoted_kind: "none", quoted_stanza_id: "" };
+const STATUS_ACTION_DIAG = {
+  recvHits: 0,
+  waitReadyHits: 0,
+  resultEmitHits: 0,
+  resultEmitOk: 0,
+  resultEmitFail: 0,
+  loopErrors: 0,
+  lastAt: 0,
+  lastStage: "",
+  lastOpId: "",
+  lastTaskId: "",
+  lastInstanceId: "",
+  lastAction: "",
+  lastChatJid: "",
+  lastStatusStanzaId: "",
+  lastParticipantJid: "",
+  lastOk: null,
+  lastError: "",
+  lastUsed: "",
+};
 
+/**
+ * 更新状态动作诊断摘要，供 `qqw.pong` 与联调日志快速判读。
+ * 参数:
+ * - meta: 当前状态动作元数据。
+ * - stage: 当前诊断阶段，如 `recv/result_emit/loop_exception`。
+ * - okValue: 最近一次结果是否成功，未知时传 `null/undefined`。
+ * - errText: 最近一次错误文本。
+ * - usedText: 最近一次成功使用的 selector/路径摘要。
+ * 返回:
+ * - 无返回值。
+ */
+function _statusDiagTouch(meta, stage, okValue, errText, usedText) {
+  try {
+    const m = meta || {};
+    STATUS_ACTION_DIAG.lastAt = Date.now();
+    STATUS_ACTION_DIAG.lastStage = String(stage || "");
+    STATUS_ACTION_DIAG.lastOpId = String(m.opId || m.op_id || "");
+    STATUS_ACTION_DIAG.lastTaskId = String(m.taskId || "");
+    STATUS_ACTION_DIAG.lastInstanceId = String(m.instanceId || "");
+    STATUS_ACTION_DIAG.lastAction = String(m.action || "");
+    STATUS_ACTION_DIAG.lastChatJid = String(m.chatJid || "status@broadcast");
+    STATUS_ACTION_DIAG.lastStatusStanzaId = String(m.statusStanzaId || m.stanzaId || "");
+    STATUS_ACTION_DIAG.lastParticipantJid = String(m.participantJid || m.statusAuthorJid || "");
+    STATUS_ACTION_DIAG.lastOk = (okValue === null || okValue === undefined) ? null : !!okValue;
+    STATUS_ACTION_DIAG.lastError = errText ? String(errText) : "";
+    STATUS_ACTION_DIAG.lastUsed = usedText ? String(usedText) : "";
+  } catch (_) {}
+}
+
+/**
+ * 发出一条极小的状态动作诊断事件，便于确认消息是否真正进入 `_statusHandle()`。
+ * 参数:
+ * - stage: 当前诊断阶段。
+ * - meta: 当前状态动作元数据。
+ * - okValue: 最近一次结果是否成功，未知时传 `null/undefined`。
+ * - errText: 最近一次错误文本。
+ * - usedText: 最近一次成功使用的路径摘要。
+ * 返回:
+ * - 无返回值；失败时静默吞掉异常。
+ */
+function _statusDiagEmit(stage, meta, okValue, errText, usedText) {
+  try {
+    const m = meta || {};
+    send({
+      type: "qqw.status_action.diag",
+      build: SCRIPT_BUILD_ID,
+      ts: Date.now(),
+      stage: String(stage || ""),
+      opId: String(m.opId || m.op_id || ""),
+      taskId: String(m.taskId || ""),
+      instanceId: String(m.instanceId || ""),
+      action: String(m.action || ""),
+      chatJid: String(m.chatJid || "status@broadcast"),
+      statusStanzaId: String(m.statusStanzaId || m.stanzaId || ""),
+      participantJid: String(m.participantJid || m.statusAuthorJid || ""),
+      ok: (okValue === null || okValue === undefined) ? null : !!okValue,
+      error: errText ? String(errText) : "",
+      used: usedText ? String(usedText) : "",
+    });
+  } catch (_) {}
+}
+
+/**
+ * 发出状态动作执行结果。
+ * 参数:
+ * - meta: 透传的动作元数据，至少包含 `opId/action/statusStanzaId/participantJid`。
+ * - res: 动作执行结果对象，约定包含 `ok/error/used`。
+ * - extraErr: 额外错误文本。
+ * 返回:
+ * - 无返回值；失败时静默吞掉异常。
+ */
+function _statusEmitResult(meta, res, extraErr) {
+  try {
+    const m = meta || {};
+    const ok = !!(res && res.ok);
+    const err = ok ? "" : String((res && res.error) ? res.error : (extraErr ? extraErr : "failed"));
+    const opId = String(m.opId || m.op_id || "");
+    const action = String(m.action || "");
+    const statusStanzaId = String(m.statusStanzaId || m.stanzaId || "");
+    const participantJid = String(m.participantJid || m.statusAuthorJid || "");
+    STATUS_ACTION_DIAG.resultEmitHits = (Number(STATUS_ACTION_DIAG.resultEmitHits) || 0) + 1;
+    if (ok) {
+      STATUS_ACTION_DIAG.resultEmitOk = (Number(STATUS_ACTION_DIAG.resultEmitOk) || 0) + 1;
+    } else {
+      STATUS_ACTION_DIAG.resultEmitFail = (Number(STATUS_ACTION_DIAG.resultEmitFail) || 0) + 1;
+    }
+    _statusDiagTouch(m, "result_emit", ok, err, ok && res && res.used ? String(res.used) : "");
+    _statusDiagEmit("result_emit", m, ok, err, ok && res && res.used ? String(res.used) : "");
+    send({
+      type: "wa.tx.status_action.result",
+      build: SCRIPT_BUILD_ID,
+      ts: Date.now(),
+      op_id: opId,
+      opId: opId,
+      taskId: String(m.taskId || ""),
+      instanceId: String(m.instanceId || ""),
+      action: action,
+      chatJid: String(m.chatJid || "status@broadcast"),
+      statusStanzaId: statusStanzaId,
+      stanzaId: statusStanzaId,
+      participantJid: participantJid,
+      statusAuthorJid: participantJid,
+      ok: ok,
+      error: err,
+      used: ok && res && res.used ? String(res.used) : "",
+      fetchVia: ok && res && res.fetchVia ? String(res.fetchVia) : "",
+      targetChatSessionVia: ok && res && res.targetChatSessionVia ? String(res.targetChatSessionVia) : "",
+      fetchDebug: res && res.fetchDebug ? res.fetchDebug : null
+    });
+  } catch (_) {}
+}
+
+/**
+ * 用已验证成功的 `recover -> bridge -> canonical author` 主线恢复目标状态消息。
+ * 参数:
+ * - core: `_resolveCoreFixed()` 返回的核心上下文。
+ * - statusStanzaId: 目标动态 stanzaId。
+ * - participantJidStr: 目标动态作者 JID。
+ * 返回:
+ * - `{ ok, msg, via, normalizedAuthorJid, statusBridge, error }`。
+ */
+function _fetchStatusMessageByStanzaIdStrict(core, statusStanzaId, participantJidStr, progressRef) {
+  try {
+    const sid = String(statusStanzaId || "").trim();
+    const participant = String(participantJidStr || "").trim();
+    if (!sid || !participant) return { ok: false, error: "missing statusStanzaId/participantJid" };
+    const setFetchStage = (stage) => {
+      try {
+        if (progressRef && typeof progressRef === "object") progressRef.stage = String(stage || "").trim() || progressRef.stage;
+      } catch (_) {}
+    };
+    setFetchStage("directFetch");
+    const directFetch = _fetchStatusMessageByStanzaIdNoUI(core, sid, participant);
+    let msgObj = directFetch && directFetch.ok && directFetch.msg
+      ? (directFetch.msg && directFetch.msg.handle ? directFetch.msg : _safeObj(directFetch.msg))
+      : null;
+    let modelFetch = { ok: false, skipped: !!msgObj, error: "", provider: null, statusModel: null, bridge: "" };
+    if (!msgObj) {
+      setFetchStage("modelFetch");
+      const r = _fetchStatusMessageViaStatusModel(core, sid, participant);
+      modelFetch = {
+        ok: !!(r && r.ok && r.msg),
+        skipped: false,
+        error: String((r && !r.ok) ? (r.error || "") : ""),
+        provider: r && r.provider ? r.provider : null,
+        statusModel: r && r.statusModel ? r.statusModel : null,
+        bridge: r && r.via ? String(r.via) : "",
+      };
+      if (r && r.ok && r.msg) {
+        msgObj = r.msg && r.msg.handle ? r.msg : _safeObj(r.msg);
+      }
+    }
+    if (!msgObj) {
+      return {
+        ok: false,
+        error: modelFetch && !modelFetch.skipped
+          ? String(modelFetch.error || "status message unavailable")
+          : String((directFetch && directFetch.error) || "status message unavailable"),
+        fetchStage: String(progressRef && progressRef.stage ? progressRef.stage : (modelFetch && !modelFetch.skipped ? "modelFetch" : "directFetch")),
+        participantJid: participant,
+        directFetch: directFetch || null,
+        modelFetch: modelFetch || null,
+      };
+    }
+    setFetchStage("bridge");
+    const bridge = _bridgeStatusMessageItemFromMessage(msgObj);
+    const normalizedAuthor = _resolveCanonicalStatusAuthorFromBridge(bridge, msgObj, participant);
+    const viaParts = [];
+    if (directFetch && directFetch.ok && directFetch.via) {
+      viaParts.push(String(directFetch.via || ""));
+    } else if (modelFetch && modelFetch.ok && modelFetch.bridge) {
+      viaParts.push(String(modelFetch.bridge || ""));
+    }
+    if (bridge && bridge.ok) viaParts.push("WAStatusMessageItem.bridge");
+    return {
+      ok: true,
+      msg: msgObj,
+      via: viaParts.join(" -> "),
+      fetchStage: "bridge",
+      participantJid: participant,
+      statusChatJid: "status@broadcast",
+      statusBridge: bridge || null,
+      normalizedAuthorJid: normalizedAuthor || participant,
+      directFetch: directFetch || null,
+      modelFetch: modelFetch || null,
+    };
+  } catch (e) {
+    return { ok: false, error: String(e) };
+  }
+}
+
+/**
+ * 从主上下文单一路径恢复 `WAChatManager`。
+ * 参数:
+ * - core: `_resolveCoreFixed()` 返回的核心上下文。
+ * 返回:
+ * - `{ ok, mgr, source, error }`。
+ */
+function _resolveChatManagerStrict(core) {
+  try {
+    if (!core || !core.ok || !core.ctxMain) return { ok: false, error: "no core/ctx" };
+    const ctx = core.ctxMain && core.ctxMain.handle ? core.ctxMain : _safeObj(core.ctxMain);
+    if (!ctx) return { ok: false, error: "ctxMain invalid" };
+    const sel = "- chatManager";
+    if (!_objcCanCall(ctx, sel)) return { ok: false, error: "ctxMain.chatManager selector missing" };
+    const mgrObj = _safeObj(ctx[sel]());
+    if (!mgrObj) return { ok: false, error: "ctxMain.chatManager returned nil" };
+    return { ok: true, mgr: mgrObj, source: "ctxMain.chatManager" };
+  } catch (e) {
+    return { ok: false, error: String(e) };
+  }
+}
+
+/**
+ * 按目标作者 JID 恢复私聊 chatSession，供动态回复使用。
+ * 参数:
+ * - core: `_resolveCoreFixed()` 返回的核心上下文。
+ * - targetJidStr: 目标作者 JID。
+ * 返回:
+ * - `{ ok, chatSession, mutableChatSession, via, error }`。
+ */
+function _fetchReplyTargetChatSessionStrict(core, targetJidStr) {
+  try {
+    const jidStr = String(targetJidStr || "").trim();
+    if (!jidStr) return { ok: false, error: "missing targetJid" };
+    if (!core || !core.storage) return { ok: false, error: "chatStorage nil" };
+    const targetJidObj = _makeWAChatJIDFromString(jidStr);
+    if (!targetJidObj) return { ok: false, error: "target jid parse failed" };
+    const cs = _fetchChatSession(core.storage, targetJidObj);
+    if (!cs) return { ok: false, error: "fetchChatSessionForJID target failed" };
+    const csObj = _safeObj(cs);
+    const mcsObj = _getMutableChatSession(csObj);
+    if (!csObj || !mcsObj) return { ok: false, error: "mutableChatSession target failed" };
+    return {
+      ok: true,
+      chatSession: csObj,
+      mutableChatSession: mcsObj,
+      via: "WAChatStorage.fetchChatSessionForJID:"
+    };
+  } catch (e) {
+    return { ok: false, error: String(e) };
+  }
+}
+
+/**
+ * 发送带 quoted item 的文本消息。
+ * 参数:
+ * - senderObj: `WAMessageSender`。
+ * - chatSessionObj: 目标私聊 chatSession。
+ * - nsTextObj: `NSString` 文本对象。
+ * - attObj: 已挂好 quoted item 的 attachments。
+ * - originInt: message origin。
+ * 返回:
+ * - `{ ok, used, error }`。
+ */
+function _sendTextWithAttachmentsStrict(senderObj, chatSessionObj, nsTextObj, attObj, originInt) {
+  try {
+    const sender = senderObj && senderObj.handle ? senderObj : _safeObj(senderObj);
+    const cs = chatSessionObj && chatSessionObj.handle ? chatSessionObj : _safeObj(chatSessionObj);
+    const nsText = nsTextObj && nsTextObj.handle ? nsTextObj : _safeObj(nsTextObj);
+    const att = attObj && attObj.handle ? attObj : _safeObj(attObj);
+    const mo = Number.isFinite(Number(originInt)) ? (Number(originInt) | 0) : 1;
+    if (!sender || !cs || !nsText || !att) return { ok: false, error: "sender/chatSession/text/attachments missing" };
+    const sel = "- sendMessageWithText:attachments:messageOrigin:inChatSession:";
+    if (!_objcCanCall(sender, sel)) return { ok: false, error: "sendMessageWithText:attachments:messageOrigin:inChatSession: missing" };
+    sender[sel](nsText, att, mo, cs);
+    return { ok: true, used: "sendMessageWithText:attachments:messageOrigin:inChatSession:" };
+  } catch (e) {
+    return { ok: false, error: String(e) };
+  }
+}
+
+/**
+ * 执行动态已读动作。
+ * 参数:
+ * - statusStanzaId: 目标动态 stanzaId。
+ * - participantJidStr: 目标动态作者 JID。
+ * - timeoutMs: 主线程执行超时毫秒数。
+ * 返回:
+ * - `{ ok, used, fetchVia, error }`。
+ */
+function _statusActionRead(statusStanzaId, participantJidStr, timeoutMs) {
+  const sid = String(statusStanzaId || "").trim();
+  const participant = String(participantJidStr || "").trim();
+  if (!sid || !participant) return { ok: false, error: "missing statusStanzaId/participantJid" };
+  const waitMs = timeoutMs > 0 ? timeoutMs : 8000;
+  const progress = {
+    stage: "scheduled",
+    statusStanzaId: sid,
+    participantJid: participant,
+    timeoutMs: waitMs,
+  };
+  const res = _runOnMainQueueSync(() => {
+    let pool = null;
+    try {
+      progress.stage = "autorelease_pool";
+      try {
+        const NSAutoreleasePool = ObjC.classes.NSAutoreleasePool;
+        pool = NSAutoreleasePool && NSAutoreleasePool.alloc ? NSAutoreleasePool.alloc().init() : null;
+      } catch (_) { pool = null; }
+      progress.stage = "core";
+      const core = _resolveCoreForStatusRead();
+      if (!core || !core.ok) {
+        return {
+          ok: false,
+          error: core ? core.error : "core failed",
+          fetchDebug: { stage: progress.stage, core: core || null },
+        };
+      }
+      progress.stage = "fetch";
+      const fetchRes = _fetchStatusMessageByStanzaIdStrict(core, sid, participant, progress);
+      if (!fetchRes || !fetchRes.ok || !fetchRes.msg) {
+        return {
+          ok: false,
+          error: fetchRes ? fetchRes.error : "status message unavailable",
+          fetchDebug: Object.assign({ stage: progress.stage, coreSource: String(core && core.source ? core.source : "") }, fetchRes || null),
+        };
+      }
+      progress.stage = "chat_manager";
+      const mgrRes = _resolveChatManagerStrict(core);
+      if (!mgrRes || !mgrRes.ok || !mgrRes.mgr) {
+        return {
+          ok: false,
+          error: mgrRes ? mgrRes.error : "chatManager unavailable",
+          fetchDebug: { stage: progress.stage, fetch: fetchRes || null, chatManager: mgrRes || null },
+        };
+      }
+      progress.stage = "selector";
+      const sel = "- markStatusAsSeen:sendReadReceipts:skipUpdateChatSession:";
+      const mgrObj = mgrRes.mgr && mgrRes.mgr.handle ? mgrRes.mgr : _safeObj(mgrRes.mgr);
+      const msgObj = fetchRes.msg && fetchRes.msg.handle ? fetchRes.msg : _safeObj(fetchRes.msg);
+      if (!mgrObj || !msgObj) {
+        return {
+          ok: false,
+          error: "markStatusAsSeen input unavailable",
+          fetchDebug: { stage: progress.stage, fetch: fetchRes || null, chatManager: mgrRes || null },
+        };
+      }
+      if (!_objcCanCall(mgrObj, sel)) {
+        return {
+          ok: false,
+          error: "chatManager missing markStatusAsSeen selector",
+          fetchDebug: { stage: progress.stage, fetch: fetchRes || null, chatManager: mgrRes || null },
+        };
+      }
+      progress.stage = "selector_call";
+      mgrObj[sel].call(mgrObj, msgObj, 1, 0);
+      progress.stage = "done";
+      return { ok: true, used: "markStatusAsSeen:sendReadReceipts:skipUpdateChatSession:", fetchVia: String(fetchRes.via || "") };
+    } catch (e) {
+      return {
+        ok: false,
+        error: String(e),
+        fetchDebug: { stage: progress.stage, statusStanzaId: sid, participantJid: participant },
+      };
+    } finally {
+      try { if (pool) pool.release(); } catch (_) {}
+    }
+  }, waitMs);
+  if (res && res.ok) return res;
+  const errText = res && res.error ? String(res.error) : "failed";
+  const timeoutDebug = errText === "timeout"
+    ? {
+        stage: progress.stage,
+        statusStanzaId: sid,
+        participantJid: participant,
+        timeoutMs: waitMs,
+      }
+    : null;
+  return {
+    ok: false,
+    error: errText,
+    fetchDebug: res && res.fetchDebug ? res.fetchDebug : timeoutDebug,
+  };
+}
+
+/**
+ * 执行动态文本回复动作。
+ * 参数:
+ * - statusStanzaId: 被引用动态 stanzaId。
+ * - text: 回复文本。
+ * - participantJidStr: 目标动态作者 JID。
+ * - timeoutMs: 主线程执行超时毫秒数。
+ * 返回:
+ * - `{ ok, used, fetchVia, targetChatSessionVia, error }`。
+ */
+function _statusActionReplyText(statusStanzaId, text, participantJidStr, timeoutMs) {
+  const sid = String(statusStanzaId || "").trim();
+  const replyText = String(text || "");
+  const participant = String(participantJidStr || "").trim();
+  if (!sid || !participant) return { ok: false, error: "missing statusStanzaId/participantJid" };
+  if (!replyText) return { ok: false, error: "text required" };
+  const res = _runOnMainQueueSync(() => {
+    const core = _resolveCoreFixed();
+    if (!core || !core.ok) return { ok: false, error: core ? core.error : "core failed" };
+    const fetchRes = _fetchStatusMessageByStanzaIdStrict(core, sid, participant);
+    if (!fetchRes || !fetchRes.ok || !fetchRes.msg) {
+      return {
+        ok: false,
+        error: fetchRes ? fetchRes.error : "status message unavailable",
+        fetchDebug: fetchRes || null,
+      };
+    }
+    const targetAuthorJid = String((fetchRes && fetchRes.normalizedAuthorJid) || participant || "").trim();
+    const targetSessionRes = _fetchReplyTargetChatSessionStrict(core, targetAuthorJid);
+    if (!targetSessionRes || !targetSessionRes.ok || !targetSessionRes.chatSession) return { ok: false, error: targetSessionRes ? targetSessionRes.error : "target chatSession unavailable" };
+    const qi = _buildQuotedItemFromMessage(fetchRes.msg, 1);
+    if (!qi) return { ok: false, error: "build quotedItem failed" };
+    const att = _buildAttachmentsWithQuotedItem(qi);
+    if (!att) return { ok: false, error: "build attachments failed" };
+    const nsText = _ns(replyText);
+    if (!nsText) return { ok: false, error: "text->NSString failed" };
+    const sendRes = _sendTextWithAttachmentsStrict(core.sender, targetSessionRes.chatSession, nsText, att, 1);
+    if (!sendRes || !sendRes.ok) return { ok: false, error: sendRes ? sendRes.error : "send failed" };
+    return {
+      ok: true,
+      used: String(sendRes.used || ""),
+      fetchVia: String(fetchRes.via || ""),
+      targetChatSessionVia: String(targetSessionRes.via || "")
+    };
+  }, timeoutMs > 0 ? timeoutMs : 12000);
+  if (res && res.ok) return res;
+  return {
+    ok: false,
+    error: res && res.error ? String(res.error) : "failed",
+    fetchDebug: res && res.fetchDebug ? res.fetchDebug : null,
+  };
+}
+
+/**
+ * 处理 `qqw.status_action` 动作消息。
+ * 参数:
+ * - message: Frida `recv()` 收到的消息对象。
+ * 返回:
+ * - 无返回值；执行结果通过 `_statusEmitResult()` 回传。
+ */
+function _statusHandle(message) {
+  const p = message && message.payload ? message.payload : (message || {});
+  const meta = {
+    opId: String(p.opId || p.op_id || ""),
+    taskId: String(p.taskId || ""),
+    instanceId: String(p.instanceId || ""),
+    action: String(p.action || ""),
+    chatJid: String(p.chatJid || "status@broadcast"),
+    statusStanzaId: String(p.statusStanzaId || p.stanzaId || ""),
+    participantJid: String(p.participantJid || p.statusAuthorJid || ""),
+    text: String(p.text || ""),
+    timeoutMs: Number(p.timeoutMs || p.deadlineMs || 0) | 0
+  };
+  STATUS_ACTION_DIAG.recvHits = (Number(STATUS_ACTION_DIAG.recvHits) || 0) + 1;
+  _statusDiagTouch(meta, "recv", null, "", "");
+  _statusDiagEmit("recv", meta, null, "", "");
+  if (!meta.opId || !meta.action || !meta.statusStanzaId || !meta.participantJid) {
+    _statusEmitResult(meta, { ok: false, error: "missing opId/action/statusStanzaId/participantJid" }, null);
+    return;
+  }
+  if (meta.action === "reply_status_text" && !meta.text) {
+    _statusEmitResult(meta, { ok: false, error: "text required" }, null);
+    return;
+  }
+  STATUS_ACTION_DIAG.waitReadyHits = (Number(STATUS_ACTION_DIAG.waitReadyHits) || 0) + 1;
+  _statusDiagTouch(meta, "waitready", null, "", "");
+  try { waitready(); } catch (_) {}
+  try {
+    let res = null;
+    if (meta.action === "read_status") {
+      res = _statusActionRead(meta.statusStanzaId, meta.participantJid, meta.timeoutMs);
+    } else if (meta.action === "reply_status_text") {
+      res = _statusActionReplyText(meta.statusStanzaId, meta.text, meta.participantJid, meta.timeoutMs);
+    } else {
+      res = { ok: false, error: "unknown action" };
+    }
+    _statusEmitResult(meta, res, null);
+  } catch (e) {
+    _statusEmitResult(meta, { ok: false, error: String(e) }, null);
+  }
+}
+
+/**
+ * 安装状态动作消息循环。
+ * 参数:
+ * - 无。
+ * 返回:
+ * - 无返回值。
+ */
+function _statusLoop() {
+  recv("qqw.status_action", function (message) {
+    try { _statusHandle(message); } catch (e) {
+      STATUS_ACTION_DIAG.loopErrors = (Number(STATUS_ACTION_DIAG.loopErrors) || 0) + 1;
+      _statusDiagTouch(message && message.payload ? message.payload : (message || {}), "loop_exception", false, String(e), "");
+      _statusDiagEmit("loop_exception", message && message.payload ? message.payload : (message || {}), false, String(e), "");
+    }
+    _statusLoop();
+  }).wait();
+}
+
+try { setImmediate(_statusLoop); } catch (_) {}
+
+const RX_STATE = { installed: false, error: null, installedAt: null, waVersion: null, mode: "", objcHooks: null };
+
+const RX_QUOTED_DIAG = {
+  hits: 0,
+  lastAt: 0,
+  lastPhase: "",
+  lastRouteChatJid: "",
+  lastRouteIsStatus: false,
+  lastQuotedChatJid: "",
+  lastQuotedStanzaId: "",
+  lastQuotedTextLen: 0,
+  lastQuotedStatusHint: false,
+};
+
+const RX_SAMPLE = { enabled: false, msg_kind: "unknown", quoted_kind: "none", quoted_stanza_id: "" };
 function RX_objcAvailable() { try { return !!(ObjC && ObjC.available); } catch (_) { return false; } }
 
 function RX_getMainBundleVersionString() {
@@ -4527,6 +7089,24 @@ function RX_tryObjCObject(p) {
   }
 }
 
+/**
+ * 宽松地将指针包装成 `ObjC.Object`，口径对齐测试脚本 `_safeObj()`。
+ * 参数:
+ * - p: 目标对象指针。
+ * 返回:
+ * - 成功时返回 `ObjC.Object`，失败时返回 `null`。
+ */
+function RX_tryObjCObjectLoose(p) {
+  try {
+    if (!RX_objcAvailable()) return null;
+    const q = p ? ptr(p) : null;
+    if (!q || q.isNull()) return null;
+    return new ObjC.Object(q);
+  } catch (_) {
+    return null;
+  }
+}
+
 function RX_tryObjCObjectDeep(ptrValue, maxDeref) {
   try {
     if (!RX_objcAvailable()) return null;
@@ -4579,26 +7159,499 @@ function RX_tryCallBoolNoArg(obj, sel) {
   }
 }
 
-function RX_tryReadNSDataAll(ptrValue, hardCapBytes) {
+function RX_tryReadNSDataAll(ptrValue, hardCapBytes, skipReadableCheck, includeFailureDetail) {
   try {
-    if (!RX_objcAvailable()) return null;
-    const obj = RX_tryObjCObject(ptrValue);
-    if (!obj) return null;
-    if (!ObjC.classes.NSData || !obj.isKindOfClass_(ObjC.classes.NSData)) return null;
+    if (!RX_objcAvailable()) {
+      return includeFailureDetail ? { ok: false, reason: "objc_unavailable", step: "objcAvailable" } : null;
+    }
+    const p = ptrValue ? ptr(ptrValue) : null;
+    if (!p || p.isNull()) {
+      return includeFailureDetail ? {
+        ok: false,
+        reason: "pointer_null",
+        step: "pointer_precheck",
+        ptr: ptrValue ? String(ptrValue) : "0x0",
+      } : null;
+    }
+    if (RX_isLikelyTaggedPointer(p)) {
+      // tagged pointer still counts as objc-like and can continue to ctor stage
+    } else {
+      const r = Process.findRangeByAddress(p);
+      if (!r) {
+        return includeFailureDetail ? {
+          ok: false,
+          reason: "pointer_range_missing",
+          step: "pointer_precheck",
+          ptr: String(p),
+        } : null;
+      }
+      const prot = String(r.protection || "");
+      if (prot.indexOf("r") === -1) {
+        return includeFailureDetail ? {
+          ok: false,
+          reason: "pointer_not_readable",
+          step: "pointer_precheck",
+          ptr: String(p),
+          protection: prot,
+        } : null;
+      }
+    }
+    let obj = null;
+    try {
+      obj = new ObjC.Object(p);
+    } catch (e) {
+      return includeFailureDetail ? {
+        ok: false,
+        reason: "objc_object_ctor_failed",
+        step: "ObjC.Object",
+        ptr: String(p),
+        error: String(e),
+      } : null;
+    }
+    if (!ObjC.classes.NSData || !obj.isKindOfClass_(ObjC.classes.NSData)) {
+      return includeFailureDetail ? {
+        ok: false,
+        reason: "objc_not_nsdata",
+        step: "isKindOfClass",
+        ptr: ptrValue ? String(ptrValue) : "0x0",
+        className: String(obj.$className || ""),
+      } : null;
+    }
     let len = 0;
-    try { len = Number(obj.length()); } catch (_) { len = 0; }
+    try {
+      len = Number(obj.length());
+    } catch (e) {
+      return includeFailureDetail ? {
+        ok: false,
+        reason: "objc_length_exception",
+        step: "length",
+        ptr: ptrValue ? String(ptrValue) : "0x0",
+        className: String(obj.$className || ""),
+        error: String(e),
+      } : null;
+    }
     const cap = Math.max(0, Number(hardCapBytes) || 0);
     const n = cap > 0 ? Math.min(len, cap) : len;
-    if (n <= 0) return { bytes: new Uint8Array([]), totalLen: len, truncated: false };
+    if (n <= 0) {
+      return includeFailureDetail ? {
+        ok: true,
+        reason: "objc_len_zero",
+        step: "length",
+        ptr: ptrValue ? String(ptrValue) : "0x0",
+        className: String(obj.$className || ""),
+        bytes: new Uint8Array([]),
+        totalLen: len,
+        truncated: false,
+      } : { bytes: new Uint8Array([]), totalLen: len, truncated: false };
+    }
     let bytesPtr = null;
-    try { bytesPtr = obj.bytes(); } catch (_) { bytesPtr = null; }
-    if (!bytesPtr || bytesPtr.isNull()) return null;
-    if (!RX_isReadable(bytesPtr, Math.min(16, n))) return null;
+    try {
+      bytesPtr = obj.bytes();
+    } catch (e) {
+      return includeFailureDetail ? {
+        ok: false,
+        reason: "objc_bytes_exception",
+        step: "bytes",
+        ptr: ptrValue ? String(ptrValue) : "0x0",
+        className: String(obj.$className || ""),
+        error: String(e),
+      } : null;
+    }
+    if (!bytesPtr || bytesPtr.isNull()) {
+      return includeFailureDetail ? {
+        ok: false,
+        reason: "objc_bytes_nil",
+        step: "bytes",
+        ptr: ptrValue ? String(ptrValue) : "0x0",
+        className: String(obj.$className || ""),
+      } : null;
+    }
+    if (!skipReadableCheck && !RX_isReadable(bytesPtr, Math.min(16, n))) {
+      return includeFailureDetail ? {
+        ok: false,
+        reason: "objc_bytes_unreadable",
+        step: "isReadable",
+        ptr: ptrValue ? String(ptrValue) : "0x0",
+        className: String(obj.$className || ""),
+        bytesPtr: String(bytesPtr),
+        totalLen: len,
+      } : null;
+    }
     const ab = Memory.readByteArray(bytesPtr, n);
-    if (!ab) return null;
-    return { bytes: new Uint8Array(ab), totalLen: len, truncated: (cap > 0 && len > cap) };
+    if (!ab) {
+      return includeFailureDetail ? {
+        ok: false,
+        reason: "objc_read_byte_array_failed",
+        step: "readByteArray",
+        ptr: ptrValue ? String(ptrValue) : "0x0",
+        className: String(obj.$className || ""),
+        bytesPtr: String(bytesPtr),
+        totalLen: len,
+      } : null;
+    }
+    return {
+      ok: true,
+      reason: "objc_nsdata_bytes_ok",
+      step: "readByteArray",
+      ptr: ptrValue ? String(ptrValue) : "0x0",
+      className: String(obj.$className || ""),
+      bytesPtr: String(bytesPtr),
+      bytes: new Uint8Array(ab),
+      totalLen: len,
+      truncated: (cap > 0 && len > cap),
+    };
+  } catch (e) {
+    return includeFailureDetail ? { ok: false, reason: "objc_exception", step: "catch", error: String(e), ptr: ptrValue ? String(ptrValue) : "0x0" } : null;
+  }
+}
+
+function RX_tryReadProtobufObjectMaterial(ptrValue, hardCapBytes) {
+  try {
+    if (!RX_objcAvailable()) {
+      return { present: false, ptr: String(ptrValue || "0x0"), className: "", kind: "protobuf_object", reason: "objc_unavailable", totalBytes: 0, bytes: null, truncated: false, b64Prefix: "", selector: "" };
+    }
+    const p = ptrValue ? ptr(ptrValue) : null;
+    const obj = p ? (RX_tryObjCObjectDeep(p, 1) || RX_tryObjCObjectLoose(p)) : null;
+    if (!obj) {
+      return { present: true, ptr: String(p || "0x0"), className: String(RX_recoveryClassNameNoMsgSend(p) || ""), kind: "protobuf_object", reason: "protobuf_object_unavailable", totalBytes: 0, bytes: null, truncated: false, b64Prefix: "", selector: "" };
+    }
+    const className = String(obj.$className || RX_recoveryClassNameNoMsgSend(p) || "");
+    const selectors = ["serializedData", "data", "bytes"];
+    let last = { present: true, ptr: String(p || "0x0"), className: className, kind: "protobuf_object", reason: "serialized_outlet_missing", totalBytes: 0, bytes: null, truncated: false, b64Prefix: "", selector: "" };
+    for (let i = 0; i < selectors.length; i++) {
+      const sel = String(selectors[i] || "");
+      if (!sel) continue;
+      const v = RX_tryInvokeNoArg(obj, sel);
+      if (v === null || v === undefined) {
+        last = { present: true, ptr: String(p || "0x0"), className: className, kind: "protobuf_object", reason: "selector_unavailable", totalBytes: 0, bytes: null, truncated: false, b64Prefix: "", selector: sel };
+        continue;
+      }
+      const valuePtr = RX_recoveryPtr(v);
+      const nsdata = RX_tryReadNSDataAll(valuePtr, hardCapBytes, true, true);
+      if (nsdata && nsdata.ok && nsdata.bytes && nsdata.bytes.length > 0) {
+        return {
+          present: true,
+          ptr: String(valuePtr || p || "0x0"),
+          className: className,
+          kind: "protobuf_object_serialized",
+          reason: "protobuf_object_serialized_ok",
+          totalBytes: Math.max(0, Number(nsdata.totalLen) || nsdata.bytes.length || 0),
+          bytes: nsdata.bytes,
+          truncated: !!nsdata.truncated,
+          b64Prefix: String(RX_bytesToBase64(nsdata.bytes) || ""),
+          selector: sel,
+        };
+      }
+      const summary = RX_crossThreadCFDataReadAll(valuePtr, hardCapBytes);
+      if (summary && summary.present && summary.bytes && summary.bytes.length > 0) {
+        return {
+          present: true,
+          ptr: String(summary.ptr || valuePtr || p || "0x0"),
+          className: className,
+          kind: "protobuf_object_serialized",
+          reason: "protobuf_object_serialized_ok",
+          totalBytes: Math.max(0, Number(summary.totalBytes) || summary.bytes.length || 0),
+          bytes: summary.bytes,
+          truncated: !!summary.truncated,
+          b64Prefix: String(summary.b64Prefix || ""),
+          selector: sel,
+        };
+      }
+      last = {
+        present: true,
+        ptr: String(summary && summary.ptr ? summary.ptr : (valuePtr || p || "0x0")),
+        className: className,
+        kind: "protobuf_object_serialized_failed",
+        reason: (nsdata && nsdata.reason) ? String(nsdata.reason) : (summary && summary.reason ? String(summary.reason) : "serialized_outlet_no_bytes"),
+        totalBytes: Math.max(0, Number((nsdata && nsdata.totalLen) || (summary && summary.totalBytes)) || 0),
+        bytes: null,
+        truncated: !!((nsdata && nsdata.truncated) || (summary && summary.truncated)),
+        b64Prefix: String(summary && summary.b64Prefix || ""),
+        selector: sel,
+        error: (nsdata && nsdata.error) ? String(nsdata.error) : (summary && summary.error ? String(summary.error) : ""),
+      };
+    }
+    return last;
+  } catch (e) {
+    return { present: true, ptr: String(ptrValue || "0x0"), className: String(RX_recoveryClassNameNoMsgSend(ptrValue) || ""), kind: "protobuf_object_exception", reason: "protobuf_object_exception", totalBytes: 0, bytes: null, truncated: false, b64Prefix: "", selector: "", error: String(e) };
+  }
+}
+
+/**
+ * 将原始对象、句柄或指针统一转换为 `NativePointer`，供 recovery 只读 helper 使用。
+ * 参数:
+ * - rawObj: Frida `NativePointer`、`ObjC.Object`、字符串指针或其它可转指针值。
+ * 返回:
+ * - 成功时返回 `NativePointer`，失败时返回 `0x0`。
+ */
+function RX_recoveryPtr(rawObj) {
+  try {
+    if (rawObj === null || rawObj === undefined) return ptr("0x0");
+    if (rawObj && rawObj.handle) return ptr(rawObj.handle);
+    return ptr(rawObj);
   } catch (_) {
-    return null;
+    return ptr("0x0");
+  }
+}
+
+/**
+ * 懒加载 Objective-C runtime C API，仅供跨线程无消息发送读取使用。
+ * 返回:
+ * - `{ object_getClass, class_getName }`。
+ */
+function RX_recoveryRuntimeFns() {
+  try {
+    if (RX_recoveryRuntimeFns._cached) return RX_recoveryRuntimeFns._cached;
+    const get = (name, ret, args) => {
+      try {
+        const p = Module.findExportByName(null, name);
+        if (!p) return null;
+        return new NativeFunction(p, ret, args);
+      } catch (_) {
+        return null;
+      }
+    };
+    RX_recoveryRuntimeFns._cached = {
+      object_getClass: get("object_getClass", "pointer", ["pointer"]),
+      class_getName: get("class_getName", "pointer", ["pointer"]),
+    };
+    return RX_recoveryRuntimeFns._cached;
+  } catch (_) {
+    return {};
+  }
+}
+
+/**
+ * 懒加载 `CFData` 只读所需 CoreFoundation C API，避免跨线程发送 ObjC selector。
+ * 返回:
+ * - `{ CFGetTypeID, CFDataGetTypeID, CFDataGetLength, CFDataGetBytePtr }`。
+ */
+function RX_recoveryCFDataFns() {
+  try {
+    if (RX_recoveryCFDataFns._cached) return RX_recoveryCFDataFns._cached;
+    const get = (name, ret, args) => {
+      try {
+        const p = Module.findExportByName("CoreFoundation", name) || Module.findExportByName(null, name);
+        if (!p) return null;
+        return new NativeFunction(p, ret, args);
+      } catch (_) {
+        return null;
+      }
+    };
+    RX_recoveryCFDataFns._cached = {
+      CFGetTypeID: get("CFGetTypeID", "ulong", ["pointer"]),
+      CFDataGetTypeID: get("CFDataGetTypeID", "ulong", []),
+      CFDataGetLength: get("CFDataGetLength", "long", ["pointer"]),
+      CFDataGetBytePtr: get("CFDataGetBytePtr", "pointer", ["pointer"]),
+    };
+    return RX_recoveryCFDataFns._cached;
+  } catch (_) {
+    return {};
+  }
+}
+
+/**
+ * 在不创建 `ObjC.Object`、不发送 selector 的前提下，只读取对象运行时类名。
+ * 参数:
+ * - rawObj: 原始对象或指针。
+ * 返回:
+ * - 成功时返回类名字符串，失败时返回空串。
+ */
+function RX_recoveryClassNameNoMsgSend(rawObj) {
+  try {
+    const p = RX_recoveryPtr(rawObj);
+    if (!p || p.isNull()) return "";
+    const f = RX_recoveryRuntimeFns();
+    if (!f.object_getClass || !f.class_getName) return "";
+    const cls = f.object_getClass(p);
+    if (!cls || cls.isNull()) return "";
+    const np = f.class_getName(cls);
+    if (!np || np.isNull()) return "";
+    return String(Memory.readCString(np) || "");
+  } catch (_) {
+    return "";
+  }
+}
+
+/**
+ * 对潜在 `NSData/CFData` 对象做跨线程安全的只读摘要。
+ * 参数:
+ * - rawObj: 原始对象或指针。
+ * - hardCapBytes: 最多采样的字节数。
+ * 返回:
+ * - `{ present, ptr, className, kind, bytes, totalBytes, hexPrefix, b64Prefix }`。
+ */
+function RX_crossThreadCFDataSummary(rawObj, hardCapBytes) {
+  try {
+    const p = RX_recoveryPtr(rawObj);
+    if (!p || p.isNull()) {
+      return { present: false, ptr: "0x0", className: "", kind: "nil", bytes: 0, totalBytes: 0, hexPrefix: "", b64Prefix: "" };
+    }
+    const className = RX_recoveryClassNameNoMsgSend(p);
+    const looksLikeData = /data/i.test(String(className || ""));
+    const out = {
+      present: true,
+      ptr: p.toString(),
+      className: String(className || ""),
+      kind: className ? "object" : "unknown",
+      bytes: 0,
+      totalBytes: 0,
+      hexPrefix: "",
+      b64Prefix: "",
+    };
+    if (!looksLikeData) return out;
+    const f = RX_recoveryCFDataFns();
+    if (!f.CFDataGetLength || !f.CFDataGetBytePtr) {
+      out.kind = "cfdata_api_missing";
+      return out;
+    }
+    if (f.CFGetTypeID && f.CFDataGetTypeID) {
+      try {
+        const wantTid = Number(f.CFDataGetTypeID());
+        const gotTid = Number(f.CFGetTypeID(p));
+        if (wantTid > 0 && gotTid > 0 && wantTid !== gotTid) {
+          out.kind = "not_cfdata";
+          return out;
+        }
+      } catch (_) {}
+    }
+    const totalBytes = Math.max(0, Number(f.CFDataGetLength(p)) || 0);
+    out.kind = "CFData";
+    out.totalBytes = totalBytes;
+    if (totalBytes <= 0) return out;
+    const cap = Math.max(0, Math.min(totalBytes, Math.max(0, Number(hardCapBytes || 0) | 0)));
+    if (cap <= 0) return out;
+    const bytesPtr = f.CFDataGetBytePtr(p);
+    if (!bytesPtr || ptr(bytesPtr).isNull()) {
+      out.kind = "CFData_no_bytes";
+      return out;
+    }
+    if (!RX_isReadable(ptr(bytesPtr), Math.min(16, cap))) {
+      out.kind = "CFData_unreadable";
+      return out;
+    }
+    const ab = Memory.readByteArray(ptr(bytesPtr), cap);
+    if (!ab) return out;
+    const u8 = new Uint8Array(ab);
+    out.bytes = u8.length;
+    let hex = "";
+    for (let i = 0; i < u8.length && i < 24; i++) {
+      const b = u8[i] & 0xff;
+      hex += (b < 16 ? "0" : "") + b.toString(16);
+    }
+    out.hexPrefix = hex;
+    out.b64Prefix = String(RX_bytesToBase64(u8) || "").slice(0, 96);
+    return out;
+  } catch (e) {
+    return {
+      present: false,
+      ptr: "0x0",
+      className: "",
+      kind: "error",
+      bytes: 0,
+      totalBytes: 0,
+      hexPrefix: "",
+      b64Prefix: "",
+      error: String(e),
+    };
+  }
+}
+
+/**
+ * 读取完整 `CFData` bytes，供 recovery cache 写入原始材料使用。
+ * 参数:
+ * - rawObj: 原始对象或指针。
+ * - hardCapBytes: 最大读取字节数。
+ * 返回:
+ * - `{ present, ptr, className, kind, reason, totalBytes, bytes, truncated, b64Prefix }`。
+ */
+function RX_crossThreadCFDataReadAll(rawObj, hardCapBytes) {
+  try {
+    const p = RX_recoveryPtr(rawObj);
+    if (!p || p.isNull()) {
+      return { present: false, ptr: "0x0", className: "", kind: "nil", reason: "nil_ptr", totalBytes: 0, bytes: null, truncated: false, b64Prefix: "" };
+    }
+    const className = RX_recoveryClassNameNoMsgSend(p);
+    const looksLikeData = /data/i.test(String(className || ""));
+    if (!looksLikeData) {
+      return { present: true, ptr: p.toString(), className: String(className || ""), kind: className ? "object" : "unknown", reason: "class_not_data_like", totalBytes: 0, bytes: null, truncated: false, b64Prefix: "" };
+    }
+    const f = RX_recoveryCFDataFns();
+    if (!f.CFDataGetLength || !f.CFDataGetBytePtr) {
+      return { present: true, ptr: p.toString(), className: String(className || ""), kind: "cfdata_api_missing", reason: "cfdata_api_missing", totalBytes: 0, bytes: null, truncated: false, b64Prefix: "" };
+    }
+    if (f.CFGetTypeID && f.CFDataGetTypeID) {
+      try {
+        const wantTid = Number(f.CFDataGetTypeID());
+        const gotTid = Number(f.CFGetTypeID(p));
+        if (wantTid > 0 && gotTid > 0 && wantTid !== gotTid) {
+          return { present: true, ptr: p.toString(), className: String(className || ""), kind: "not_cfdata", reason: "type_mismatch_not_cfdata", totalBytes: 0, bytes: null, truncated: false, b64Prefix: "" };
+        }
+      } catch (_) {}
+    }
+    const totalBytes = Math.max(0, Number(f.CFDataGetLength(p)) || 0);
+    if (totalBytes <= 0) {
+      return { present: true, ptr: p.toString(), className: String(className || ""), kind: "CFData", reason: "len_zero", totalBytes: 0, bytes: new Uint8Array([]), truncated: false, b64Prefix: "" };
+    }
+    const cap = Math.max(0, Math.min(totalBytes, Math.max(0, Number(hardCapBytes || 0) | 0)));
+    if (cap <= 0) {
+      return { present: true, ptr: p.toString(), className: String(className || ""), kind: "CFData", reason: "cap_zero", totalBytes: totalBytes, bytes: new Uint8Array([]), truncated: totalBytes > 0, b64Prefix: "" };
+    }
+    const bytesPtr = f.CFDataGetBytePtr(p);
+    if (!bytesPtr || ptr(bytesPtr).isNull()) {
+      return { present: true, ptr: p.toString(), className: String(className || ""), kind: "CFData_no_bytes", reason: "bytes_nil", totalBytes: totalBytes, bytes: null, truncated: cap < totalBytes, b64Prefix: "" };
+    }
+    if (!RX_isReadable(ptr(bytesPtr), Math.min(16, cap))) {
+      if (String(className || "") === "_NSInlineData") {
+        const alt = RX_tryReadNSDataAll(p, cap, true, true);
+        if (alt && alt.ok && alt.bytes && alt.bytes.length > 0) {
+          return {
+            present: true,
+            ptr: p.toString(),
+            className: String(className || ""),
+            kind: "NSData_bytes_fallback",
+            reason: String(alt.reason || "objc_nsdata_bytes_ok"),
+            totalBytes: Math.max(0, Number(alt.totalLen) || totalBytes),
+            bytes: alt.bytes,
+            truncated: !!alt.truncated,
+            b64Prefix: String(RX_bytesToBase64(alt.bytes) || "").slice(0, 96),
+          };
+        }
+        if (alt && !alt.ok) {
+          return {
+            present: true,
+            ptr: p.toString(),
+            className: String(className || ""),
+            kind: "NSData_bytes_fallback_failed",
+            reason: String(alt.reason || "objc_fallback_failed"),
+            totalBytes: totalBytes,
+            bytes: null,
+            truncated: cap < totalBytes,
+            b64Prefix: "",
+            error: alt.error ? String(alt.error) : "",
+          };
+        }
+      }
+      return { present: true, ptr: p.toString(), className: String(className || ""), kind: "CFData_unreadable", reason: "bytes_unreadable", totalBytes: totalBytes, bytes: null, truncated: cap < totalBytes, b64Prefix: "" };
+    }
+    const ab = Memory.readByteArray(ptr(bytesPtr), cap);
+    if (!ab) {
+      return { present: true, ptr: p.toString(), className: String(className || ""), kind: "CFData_read_failed", reason: "read_byte_array_failed", totalBytes: totalBytes, bytes: null, truncated: cap < totalBytes, b64Prefix: "" };
+    }
+    const u8 = new Uint8Array(ab);
+    return {
+      present: true,
+      ptr: p.toString(),
+      className: String(className || ""),
+      kind: "CFData",
+      reason: u8.length > 0 ? "ok" : "bytes_empty",
+      totalBytes: totalBytes,
+      bytes: u8,
+      truncated: cap < totalBytes,
+      b64Prefix: String(RX_bytesToBase64(u8) || "").slice(0, 96),
+    };
+  } catch (e) {
+    return { present: false, ptr: "0x0", className: "", kind: "error", reason: "exception", totalBytes: 0, bytes: null, truncated: false, b64Prefix: "", error: String(e) };
   }
 }
 
@@ -4769,16 +7822,11 @@ function RX_extractTailJidFromUniqueKey(uniqueKeyStr) {
   }
 }
 
-function RX_extractStanzaFieldsFromContext(ctxPtr) {
-  const out = { stanzaId: null, uniqueKey: null, chatJID: null, senderJID: null, statusAuthorJID: null, isGroup: null, isFromMe: null };
+function RX_extractStanzaFieldsFromStanzaObj(stanzaObj) {
+  const out = { stanzaId: null, uniqueKey: null, chatJID: null, senderJID: null, statusAuthorJID: null, isGroup: null, isFromMe: null, messageStanzaPtr: "0x0" };
   try {
-    const ctxObj = RX_tryObjCObject(ctxPtr) || RX_tryObjCObjectDeep(ctxPtr, 2);
-    if (!ctxObj) return out;
-    const stanzaObj =
-      RX_tryInvokeNoArg(ctxObj, "orderedMessageStanza") ||
-      RX_tryInvokeNoArg(ctxObj, "messageStanza") ||
-      (RX_tryObjCObjectDeep(ctxPtr, 2) ? (RX_tryInvokeNoArg(RX_tryObjCObjectDeep(ctxPtr, 2), "orderedMessageStanza") || RX_tryInvokeNoArg(RX_tryObjCObjectDeep(ctxPtr, 2), "messageStanza")) : null);
     if (!stanzaObj || !(stanzaObj instanceof ObjC.Object)) return out;
+    out.messageStanzaPtr = RX_ptrStrOfObj(stanzaObj);
 
     const stanzaId = RX_tryInvokeNoArg(stanzaObj, "uniqueStanzaID");
     if (stanzaId !== null && stanzaId !== undefined) out.stanzaId = String(stanzaId);
@@ -4837,6 +7885,114 @@ function RX_extractStanzaFieldsFromContext(ctxPtr) {
     return out;
   } catch (_) {
     return out;
+  }
+}
+
+function RX_extractStanzaFieldsFromStanzaPtr(stanzaPtr) {
+  try {
+    const stanzaObj = RX_tryObjCObject(stanzaPtr) || RX_tryObjCObjectDeep(stanzaPtr, 1);
+    return RX_extractStanzaFieldsFromStanzaObj(stanzaObj);
+  } catch (_) {
+    return { stanzaId: null, uniqueKey: null, chatJID: null, senderJID: null, statusAuthorJID: null, isGroup: null, isFromMe: null, messageStanzaPtr: "0x0" };
+  }
+}
+
+function RX_extractStanzaFieldsFromContext(ctxPtr) {
+  try {
+    const ctxObj = RX_tryObjCObject(ctxPtr) || RX_tryObjCObjectDeep(ctxPtr, 2);
+    if (!ctxObj) {
+      return { stanzaId: null, uniqueKey: null, chatJID: null, senderJID: null, statusAuthorJID: null, isGroup: null, isFromMe: null, messageStanzaPtr: "0x0" };
+    }
+    const deepCtx = RX_tryObjCObjectDeep(ctxPtr, 2);
+    const stanzaObj =
+      RX_tryInvokeNoArg(ctxObj, "orderedMessageStanza") ||
+      RX_tryInvokeNoArg(ctxObj, "messageStanza") ||
+      (deepCtx ? (RX_tryInvokeNoArg(deepCtx, "orderedMessageStanza") || RX_tryInvokeNoArg(deepCtx, "messageStanza")) : null);
+    return RX_extractStanzaFieldsFromStanzaObj(stanzaObj);
+  } catch (_) {
+    return { stanzaId: null, uniqueKey: null, chatJID: null, senderJID: null, statusAuthorJID: null, isGroup: null, isFromMe: null, messageStanzaPtr: "0x0" };
+  }
+}
+
+/**
+ * 在主接收 `protobuf = null` 时记录短窗锚点，供 helper 做同窗合流使用。
+ * 参数:
+ * - pending: 已构造好的 pending 条目。
+ * 返回:
+ * - 无返回值，直接更新短窗缓存。
+ */
+function RX_recoveryRememberNullPending(pending) {
+  try {
+    const p = pending || {};
+    const pendingKey = String(p.pendingKey || "");
+    if (!pendingKey) return;
+    const now = Date.now();
+    const ttlMs = Math.max(100, Number(RX_RECOVERY_CONFIG.sameWindowMs) || 1200);
+    const maxEntries = Math.max(1, Number(RX_RECOVERY_CONFIG.recentWindowMax) || 64);
+    for (const [k, v] of RX_RECOVERY_RECENT_NULL.entries()) {
+      const atMs = Math.max(0, Number(v && v.rxTs) || 0);
+      if (!atMs || (now - atMs) > ttlMs) RX_RECOVERY_RECENT_NULL.delete(k);
+    }
+    RX_RECOVERY_RECENT_NULL.set(pendingKey, {
+      pendingKey: pendingKey,
+      rxTs: Math.max(0, Number(p.rxTs) || now),
+      tid: Math.max(0, Number(p.tid) || 0),
+      stanzaId: String(p.stanzaId || ""),
+      uniqueKey: String(p.uniqueKey || ""),
+      chatJID: String(p.chatJID || ""),
+      senderJID: String(p.senderJID || ""),
+      statusAuthorJID: String(p.statusAuthorJID || ""),
+      messageStanzaPtr: String(p.messageStanzaPtr || "0x0"),
+      route: p.route || {},
+      cmdSel: String(p.cmdSel || ""),
+    });
+    if (RX_RECOVERY_RECENT_NULL.size <= maxEntries) return;
+    const rows = Array.from(RX_RECOVERY_RECENT_NULL.entries()).sort((a, b) => {
+      const aTs = Math.max(0, Number(a && a[1] && a[1].rxTs) || 0);
+      const bTs = Math.max(0, Number(b && b[1] && b[1].rxTs) || 0);
+      return aTs - bTs;
+    });
+    while (RX_RECOVERY_RECENT_NULL.size > maxEntries && rows.length) {
+      const row = rows.shift();
+      if (!row) break;
+      RX_RECOVERY_RECENT_NULL.delete(String(row[0] || ""));
+    }
+  } catch (_) {}
+}
+
+/**
+ * 在 helper 命中时查找最近的空包主接收锚点，用于同窗合流。
+ * 参数:
+ * - messageStanzaPtr: helper 当前看到的 `messageStanzaPtr`。
+ * - tid: helper 当前线程 ID。
+ * 返回:
+ * - 命中时返回 `{ pending, match }`，否则返回 `null`。
+ */
+function RX_recoveryPickRecentNullPending(messageStanzaPtr, tid) {
+  try {
+    const ptrText = String(messageStanzaPtr || "");
+    const hookTid = Math.max(0, Number(tid) || 0);
+    const now = Date.now();
+    const ttlMs = Math.max(100, Number(RX_RECOVERY_CONFIG.sameWindowMs) || 1200);
+    const sameTid = [];
+    for (const [k, row] of RX_RECOVERY_RECENT_NULL.entries()) {
+      const pending = row || {};
+      const atMs = Math.max(0, Number(pending.rxTs) || 0);
+      if (!atMs || (now - atMs) > ttlMs) {
+        RX_RECOVERY_RECENT_NULL.delete(k);
+        continue;
+      }
+      if (ptrText && ptrText !== "0x0" && String(pending.messageStanzaPtr || "") === ptrText) {
+        return { pending: pending, match: "same_window_messageStanzaPtr" };
+      }
+      if (hookTid > 0 && Math.max(0, Number(pending.tid) || 0) === hookTid) {
+        sameTid.push(pending);
+      }
+    }
+    if (sameTid.length !== 1) return null;
+    return { pending: sameTid[0], match: "same_window_same_tid" };
+  } catch (_) {
+    return null;
   }
 }
 
@@ -4975,26 +8131,88 @@ function RX_findFirstNested(fields, fieldNo) {
   return null;
 }
 
+/**
+ * 收集 protobuf 某段子树中命中的 UTF8 路径摘要，仅用于最小诊断。
+ * 参数:
+ * - fields: 当前子树字段数组。
+ * - prefix: 当前路径前缀。
+ * - pred: 过滤函数，命中时才记录。
+ * - limit: 最多收集多少条。
+ * 返回:
+ * - `["6.17.2=status@broadcast", ...]` 形式的路径数组。
+ */
+function RX_collectUtf8PathHits(fields, prefix, pred, limit) {
+  try {
+    const out = [];
+    const walk = (arr, base, depth) => {
+      if (!arr || !arr.length || out.length >= limit || depth > 4) return;
+      for (let i = 0; i < arr.length; i++) {
+        const it = arr[i];
+        if (!it) continue;
+        const path = base ? (base + "." + String(it.field || "")) : String(it.field || "");
+        if (typeof it.utf8 === "string" && it.utf8.length) {
+          const s = String(it.utf8 || "");
+          if (!pred || pred(s)) out.push(path + "=" + s.slice(0, 140));
+        }
+        if (it.nested && it.nested.length) walk(it.nested, path, depth + 1);
+        if (out.length >= limit) break;
+      }
+    };
+    walk(fields, String(prefix || ""), 0);
+    return out;
+  } catch (_) {
+    return [];
+  }
+}
+
+/**
+ * 在原始 protobuf bytes 中做最小 ASCII needle 命中判断。
+ * 参数:
+ * - bytes: protobuf 原始字节数组。
+ * - needle: 需要匹配的 ASCII 字符串。
+ * 返回:
+ * - 命中返回 `true`，否则返回 `false`。
+ */
+function RX_bytesContainAscii(bytes, needle) {
+  try {
+    if (!bytes || !bytes.length) return false;
+    const pat = String(needle || "");
+    if (!pat) return false;
+    if (bytes.length < pat.length) return false;
+    for (let i = 0; i <= bytes.length - pat.length; i++) {
+      let ok = true;
+      for (let j = 0; j < pat.length; j++) {
+        if ((bytes[i + j] & 0xff) !== pat.charCodeAt(j)) {
+          ok = false;
+          break;
+        }
+      }
+      if (ok) return true;
+    }
+  } catch (_) {}
+  return false;
+}
+
 function RX_extractPbFromProtoBytes(bytes) {
   const pb = { kind: "", text: "", caption: "", directPath: "", mediaKey: "", fileEncSha256: "", fileSha256: "" };
-  const extra = { bytes32: [], mime: "", url: "", directPath: "", quoted: null, strings: [] };
+  const extra = { bytes32: [], mime: "", url: "", directPath: "", quoted: null, quotedProbe: null, strings: [] };
   try {
     const top = RX_dumpProto(bytes, 0, 2000);
     let text = RX_findFirstFieldUtf8(top, 1);
     let quoted = null;
-    if (!text) {
-      const f6 = RX_findFirstNested(top, 6);
-      if (f6) {
+    const f6 = RX_findFirstNested(top, 6);
+    if (f6) {
+      if (!text) {
         const rt = RX_findFirstFieldUtf8(f6, 1);
         if (rt) text = rt;
-        const f17 = RX_findFirstNested(f6, 17);
-        if (f17) {
-          const qStanza = RX_findFirstFieldUtf8(f17, 1);
-          const qChat = RX_findFirstFieldUtf8(f17, 2);
-          const f3 = RX_findFirstNested(f17, 3);
-          const qText = f3 ? RX_findFirstFieldUtf8(f3, 1) : "";
-          if (qStanza || qChat || qText) quoted = { stanzaId: qStanza, chatJid: qChat, text: qText };
-        }
+      }
+      const f17 = RX_findFirstNested(f6, 17);
+      if (f17) {
+        const qStanza = RX_findFirstFieldUtf8(f17, 1);
+        const qChat = RX_findFirstFieldUtf8(f17, 2);
+        const f3 = RX_findFirstNested(f17, 3);
+        const qText = f3 ? RX_findFirstFieldUtf8(f3, 1) : "";
+        if (qStanza || qChat || qText) quoted = { stanzaId: qStanza, chatJid: qChat, text: qText };
       }
     }
     if (text) {
@@ -5002,6 +8220,31 @@ function RX_extractPbFromProtoBytes(bytes) {
       pb.text = text;
     }
     if (quoted) extra.quoted = quoted;
+    const jidOrStatusPred = (s) => {
+      const v = String(s || "").trim();
+      const l = v.toLowerCase();
+      return l.indexOf("status@broadcast") !== -1 || l.indexOf("@") !== -1 || /^3a[0-9a-f]/i.test(v);
+    };
+    const statusPathHits = RX_collectUtf8PathHits(top, "", s => String(s || "").toLowerCase().indexOf("status@broadcast") !== -1, 6);
+    const f17PathHits = f6 ? RX_collectUtf8PathHits(RX_findFirstNested(f6, 17), "6.17", jidOrStatusPred, 12) : [];
+    const f6PathHits = f6 ? RX_collectUtf8PathHits(f6, "6", jidOrStatusPred, 18) : [];
+    const rawStatusBroadcastHit = RX_bytesContainAscii(bytes, "status@broadcast");
+    // reply/quoted 上下文不能再只依赖 f6->f17 这条窄路径；只要已有 quoted 摘要，
+    // 或邻近 quoted 子树存在稳定的 JID/stanza/status 迹象，就视为存在 quoted 语义。
+    const hasQuotedContext = !!quoted ||
+      statusPathHits.length > 0 ||
+      f17PathHits.length > 0 ||
+      f6PathHits.length > 0 ||
+      rawStatusBroadcastHit;
+    if (statusPathHits.length || f17PathHits.length || f6PathHits.length || rawStatusBroadcastHit) {
+      extra.quotedProbe = {
+        statusPaths: statusPathHits,
+        f17Paths: f17PathHits,
+        f6Paths: f6PathHits,
+        rawStatusBroadcastHit: rawStatusBroadcastHit,
+        hasQuotedContext: hasQuotedContext,
+      };
+    }
 
     const bytes32 = [];
     const strings = [];
@@ -5073,6 +8316,95 @@ function RX_scoreProtoBytes(bytes) {
   }
 }
 
+/**
+ * 记录并发出 quoted 来源诊断，验证被引用对象是否来自 `status@broadcast`。
+ * 参数:
+ * - phase: 当前接收阶段。
+ * - route: 当前消息路由信息。
+ * - parsed: `RX_extractPbFromProtoBytes()` 的解析结果。
+ * - stanzaId: 当前消息 stanzaId。
+ * 返回:
+ * - 无返回值。
+ */
+function RX_emitQuotedDiag(phase, route, parsed, stanzaId) {
+  try {
+    const q = parsed && parsed.extra && parsed.extra.quoted ? parsed.extra.quoted : null;
+    const probe = parsed && parsed.extra && parsed.extra.quotedProbe ? parsed.extra.quotedProbe : null;
+    if (!q && !probe) return;
+    const quotedChatJid = String(q && q.chatJid || "").trim();
+    const quotedStanzaId = String(q && q.stanzaId || "").trim();
+    const quotedText = String(q && q.text || "");
+    const routeChatJid = String(route && route.chatJID || "").trim();
+    const routeIsStatus = !!(route && route.isStatus);
+    const probeStatusPaths = probe && Array.isArray(probe.statusPaths) ? probe.statusPaths : [];
+    const probeF17Paths = probe && Array.isArray(probe.f17Paths) ? probe.f17Paths : [];
+    const probeF6Paths = probe && Array.isArray(probe.f6Paths) ? probe.f6Paths : [];
+    const rawStatusBroadcastHit = !!(probe && probe.rawStatusBroadcastHit);
+    const hasQuotedContext = !!(probe && probe.hasQuotedContext);
+    const quotedStatusHint = (quotedChatJid.toLowerCase() === "status@broadcast") ||
+      ((probeStatusPaths.length > 0 || rawStatusBroadcastHit) && hasQuotedContext);
+    RX_QUOTED_DIAG.hits = (Number(RX_QUOTED_DIAG.hits) || 0) + 1;
+    RX_QUOTED_DIAG.lastAt = Date.now();
+    RX_QUOTED_DIAG.lastPhase = String(phase || "");
+    RX_QUOTED_DIAG.lastRouteChatJid = routeChatJid;
+    RX_QUOTED_DIAG.lastRouteIsStatus = routeIsStatus;
+    RX_QUOTED_DIAG.lastQuotedChatJid = quotedChatJid;
+    RX_QUOTED_DIAG.lastQuotedStanzaId = quotedStanzaId;
+    RX_QUOTED_DIAG.lastQuotedTextLen = quotedText.length | 0;
+    RX_QUOTED_DIAG.lastQuotedStatusHint = quotedStatusHint;
+    send({
+      type: "qqw.recv.quoted.diag",
+      build: SCRIPT_BUILD_ID,
+      ts: RX_QUOTED_DIAG.lastAt,
+      phase: String(phase || ""),
+      stanzaId: String(stanzaId || ""),
+      routeChatJid: routeChatJid,
+      routeIsStatus: routeIsStatus,
+      quotedChatJid: quotedChatJid,
+      quotedStanzaId: quotedStanzaId,
+      quotedTextLen: quotedText.length | 0,
+      quotedStatusHint: quotedStatusHint,
+      quotedRawStatusBroadcastHit: rawStatusBroadcastHit,
+      quotedHasContext: hasQuotedContext,
+      quotedStatusPaths: probeStatusPaths,
+      quotedF17Paths: probeF17Paths,
+      quotedF6Paths: probeF6Paths,
+    });
+  } catch (_) {}
+}
+
+/**
+ * 从 protobuf 解析结果中提取正式 quoted 来源摘要，供 `wa.recv.update` 下游消费。
+ * 参数:
+ * - parsed: `RX_extractPbFromProtoBytes()` 的解析结果。
+ * 返回:
+ * - 未命中 quoted 时返回 `null`；否则返回 `{ stanzaId, chatJid, textLen, statusHint }`。
+ */
+function RX_buildQuotedRecvInfo(parsed) {
+  try {
+    const q = parsed && parsed.extra && parsed.extra.quoted ? parsed.extra.quoted : null;
+    const probe = parsed && parsed.extra && parsed.extra.quotedProbe ? parsed.extra.quotedProbe : null;
+    if (!q && !probe) return null;
+    const stanzaId = String(q && q.stanzaId || "").trim();
+    const chatJid = String(q && q.chatJid || "").trim();
+    const text = String(q && q.text || "");
+    const probeStatusPaths = probe && Array.isArray(probe.statusPaths) ? probe.statusPaths : [];
+    const rawStatusBroadcastHit = !!(probe && probe.rawStatusBroadcastHit);
+    const hasQuotedContext = !!(probe && probe.hasQuotedContext);
+    const statusHint = (chatJid.toLowerCase() === "status@broadcast") ||
+      ((probeStatusPaths.length > 0 || rawStatusBroadcastHit) && hasQuotedContext);
+    return {
+      stanzaId: stanzaId,
+      chatJid: chatJid,
+      textLen: text.length | 0,
+      statusHint: statusHint,
+      probe: probe,
+    };
+  } catch (_) {
+    return null;
+  }
+}
+
 function RX_pickBestNSDataCandidate(cands) {
   try {
     let best = null;
@@ -5100,16 +8432,115 @@ function RX_pickBestNSDataCandidate(cands) {
   }
 }
 
+/**
+ * 返回 ObjC 对象的稳定指针字符串，便于事件对齐。
+ * 参数:
+ * - obj: ObjC 对象、指针或 `nil`。
+ * 返回:
+ * - 十六进制指针字符串，失败时返回 `0x0`。
+ */
+function RX_ptrStrOfObj(obj) {
+  try {
+    if (obj === null || obj === undefined) return "0x0";
+    const o = (obj instanceof ObjC.Object) ? obj : _safeObj(obj);
+    if (!o || !o.handle) return "0x0";
+    return String(o.handle);
+  } catch (_) {
+    return "0x0";
+  }
+}
+
+/**
+ * 读取 ObjC 对象的轻量描述，避免热路径深度探测。
+ * 参数:
+ * - obj: ObjC 对象、指针或 `nil`。
+ * 返回:
+ * - 最多 160 字符的描述字符串。
+ */
+function RX_safeDesc(obj) {
+  try {
+    if (obj === null || obj === undefined) return "";
+    const o = (obj instanceof ObjC.Object) ? obj : _safeObj(obj);
+    if (!o) return "";
+    const d = String(o);
+    if (!d || d === "(null)") return "";
+    return d.slice(0, 160);
+  } catch (_) {
+    return "";
+  }
+}
+
+/**
+ * 生成固定大小的 probe 事件缓冲区，避免持续增长。
+ * 参数:
+ * - state: probe 状态对象。
+ * - ev: 待写入事件。
+ * 返回:
+ * - 无返回值。
+ */
+function RX_pushBoundedProbeEvent(state, ev) {
+  try {
+    if (!state || !ev) return;
+    const xs = Array.isArray(state.events) ? state.events : [];
+    xs.push(ev);
+    state.count = (Number(state.count) || 0) + 1;
+    const keep = Math.max(1, Number(state.maxEvents) || 160);
+    if (xs.length > keep) xs.splice(0, xs.length - keep);
+    state.events = xs;
+    const kind = String(ev.kind || "");
+    const cap = Number((state.kindKeepCaps || {})[kind] || 0);
+    if (cap > 0) {
+      let seen = 0;
+      const kept = [];
+      for (let i = xs.length - 1; i >= 0; i--) {
+        const it = xs[i];
+        if (String((it && it.kind) || "") === kind) {
+          seen += 1;
+          if (seen > cap) continue;
+        }
+        kept.push(it);
+      }
+      kept.reverse();
+      state.events = kept;
+    }
+  } catch (_) {}
+}
+
+/**
+ * 异步等待指定毫秒数，供 probe wait RPC 复用。
+ * 参数:
+ * - ms: 等待毫秒数。
+ * 返回:
+ * - Promise，在时间到达后 resolve。
+ */
+function RX_sleepMs(ms) {
+  return new Promise(resolve => setTimeout(resolve, Math.max(0, Number(ms) || 0)));
+}
+
 const RX_CONFIG = {
   moduleNameHints: ["WhatsApp", "WhatsAppDecrypted", "WhatsApp_Decrypted"],
-  rva: 0x3aeeef0,
+  rva: 0x392a69c,
   cmdSelectors: [
     "reallyProcessResultsAfterSignalForContext:plaintextProtobuf:originalMessageData:notificationBehavior:journalID:error:retryCount:origin:reportEmptyPlaintextError:",
     "processResultsAfterSignalForContext:plaintextProtobuf:originalMessageData:notificationBehavior:journalID:error:retryCount:origin:reportEmptyPlaintextError:",
   ],
-  enableObjcFallback: false,
+  // 当前 IDA 新版已证实旧 rva 会漂到无关函数，先保持 selector fallback 开启，待设备在线后再用 impof 补精确 IMP。
+  enableObjcFallback:false,
   limits: { maxEvents: 0, maxLinesPerSecond: 60 },
   protobuf: { hardCapBytes: 256 * 1024, alwaysEmitB64: true },
+};
+const RX_RECOVERY_CONFIG = {
+  enabled: true,
+  helper: {
+    rva: 0x4e5fb6c,
+    sourceRva: "0x4e5fb6c",
+    helperName: "updateWithDataFromProtobuf",
+    symbol: "updateWithDataFromProtobuf:originalMessageData:messageStanza:verifyMessageType:canHaveExistingMediaItem:e2eFailureReason:",
+  },
+  readHardCapBytes: 256 * 1024,
+  helperTtlMs: 1500,
+  mainWaitMs: 350,
+  maxEntries: 64,
 };
 
 const RX_ENABLED_DEFAULT = true;
@@ -5131,6 +8562,1107 @@ const RX_AUTO_READ_STATS = {
   fail_reason: {},
   last: null,
 };
+const RX_PARALLEL_MERGE_ROWS = new Map();
+const RX_RECOVERY_STATS = {
+  helperReady: true,
+  helperInstalledAt: Date.now(),
+  installed: false,
+  installedAt: "",
+  installError: "",
+  helperTargetCount: 1,
+  helperInstalledCount: 0,
+  helperStats: {},
+  helperProtoStored: 0,
+  helperConsumed: 0,
+  helperDrops: 0,
+  mergeCreated: 0,
+  mergeResolved: 0,
+  mergeExpired: 0,
+  nullProtoObserved: 0,
+  lastMainNull: null,
+  lastHelper: null,
+  lastWrite: null,
+  lastResolve: null,
+  lastExpire: null,
+};
+
+/**
+ * 归一化 recovery helper 键，统一用于统计与窗口差分。
+ * 参数:
+ * - sourceKey: helper 的 `sourceRva` 或其他标识。
+ * 返回:
+ * - 非空字符串键；缺失时返回 `unknown_helper`。
+ */
+function RX_recoveryNormalizeHelperKey(sourceKey) {
+  try {
+    const key = String(sourceKey || "").trim();
+    return key || "unknown_helper";
+  } catch (_) {
+    return "unknown_helper";
+  }
+}
+
+/**
+ * 获取指定 recovery helper 的统计桶，不存在时按默认结构创建。
+ * 参数:
+ * - sourceKey: helper 的 `sourceRva` 或其他标识。
+ * 返回:
+ * - 可直接原地更新的统计对象。
+ */
+function RX_recoveryGetHelperStatBucket(sourceKey) {
+  try {
+    const key = RX_recoveryNormalizeHelperKey(sourceKey);
+    if (!RX_RECOVERY_STATS.helperStats[key]) {
+      RX_RECOVERY_STATS.helperStats[key] = {
+        helperName: "",
+        symbol: "",
+        installed: false,
+        installAddr: "",
+        installError: "",
+        hits: 0,
+        writes: 0,
+        emptyDrops: 0,
+        errors: 0,
+        lastSeenAt: 0,
+        lastWriteAt: 0,
+        lastDropAt: 0,
+        lastErrorAt: 0,
+        lastOriginalMessageDataLen: 0,
+        lastOriginalMessageDataReason: "",
+        lastOriginalMessageDataKind: "",
+        lastOriginalMessageDataClassName: "",
+        lastOriginalMessageDataPtr: "",
+        lastOriginalMessageDataError: "",
+        lastMessageStanzaPtr: "",
+        lastCacheKey: "",
+      };
+    }
+    return RX_RECOVERY_STATS.helperStats[key];
+  } catch (_) {
+    return {
+      helperName: "",
+      symbol: "",
+      installed: false,
+      installAddr: "",
+      installError: "",
+      hits: 0,
+      writes: 0,
+      emptyDrops: 0,
+      errors: 0,
+      lastSeenAt: 0,
+      lastWriteAt: 0,
+      lastDropAt: 0,
+      lastErrorAt: 0,
+      lastOriginalMessageDataLen: 0,
+      lastOriginalMessageDataReason: "",
+      lastOriginalMessageDataKind: "",
+      lastOriginalMessageDataClassName: "",
+      lastOriginalMessageDataPtr: "",
+      lastOriginalMessageDataError: "",
+      lastMessageStanzaPtr: "",
+      lastCacheKey: "",
+    };
+  }
+}
+
+/**
+ * 记录单个 recovery helper 的安装、命中、写入和丢弃情况。
+ * 参数:
+ * - sourceKey: helper 的 `sourceRva` 或其他标识。
+ * - eventType: `install`/`hit`/`write`/`empty_drop`/`error`。
+ * - extra: 本次事件附加信息。
+ * 返回:
+ * - 无返回值，直接更新全局统计对象。
+ */
+function RX_recoveryRecordHelperEvent(sourceKey, eventType, extra) {
+  try {
+    const key = RX_recoveryNormalizeHelperKey(sourceKey);
+    const bucket = RX_recoveryGetHelperStatBucket(key);
+    const info = extra || {};
+    if (info.helperName) bucket.helperName = String(info.helperName);
+    if (info.symbol) bucket.symbol = String(info.symbol);
+    if (info.installAddr) bucket.installAddr = String(info.installAddr);
+    if (typeof info.originalMessageDataLen === "number") {
+      bucket.lastOriginalMessageDataLen = Math.max(0, Number(info.originalMessageDataLen) || 0);
+    }
+    if (info.originalMessageDataReason) bucket.lastOriginalMessageDataReason = String(info.originalMessageDataReason);
+    if (info.originalMessageDataKind) bucket.lastOriginalMessageDataKind = String(info.originalMessageDataKind);
+    if (info.originalMessageDataClassName) bucket.lastOriginalMessageDataClassName = String(info.originalMessageDataClassName);
+    if (info.originalMessageDataPtr) bucket.lastOriginalMessageDataPtr = String(info.originalMessageDataPtr);
+    if (info.originalMessageDataError) bucket.lastOriginalMessageDataError = String(info.originalMessageDataError);
+    if (typeof info.recoveryMaterialLen === "number") {
+      bucket.lastRecoveryMaterialLen = Math.max(0, Number(info.recoveryMaterialLen) || 0);
+    }
+    if (info.recoveryMaterialSource) bucket.lastRecoveryMaterialSource = String(info.recoveryMaterialSource);
+    if (info.recoveryMaterialKind) bucket.lastRecoveryMaterialKind = String(info.recoveryMaterialKind);
+    if (info.recoveryMaterialReason) bucket.lastRecoveryMaterialReason = String(info.recoveryMaterialReason);
+    if (info.recoveryMaterialClassName) bucket.lastRecoveryMaterialClassName = String(info.recoveryMaterialClassName);
+    if (info.recoveryMaterialPtr) bucket.lastRecoveryMaterialPtr = String(info.recoveryMaterialPtr);
+    if (info.recoveryMaterialError) bucket.lastRecoveryMaterialError = String(info.recoveryMaterialError);
+    if (info.recoveryMaterialSelector) bucket.lastRecoveryMaterialSelector = String(info.recoveryMaterialSelector);
+    if (info.messageStanzaPtr) bucket.lastMessageStanzaPtr = String(info.messageStanzaPtr);
+    if (info.cacheKey) bucket.lastCacheKey = String(info.cacheKey);
+    const now = Date.now();
+    if (eventType === "install") {
+      bucket.installed = !!info.installed;
+      bucket.installError = info.installError ? String(info.installError) : "";
+      if (bucket.installed) {
+        bucket.lastSeenAt = now;
+      }
+      return;
+    }
+    if (eventType === "hit") {
+      bucket.hits = (Number(bucket.hits) || 0) + 1;
+      bucket.lastSeenAt = now;
+      return;
+    }
+    if (eventType === "write") {
+      bucket.writes = (Number(bucket.writes) || 0) + 1;
+      bucket.lastSeenAt = now;
+      bucket.lastWriteAt = now;
+      return;
+    }
+    if (eventType === "empty_drop") {
+      bucket.emptyDrops = (Number(bucket.emptyDrops) || 0) + 1;
+      bucket.lastSeenAt = now;
+      bucket.lastDropAt = now;
+      return;
+    }
+    if (eventType === "error") {
+      bucket.errors = (Number(bucket.errors) || 0) + 1;
+      bucket.lastSeenAt = now;
+      bucket.lastErrorAt = now;
+      bucket.installError = info.error ? String(info.error) : bucket.installError;
+    }
+  } catch (_) {}
+}
+
+/**
+ * 为单次主接收空包建立 helper 统计快照，便于判断等待窗口内辅助点是否同步 miss。
+ * 参数:
+ * - 无。
+ * 返回:
+ * - 以 helper 键为索引的计数快照对象。
+ */
+function RX_recoveryTakeHelperSnapshot() {
+  try {
+    const out = {};
+    const stats = RX_RECOVERY_STATS.helperStats || {};
+    for (const key of Object.keys(stats)) {
+      const row = stats[key] || {};
+      out[key] = {
+        hits: Number(row.hits) || 0,
+        writes: Number(row.writes) || 0,
+        emptyDrops: Number(row.emptyDrops) || 0,
+        errors: Number(row.errors) || 0,
+      };
+    }
+    return out;
+  } catch (_) {
+    return {};
+  }
+}
+
+/**
+ * 计算从主接收空包创建 pending 到最终恢复/超时期间，各 helper 的统计增量。
+ * 参数:
+ * - before: pending 创建时的 helper 统计快照。
+ * 返回:
+ * - 包含每个 helper `hitsDelta/writesDelta/emptyDropsDelta/errorsDelta` 的对象。
+ */
+function RX_recoveryDiffHelperSnapshot(before) {
+  try {
+    const prev = before || {};
+    const out = {};
+    const stats = RX_RECOVERY_STATS.helperStats || {};
+    const keys = new Set(Object.keys(prev).concat(Object.keys(stats)));
+    for (const key of keys) {
+      const row = stats[key] || {};
+      const base = prev[key] || {};
+      out[key] = {
+        helperName: row.helperName ? String(row.helperName) : "",
+        installed: !!row.installed,
+        hitsDelta: (Number(row.hits) || 0) - (Number(base.hits) || 0),
+        writesDelta: (Number(row.writes) || 0) - (Number(base.writes) || 0),
+        emptyDropsDelta: (Number(row.emptyDrops) || 0) - (Number(base.emptyDrops) || 0),
+        errorsDelta: (Number(row.errors) || 0) - (Number(base.errors) || 0),
+        lastOriginalMessageDataLen: Math.max(0, Number(row.lastOriginalMessageDataLen) || 0),
+        lastOriginalMessageDataReason: row.lastOriginalMessageDataReason ? String(row.lastOriginalMessageDataReason) : "",
+        lastOriginalMessageDataKind: row.lastOriginalMessageDataKind ? String(row.lastOriginalMessageDataKind) : "",
+        lastOriginalMessageDataClassName: row.lastOriginalMessageDataClassName ? String(row.lastOriginalMessageDataClassName) : "",
+        lastOriginalMessageDataPtr: row.lastOriginalMessageDataPtr ? String(row.lastOriginalMessageDataPtr) : "",
+        lastOriginalMessageDataError: row.lastOriginalMessageDataError ? String(row.lastOriginalMessageDataError) : "",
+        lastMessageStanzaPtr: row.lastMessageStanzaPtr ? String(row.lastMessageStanzaPtr) : "",
+      };
+    }
+    return out;
+  } catch (_) {
+    return {};
+  }
+}
+
+/**
+ * 根据主接收提取出的锚点生成 recovery pending 主键。
+ * 参数:
+ * - route: 包含 `uniqueKey/chatJID/stanzaId/messageStanzaPtr` 的锚点对象。
+ * 返回:
+ * - 稳定字符串主键，失败时返回空串。
+ */
+function RX_recoveryMakePendingKey(route) {
+  try {
+    const r = route || {};
+    const uniqueKey = String(r.uniqueKey || "").trim();
+    if (uniqueKey) return "uk:" + uniqueKey;
+    const chatJID = String(r.chatJID || "").trim();
+    const stanzaId = String(r.stanzaId || "").trim();
+    if (chatJID && stanzaId) return "cs:" + chatJID + "|" + stanzaId;
+    const stanzaPtr = String(r.messageStanzaPtr || "").trim();
+    if (stanzaPtr && stanzaPtr !== "0x0") return "ptr:" + stanzaPtr;
+    return "";
+  } catch (_) {
+    return "";
+  }
+}
+
+/**
+ * 比较 pending 与 cache 条目的逻辑锚点，返回命中的匹配类型。
+ * 参数:
+ * - pending: 待补齐的 pending。
+ * - entry: helper 写入 cache 的条目。
+ * 返回:
+ * - 命中时返回匹配字符串，否则返回空串。
+ */
+function RX_recoveryMatchPendingWithEntry(pending, entry) {
+  try {
+    const p = pending || {};
+    const e = entry || {};
+    const pendingUniqueKey = String(p.uniqueKey || "").trim();
+    const entryUniqueKey = String(e.uniqueKey || "").trim();
+    if (pendingUniqueKey && entryUniqueKey && pendingUniqueKey === entryUniqueKey) return "uniqueKey";
+    const pendingChat = String(p.chatJID || "").trim();
+    const entryChat = String(e.chatJID || "").trim();
+    const pendingStanza = String(p.stanzaId || "").trim();
+    const entryStanza = String(e.stanzaId || "").trim();
+    if (pendingChat && entryChat && pendingStanza && entryStanza && pendingChat === entryChat && pendingStanza === entryStanza) {
+      return "chatJID+stanzaId";
+    }
+    const pendingPtr = String(p.messageStanzaPtr || "").trim();
+    const entryPtr = String(e.messageStanzaPtr || "").trim();
+    if (pendingPtr && entryPtr && pendingPtr !== "0x0" && pendingPtr === entryPtr) return "messageStanzaPtr";
+    return "";
+  } catch (_) {
+    return "";
+  }
+}
+
+/**
+ * 基于 cache 条目构造正式 protobuf 输出对象。
+ * 参数:
+ * - entry: `RX_RECOVERY_CACHE` 中的恢复材料条目。
+ * 返回:
+ * - `{ proto, parsed }`，失败时返回 `null`。
+ */
+function RX_recoveryBuildProtoFromCache(entry) {
+  try {
+    const row = entry || {};
+    const bytes = row.recoveryMaterialBytes || row.originalMessageDataBytes;
+    if (!bytes || !bytes.length) return null;
+    const b64 = RX_CONFIG.protobuf.alwaysEmitB64 ? RX_bytesToBase64(bytes) : "";
+    return {
+      proto: {
+        len: Math.max(0, Number(row.recoveryMaterialLen) || Number(row.originalMessageDataLen) || bytes.length || 0),
+        truncated: !!(row.recoveryMaterialTruncated || row.originalMessageDataTruncated),
+        b64: b64 || null,
+        hexChunks: null,
+      },
+      parsed: RX_extractPbFromProtoBytes(bytes),
+    };
+  } catch (_) {
+    return null;
+  }
+}
+
+/**
+ * 统一发出正式 `wa.recv.update` 事件，供主接收即时发出与 recovery 补齐共用。
+ * 参数:
+ * - payload: 已整理好的事件数据。
+ * 返回:
+ * - 无返回值，直接发送消息并维护命中统计。
+ */
+function RX_emitRecvUpdate(payload) {
+  try {
+    const p = payload || {};
+    const route = p.route || {};
+    const proto = p.protobuf || null;
+    const diag = p.diag || {};
+    const parsed = p.parsed || null;
+    const quoted = RX_buildQuotedRecvInfo(parsed);
+    try { RX_emitQuotedDiag(String(p.phase || "native_post_decrypt_pinned_style"), route, parsed, p.stanzaId); } catch (_) {}
+    send({
+      type: "wa.recv.update",
+      build: SCRIPT_BUILD_ID,
+      ts: Date.now(),
+      phase: String(p.phase || "native_post_decrypt_pinned_style"),
+      data: {
+        stanzaId: String(p.stanzaId || ""),
+        route: {
+          via: String(route.via || "native_post_decrypt"),
+          chatJID: String(route.chatJID || ""),
+          remoteChat: String(route.remoteChat || route.chatJID || ""),
+          participantJID: String(route.participantJID || ""),
+          statusAuthorJID: String(route.statusAuthorJID || ""),
+          isStatus: !!route.isStatus,
+          fromMe: !!route.fromMe,
+          isGroup: (route.isGroup === true || route.isGroup === false) ? route.isGroup : null,
+          uniqueKey: String(route.uniqueKey || ""),
+        },
+        protobuf: proto,
+        quoted: quoted,
+        diag: diag,
+        rawType: String(p.rawType || "wa.recv.native_post_decrypt.pinned_style"),
+      },
+    });
+    RX_STATE.hitsEmitted = (Number(RX_STATE.hitsEmitted) || 0) + 1;
+    if (RX_SAMPLE.enabled) {
+      send({
+        type: "qqw.sample",
+        event_id: 0,
+        device_id: "",
+        wa_version: RX_STATE.waVersion ? String(RX_STATE.waVersion) : "",
+        script_build: SCRIPT_BUILD_ID,
+        wa_event_type: "wa.recv.update",
+        chat_jid: String(route.chatJID || ""),
+        stanza_id: String(p.stanzaId || ""),
+        msg_kind: String(RX_SAMPLE.msg_kind || "unknown"),
+        quoted_kind: String(RX_SAMPLE.quoted_kind || "none"),
+        quoted_stanza_id: String(RX_SAMPLE.quoted_stanza_id || ""),
+        protobuf_len: proto ? (Number(proto.len) || 0) : 0,
+        protobuf_truncated: !!(proto && proto.truncated),
+        protobuf_b64: (proto && proto.b64) ? String(proto.b64) : "",
+      });
+    }
+  } catch (_) {}
+}
+
+/**
+ * 扫描 cache，按 `messageStanzaPtr` 为 pending 查找可立即复用的恢复材料。
+ * 参数:
+ * - pending: 待补齐的 pending 条目。
+ * 返回:
+ * - 命中时返回 `{ cacheKey, entry, match }`，否则返回 `null`。
+ */
+function RX_recoveryFindCacheMatchForPending(pending) {
+  try {
+    for (const [cacheKey, entry] of RX_RECOVERY_CACHE.entries()) {
+      const match = RX_recoveryMatchPendingWithEntry(pending, entry);
+      if (match) return { cacheKey: String(cacheKey || ""), entry: entry, match: match };
+    }
+    return null;
+  } catch (_) {
+    return null;
+  }
+}
+
+/**
+ * 用 cache 材料完成 pending 的最终补齐并发出唯一正式事件。
+ * 参数:
+ * - pendingKey: pending 主键。
+ * - pending: pending 条目。
+ * - cacheKey: 命中的 cache 主键。
+ * - entry: 命中的 cache 条目。
+ * - mode: 本次补齐模式，例如 `cache_hit` 或 `wait_hit`。
+ * - match: 本次命中的匹配依据。
+ * 返回:
+ * - 成功返回 `true`，失败返回 `false`。
+ */
+function RX_recoveryResolvePendingFromCache(pendingKey, pending, cacheKey, entry, mode, match) {
+  try {
+    const p = pending || {};
+    if (p.finalized) return false;
+    const built = RX_recoveryBuildProtoFromCache(entry);
+    if (!built || !built.proto) return false;
+    if (p.timeoutId) {
+      try { clearTimeout(p.timeoutId); } catch (_) {}
+    }
+    RX_emitRecvUpdate({
+      phase: "native_post_decrypt_pinned_style",
+      rawType: "wa.recv.native_post_decrypt.pinned_style",
+      stanzaId: String(p.stanzaId || ""),
+      route: p.route || {},
+      protobuf: built.proto,
+      parsed: built.parsed || null,
+      diag: {
+        cmdSel: p.cmdSel || null,
+        protobufSource: "recovery_cache_originalMessageData",
+        waVersion: RX_STATE.waVersion ? String(RX_STATE.waVersion) : null,
+        recovery: {
+          mode: String(mode || "wait_hit"),
+          pendingKey: String(pendingKey || ""),
+          cacheKey: String(cacheKey || ""),
+          match: String(match || ""),
+          waitMs: Math.max(0, Date.now() - (Number(p.rxTs) || Date.now())),
+          messageStanzaPtr: String(p.messageStanzaPtr || ""),
+          originalMessageDataLen: Math.max(0, Number(entry && entry.originalMessageDataLen) || 0),
+          sourceRva: String(entry && entry.sourceRva || ""),
+          helperWindow: RX_recoveryDiffHelperSnapshot(p.helperSnapshot),
+        },
+      },
+    });
+    p.finalized = true;
+    p.state = "recovered";
+    RX_RECOVERY_PENDING.delete(pendingKey);
+    RX_RECOVERY_RECENT_NULL.delete(String(pendingKey || ""));
+    RX_RECOVERY_CACHE.delete(cacheKey);
+    RX_RECOVERY_STATS.cacheHits = (Number(RX_RECOVERY_STATS.cacheHits) || 0) + 1;
+    RX_RECOVERY_STATS.pendingResolved = (Number(RX_RECOVERY_STATS.pendingResolved) || 0) + 1;
+    if (String(match || "").indexOf("same_window_") === 0) {
+      RX_RECOVERY_STATS.sameWindowResolved = (Number(RX_RECOVERY_STATS.sameWindowResolved) || 0) + 1;
+    }
+    if (String(mode || "") === "cache_hit") {
+      RX_RECOVERY_STATS.pendingImmediateCacheHit = (Number(RX_RECOVERY_STATS.pendingImmediateCacheHit) || 0) + 1;
+    }
+    RX_RECOVERY_STATS.lastResolve = {
+      atMs: Date.now(),
+      mode: String(mode || ""),
+      pendingKey: String(pendingKey || ""),
+      cacheKey: String(cacheKey || ""),
+      match: String(match || ""),
+      stanzaId: String(p.stanzaId || ""),
+      uniqueKey: String(p.uniqueKey || ""),
+      messageStanzaPtr: String(p.messageStanzaPtr || ""),
+    };
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+/**
+ * 在 pending 超时后按原始空包事件降级发出，保证外部只收到一条最终事件。
+ * 参数:
+ * - pendingKey: pending 主键。
+ * 返回:
+ * - 无返回值，内部负责删除 pending 并发送降级事件。
+ */
+function RX_recoveryExpirePending(pendingKey) {
+  try {
+    const key = String(pendingKey || "");
+    if (!key) return;
+    const p = RX_RECOVERY_PENDING.get(key);
+    if (!p || p.finalized) return;
+    p.finalized = true;
+    p.state = "expired";
+    RX_RECOVERY_PENDING.delete(key);
+    RX_RECOVERY_RECENT_NULL.delete(key);
+    RX_RECOVERY_STATS.pendingExpired = (Number(RX_RECOVERY_STATS.pendingExpired) || 0) + 1;
+    RX_RECOVERY_STATS.lastExpire = {
+      atMs: Date.now(),
+      pendingKey: key,
+      stanzaId: String(p.stanzaId || ""),
+      uniqueKey: String(p.uniqueKey || ""),
+      messageStanzaPtr: String(p.messageStanzaPtr || ""),
+    };
+    RX_emitRecvUpdate({
+      phase: "native_post_decrypt_pinned_style",
+      rawType: "wa.recv.native_post_decrypt.pinned_style",
+      stanzaId: String(p.stanzaId || ""),
+      route: p.route || {},
+      protobuf: null,
+      diag: {
+        cmdSel: p.cmdSel || null,
+        protobufSource: null,
+        waVersion: RX_STATE.waVersion ? String(RX_STATE.waVersion) : null,
+        recovery: {
+          mode: "timeout_fallback",
+          pendingKey: key,
+          waitMs: Math.max(0, Date.now() - (Number(p.rxTs) || Date.now())),
+          messageStanzaPtr: String(p.messageStanzaPtr || ""),
+          helperWindow: RX_recoveryDiffHelperSnapshot(p.helperSnapshot),
+        },
+      },
+    });
+  } catch (_) {}
+}
+
+/**
+ * 保持 pending 数量有界；若超过上限，强制刷出最老 pending，避免堆积。
+ * 参数:
+ * - 无。
+ * 返回:
+ * - 无返回值，必要时触发最老 pending 的超时降级。
+ */
+function RX_recoveryEnsurePendingCapacity() {
+  try {
+    const maxPending = Math.max(1, Number(RX_RECOVERY_CONFIG.maxPending) || 32);
+    if (RX_RECOVERY_PENDING.size < maxPending) return;
+    let oldestKey = "";
+    let oldestTs = 0;
+    for (const [k, v] of RX_RECOVERY_PENDING.entries()) {
+      const ts = Math.max(0, Number(v && v.rxTs) || 0);
+      if (!oldestKey || !oldestTs || ts < oldestTs) {
+        oldestKey = String(k || "");
+        oldestTs = ts;
+      }
+    }
+    if (!oldestKey) return;
+    RX_RECOVERY_STATS.pendingForcedFlush = (Number(RX_RECOVERY_STATS.pendingForcedFlush) || 0) + 1;
+    RX_recoveryExpirePending(oldestKey);
+  } catch (_) {}
+}
+
+/**
+ * 创建空包消息的 recovery pending；若 cache 已命中则立即补齐，否则进入短窗等待。
+ * 参数:
+ * - base: 主接收整理出的事件骨架。
+ * 返回:
+ * - `{ mode }`，其中 `mode` 为 `immediate_recovered`、`pending_wait` 或 `emit_now`。
+ */
+function RX_recoveryHandleNullProto(base) {
+  try {
+    const b = base || {};
+    const pendingKey = RX_recoveryMakePendingKey(b);
+    if (!pendingKey) return { mode: "emit_now" };
+    const pending = {
+      pendingKey: pendingKey,
+      rxTs: Math.max(0, Number(b.rxTs) || Date.now()),
+      tid: Math.max(0, Number(b.tid) || 0),
+      cmdSel: String(b.cmdSel || ""),
+      stanzaId: String(b.stanzaId || ""),
+      uniqueKey: String(b.uniqueKey || ""),
+      chatJID: String(b.chatJID || ""),
+      senderJID: String(b.senderJID || ""),
+      statusAuthorJID: String(b.statusAuthorJID || ""),
+      messageStanzaPtr: String(b.messageStanzaPtr || ""),
+      route: b.route || {},
+      helperSnapshot: RX_recoveryTakeHelperSnapshot(),
+      finalized: false,
+      state: "waiting",
+      timeoutId: null,
+    };
+    RX_recoveryRememberNullPending(pending);
+    RX_RECOVERY_STATS.nullProtoObserved = (Number(RX_RECOVERY_STATS.nullProtoObserved) || 0) + 1;
+    RX_RECOVERY_STATS.lastNullProto = {
+      atMs: Date.now(),
+      pendingKey: pendingKey,
+      stanzaId: String(b.stanzaId || ""),
+      uniqueKey: String(b.uniqueKey || ""),
+      messageStanzaPtr: String(b.messageStanzaPtr || ""),
+      helperSnapshot: pending.helperSnapshot,
+    };
+    const cacheHit = RX_recoveryFindCacheMatchForPending(pending);
+    if (cacheHit) {
+      const ok = RX_recoveryResolvePendingFromCache(pendingKey, pending, cacheHit.cacheKey, cacheHit.entry, "cache_hit", cacheHit.match);
+      if (ok) return { mode: "immediate_recovered", pendingKey: pendingKey };
+    }
+    RX_recoveryEnsurePendingCapacity();
+    const waitMs = Math.max(100, Number(RX_RECOVERY_CONFIG.pendingWaitMs) || 600);
+    pending.timeoutId = setTimeout(() => { try { RX_recoveryExpirePending(pendingKey); } catch (_) {} }, waitMs);
+    RX_RECOVERY_PENDING.set(pendingKey, pending);
+    RX_RECOVERY_STATS.pendingCreated = (Number(RX_RECOVERY_STATS.pendingCreated) || 0) + 1;
+    return { mode: "pending_wait", pendingKey: pendingKey };
+  } catch (_) {
+    return { mode: "emit_now" };
+  }
+}
+
+/**
+ * 当新的 cache 条目写入后，尝试用它匹配并补齐已存在的空包 pending。
+ * 参数:
+ * - cacheKey: 新写入的 cache 主键。
+ * - entry: 新写入的 cache 条目。
+ * 返回:
+ * - 成功补齐时返回 `true`，否则返回 `false`。
+ */
+function RX_recoveryTryResolvePendingByCacheEntry(cacheKey, entry) {
+  try {
+    for (const [pendingKey, pending] of RX_RECOVERY_PENDING.entries()) {
+      if (!pending || pending.finalized) continue;
+      const match = RX_recoveryMatchPendingWithEntry(pending, entry);
+      if (!match) continue;
+      return RX_recoveryResolvePendingFromCache(pendingKey, pending, cacheKey, entry, "wait_hit", match);
+    }
+    return false;
+  } catch (_) {
+    return false;
+  }
+}
+
+/**
+ * 清理 recovery cache 中过期或超量的条目，避免长期占用内存。
+ * 参数:
+ * - nowMs: 当前时间戳，毫秒。
+ * 返回:
+ * - 无返回值，直接原地更新 `RX_RECOVERY_CACHE`。
+ */
+function RX_recoverySweepCache(nowMs) {
+  try {
+    const now = Math.max(0, Number(nowMs) || Date.now());
+    const ttlMs = Math.max(1000, Number(RX_RECOVERY_CONFIG.ttlMs) || 30000);
+    const maxEntries = Math.max(1, Number(RX_RECOVERY_CONFIG.maxEntries) || 64);
+    for (const [k, v] of RX_RECOVERY_CACHE.entries()) {
+      const atMs = Math.max(0, Number(v && v.materialTs) || 0);
+      if (!atMs || (now - atMs) > ttlMs) {
+        RX_RECOVERY_CACHE.delete(k);
+        RX_RECOVERY_STATS.cacheExpired = (Number(RX_RECOVERY_STATS.cacheExpired) || 0) + 1;
+      }
+    }
+    if (RX_RECOVERY_CACHE.size <= maxEntries) return;
+    const xs = Array.from(RX_RECOVERY_CACHE.entries()).sort((a, b) => {
+      const aTs = Math.max(0, Number(a && a[1] && a[1].materialTs) || 0);
+      const bTs = Math.max(0, Number(b && b[1] && b[1].materialTs) || 0);
+      return aTs - bTs;
+    });
+    while (RX_RECOVERY_CACHE.size > maxEntries && xs.length) {
+      const row = xs.shift();
+      if (!row) break;
+      RX_RECOVERY_CACHE.delete(row[0]);
+      RX_RECOVERY_STATS.cacheEvicted = (Number(RX_RECOVERY_STATS.cacheEvicted) || 0) + 1;
+    }
+  } catch (_) {}
+}
+
+/**
+ * 生成 recovery cache 的内部临时键，阶段 3 仅用于去重与存储。
+ * 参数:
+ * - entry: 待写入的 recovery 材料条目。
+ * 返回:
+ * - 字符串形式的临时 cache key。
+ */
+function RX_recoveryMakeCacheKey(entry) {
+  try {
+    const e = entry || {};
+    const uniqueKey = String(e.uniqueKey || "").trim();
+    if (uniqueKey) return "uk:" + uniqueKey;
+    const chatJID = String(e.chatJID || "").trim();
+    const stanzaId = String(e.stanzaId || "").trim();
+    if (chatJID && stanzaId) return "cs:" + chatJID + "|" + stanzaId;
+    const stanzaPtr = String(e.messageStanzaPtr || "0x0");
+    const origPtr = String(e.recoveryMaterialPtr || e.originalMessageDataPtr || "0x0");
+    const selfPtr = String(e.selfPtr || "0x0");
+    if (stanzaPtr !== "0x0" && origPtr !== "0x0") return "stanza:" + stanzaPtr + "|orig:" + origPtr;
+    if (origPtr !== "0x0" && selfPtr !== "0x0") return "orig:" + origPtr + "|self:" + selfPtr;
+    if (origPtr !== "0x0") return "orig:" + origPtr;
+    if (stanzaPtr !== "0x0") return "stanza:" + stanzaPtr;
+    return "fallback:" + selfPtr + "|" + String(e.materialTs || Date.now());
+  } catch (_) {
+    return "fallback:0x0|" + String(Date.now());
+  }
+}
+
+/**
+ * 将 recovery helper 上抓到的恢复材料写入内部 cache。
+ * 参数:
+ * - entry: 已构造好的恢复材料条目。
+ * 返回:
+ * - 成功时返回写入后的 cache key，失败时返回空串。
+ */
+function RX_recoveryCacheUpsert(entry) {
+  try {
+    const materialBytes = entry && (entry.recoveryMaterialBytes || entry.originalMessageDataBytes);
+    if (!entry || !materialBytes || materialBytes.length <= 0) return "";
+    RX_recoverySweepCache(Date.now());
+    const cacheKey = RX_recoveryMakeCacheKey(entry);
+    const row = Object.assign({}, entry, { cacheKey: cacheKey });
+    RX_RECOVERY_CACHE.set(cacheKey, row);
+    RX_RECOVERY_STATS.cacheWrites = (Number(RX_RECOVERY_STATS.cacheWrites) || 0) + 1;
+    RX_recoveryRecordHelperEvent(row.sourceRva, "write", {
+      helperName: row.helperName,
+      symbol: row.source,
+      cacheKey: cacheKey,
+      messageStanzaPtr: row.messageStanzaPtr,
+      originalMessageDataLen: Math.max(0, Number(row.originalMessageDataLen) || 0),
+      recoveryMaterialSource: String(row.recoveryMaterialSource || ""),
+      recoveryMaterialLen: Math.max(0, Number(row.recoveryMaterialLen) || 0),
+      recoveryMaterialPtr: String(row.recoveryMaterialPtr || "0x0"),
+      recoveryMaterialSelector: String(row.recoveryMaterialSelector || ""),
+    });
+    RX_RECOVERY_STATS.lastWrite = {
+      atMs: Math.max(0, Number(row.materialTs) || Date.now()),
+      cacheKey: cacheKey,
+      messageStanzaPtr: String(row.messageStanzaPtr || "0x0"),
+      originalMessageDataPtr: String(row.originalMessageDataPtr || "0x0"),
+      originalMessageDataLen: Math.max(0, Number(row.originalMessageDataLen) || 0),
+      recoveryMaterialSource: String(row.recoveryMaterialSource || ""),
+      recoveryMaterialPtr: String(row.recoveryMaterialPtr || "0x0"),
+      recoveryMaterialLen: Math.max(0, Number(row.recoveryMaterialLen) || 0),
+      recoveryMaterialSelector: String(row.recoveryMaterialSelector || ""),
+      truncated: !!(row.recoveryMaterialTruncated || row.originalMessageDataTruncated),
+      samplePrefixB64: String(row.samplePrefixB64 || ""),
+      source: String(row.source || ""),
+    };
+    try { RX_recoveryTryResolvePendingByCacheEntry(cacheKey, row); } catch (_) {}
+    return cacheKey;
+  } catch (_) {
+    RX_RECOVERY_STATS.cacheDrops = (Number(RX_RECOVERY_STATS.cacheDrops) || 0) + 1;
+    return "";
+  }
+}
+
+/**
+ * 安装 recovery helper 集合，只写内部 cache，不触发外部事件。
+ * 参数:
+ * - mod: 已解析的 WhatsApp 模块对象。
+ * 返回:
+ * - 成功时返回 `true`，失败时返回 `false`。
+ */
+function RX_parallelMergeMakeKey(base) {
+  try {
+    const b = base || {};
+    const uniqueKey = String(b.uniqueKey || "").trim();
+    if (uniqueKey) return "uk:" + uniqueKey;
+    const chatJID = String(b.chatJID || "").trim();
+    const stanzaId = String(b.stanzaId || "").trim();
+    if (chatJID && stanzaId) return "cs:" + chatJID + "|" + stanzaId;
+    const messageStanzaPtr = String(b.messageStanzaPtr || "").trim();
+    if (messageStanzaPtr && messageStanzaPtr !== "0x0") return "mp:" + messageStanzaPtr;
+    return "";
+  } catch (_) {
+    return "";
+  }
+}
+
+function RX_parallelMergeSweep(nowMs) {
+  try {
+    const now = Math.max(0, Number(nowMs) || Date.now());
+    const ttlMs = Math.max(200, Number(RX_RECOVERY_CONFIG.helperTtlMs) || 1500);
+    const maxEntries = Math.max(1, Number(RX_RECOVERY_CONFIG.maxEntries) || 64);
+    for (const [key, row] of RX_PARALLEL_MERGE_ROWS.entries()) {
+      const lastAt = Math.max(0, Number(row && row.lastAt) || 0);
+      if (!lastAt || (now - lastAt) > ttlMs) {
+        try {
+          if (row && row.timeoutId) clearTimeout(row.timeoutId);
+        } catch (_) {}
+        RX_PARALLEL_MERGE_ROWS.delete(key);
+      }
+    }
+    if (RX_PARALLEL_MERGE_ROWS.size <= maxEntries) return;
+    const rows = Array.from(RX_PARALLEL_MERGE_ROWS.entries()).sort((a, b) => {
+      const aTs = Math.max(0, Number(a && a[1] && a[1].lastAt) || 0);
+      const bTs = Math.max(0, Number(b && b[1] && b[1].lastAt) || 0);
+      return aTs - bTs;
+    });
+    while (RX_PARALLEL_MERGE_ROWS.size > maxEntries && rows.length) {
+      const row = rows.shift();
+      if (!row) break;
+      try {
+        if (row[1] && row[1].timeoutId) clearTimeout(row[1].timeoutId);
+      } catch (_) {}
+      RX_PARALLEL_MERGE_ROWS.delete(String(row[0] || ""));
+    }
+  } catch (_) {}
+}
+
+function RX_parallelMergeGetRow(key, createIfMissing) {
+  try {
+    const mergeKey = String(key || "");
+    if (!mergeKey) return null;
+    let row = RX_PARALLEL_MERGE_ROWS.get(mergeKey) || null;
+    if (!row && createIfMissing) {
+      row = { key: mergeKey, createdAt: Date.now(), lastAt: Date.now(), main: null, helper: null, timeoutId: null };
+      RX_PARALLEL_MERGE_ROWS.set(mergeKey, row);
+    }
+    if (row) row.lastAt = Date.now();
+    return row;
+  } catch (_) {
+    return null;
+  }
+}
+
+function RX_parallelMergeDelete(key) {
+  try {
+    const mergeKey = String(key || "");
+    const row = mergeKey ? RX_PARALLEL_MERGE_ROWS.get(mergeKey) : null;
+    if (row && row.timeoutId) {
+      try { clearTimeout(row.timeoutId); } catch (_) {}
+    }
+    if (mergeKey) RX_PARALLEL_MERGE_ROWS.delete(mergeKey);
+  } catch (_) {}
+}
+
+function RX_parallelBuildProto(bytes, totalLen, truncated) {
+  try {
+    if (!bytes || !bytes.length) return null;
+    const b64 = RX_CONFIG.protobuf.alwaysEmitB64 ? RX_bytesToBase64(bytes) : "";
+    return {
+      len: Math.max(0, Number(totalLen) || bytes.length || 0),
+      truncated: !!truncated,
+      b64: b64 || null,
+      hexChunks: null,
+    };
+  } catch (_) {
+    return null;
+  }
+}
+
+function RX_parallelEmitHelperResult(row, mode) {
+  try {
+    const r = row || {};
+    if (!r.main || !r.helper || !r.helper.proto) return false;
+    const base = r.main.base || {};
+    const helper = r.helper;
+    RX_emitRecvUpdate({
+      phase: "native_post_decrypt_pinned_style",
+      rawType: "wa.recv.native_post_decrypt.pinned_style",
+      stanzaId: String(base.stanzaId || ""),
+      route: base.route || {},
+      protobuf: helper.proto,
+      parsed: helper.parsed || null,
+      diag: {
+        cmdSel: base.cmdSel ? String(base.cmdSel) : null,
+        protobufSource: helper.protobufSource ? String(helper.protobufSource) : null,
+        waVersion: RX_STATE.waVersion ? String(RX_STATE.waVersion) : null,
+      },
+    });
+    RX_RECOVERY_STATS.helperConsumed = (Number(RX_RECOVERY_STATS.helperConsumed) || 0) + 1;
+    RX_RECOVERY_STATS.mergeResolved = (Number(RX_RECOVERY_STATS.mergeResolved) || 0) + 1;
+    RX_RECOVERY_STATS.lastResolve = {
+      atMs: Date.now(),
+      mode: String(mode || "helper_parallel_hit"),
+      pendingKey: String(r.key || ""),
+      stanzaId: String(base.stanzaId || ""),
+      uniqueKey: String(base.uniqueKey || ""),
+      messageStanzaPtr: String(base.messageStanzaPtr || ""),
+      helperRva: String(helper.sourceRva || ""),
+      protobufSource: String(helper.protobufSource || ""),
+    };
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+function RX_parallelExpireMainWait(key) {
+  try {
+    const row = RX_PARALLEL_MERGE_ROWS.get(String(key || ""));
+    if (!row || !row.main) return;
+    if (row.helper && row.helper.proto) {
+      const ok = RX_parallelEmitHelperResult(row, "helper_after_wait");
+      RX_parallelMergeDelete(key);
+      if (ok) return;
+    }
+    const base = row.main.base || {};
+    RX_emitRecvUpdate({
+      phase: "native_post_decrypt_pinned_style",
+      rawType: "wa.recv.native_post_decrypt.pinned_style",
+      stanzaId: String(base.stanzaId || ""),
+      route: base.route || {},
+      protobuf: null,
+      diag: {
+        cmdSel: base.cmdSel ? String(base.cmdSel) : null,
+        protobufSource: null,
+        waVersion: RX_STATE.waVersion ? String(RX_STATE.waVersion) : null,
+      },
+    });
+    RX_RECOVERY_STATS.mergeExpired = (Number(RX_RECOVERY_STATS.mergeExpired) || 0) + 1;
+    RX_RECOVERY_STATS.lastExpire = {
+      atMs: Date.now(),
+      pendingKey: String(key || ""),
+      stanzaId: String(base.stanzaId || ""),
+      uniqueKey: String(base.uniqueKey || ""),
+      messageStanzaPtr: String(base.messageStanzaPtr || ""),
+    };
+    RX_parallelMergeDelete(key);
+  } catch (_) {}
+}
+
+function RX_parallelHandleMainNull(base) {
+  try {
+    const eventBase = base || {};
+    const key = RX_parallelMergeMakeKey(eventBase);
+    if (!key) {
+      return { mode: "emit_now", key: "" };
+    }
+    RX_parallelMergeSweep(Date.now());
+    const row = RX_parallelMergeGetRow(key, true);
+    if (!row) return { mode: "emit_now", key: key };
+    row.main = { base: eventBase, atMs: Date.now() };
+    row.lastAt = Date.now();
+    RX_RECOVERY_STATS.nullProtoObserved = (Number(RX_RECOVERY_STATS.nullProtoObserved) || 0) + 1;
+    RX_RECOVERY_STATS.mergeCreated = (Number(RX_RECOVERY_STATS.mergeCreated) || 0) + 1;
+    RX_RECOVERY_STATS.lastMainNull = {
+      atMs: Date.now(),
+      pendingKey: key,
+      stanzaId: String(eventBase.stanzaId || ""),
+      uniqueKey: String(eventBase.uniqueKey || ""),
+      messageStanzaPtr: String(eventBase.messageStanzaPtr || ""),
+    };
+    if (row.helper && row.helper.proto) {
+      const ok = RX_parallelEmitHelperResult(row, "helper_buffer_hit");
+      RX_parallelMergeDelete(key);
+      return { mode: ok ? "helper_hit" : "emit_now", key: key };
+    }
+    if (row.timeoutId) {
+      try { clearTimeout(row.timeoutId); } catch (_) {}
+    }
+    const waitMs = Math.max(80, Number(RX_RECOVERY_CONFIG.mainWaitMs) || 350);
+    row.timeoutId = setTimeout(() => { try { RX_parallelExpireMainWait(key); } catch (_) {} }, waitMs);
+    return { mode: "wait_helper", key: key };
+  } catch (_) {
+    return { mode: "emit_now", key: "" };
+  }
+}
+
+function RX_parallelReadHelperCandidate(dataFromProtobufPtr, originalMessageDataPtr) {
+  try {
+    let dataFromProtobuf = RX_crossThreadCFDataReadAll(dataFromProtobufPtr, RX_RECOVERY_CONFIG.readHardCapBytes);
+    if (dataFromProtobuf && dataFromProtobuf.present && (!dataFromProtobuf.bytes || dataFromProtobuf.bytes.length <= 0) && String(dataFromProtobuf.className || "") === "WAPBMessage") {
+      dataFromProtobuf = RX_tryReadProtobufObjectMaterial(dataFromProtobufPtr, RX_RECOVERY_CONFIG.readHardCapBytes);
+    }
+    const original = RX_crossThreadCFDataReadAll(originalMessageDataPtr, RX_RECOVERY_CONFIG.readHardCapBytes);
+    const dataOk = !!(dataFromProtobuf && dataFromProtobuf.present && dataFromProtobuf.bytes && dataFromProtobuf.bytes.length > 0);
+    const origOk = !!(original && original.present && original.bytes && original.bytes.length > 0);
+    const chosen = dataOk ? dataFromProtobuf : (origOk ? original : null);
+    const source = dataOk ? "helper.dataFromProtobuf" : (origOk ? "helper.originalMessageData" : "none");
+    const bytes = chosen && chosen.bytes ? chosen.bytes : null;
+    return {
+      ok: !!(chosen && bytes && bytes.length),
+      source: source,
+      material: chosen,
+      dataFromProtobuf: dataFromProtobuf,
+      originalMessageData: original,
+      proto: bytes ? RX_parallelBuildProto(bytes, chosen.totalBytes, chosen.truncated) : null,
+    };
+  } catch (e) {
+    return {
+      ok: false,
+      source: "none",
+      material: null,
+      dataFromProtobuf: null,
+      originalMessageData: null,
+      proto: null,
+      error: String(e),
+    };
+  }
+}
+
+function RX_installParallelHelperHook(mod) {
+  try {
+    if (!RX_RECOVERY_CONFIG.enabled) return false;
+    if (!mod || !mod.base) throw new Error("module not found");
+    if (RX_RECOVERY_STATS.installed) return true;
+    const helper = RX_RECOVERY_CONFIG.helper || {};
+    const helperKey = RX_recoveryNormalizeHelperKey(helper.sourceRva || helper.rva);
+    const addr = mod.base.add(Number(helper.rva) || 0);
+    Interceptor.attach(addr, {
+      onEnter(args) {
+        try {
+          RX_parallelMergeSweep(Date.now());
+          const dataFromProtobufPtr = RX_recoveryPtr(args[2]);
+          const originalMessageDataPtr = RX_recoveryPtr(args[3]);
+          const messageStanzaPtr = RX_recoveryPtr(args[4]);
+          const stanza = RX_extractStanzaFieldsFromStanzaPtr(messageStanzaPtr);
+          const base = {
+            stanzaId: stanza.stanzaId ? String(stanza.stanzaId) : "",
+            uniqueKey: stanza.uniqueKey ? String(stanza.uniqueKey) : "",
+            chatJID: stanza.chatJID ? String(stanza.chatJID) : "",
+            senderJID: stanza.senderJID ? String(stanza.senderJID) : "",
+            statusAuthorJID: stanza.statusAuthorJID ? String(stanza.statusAuthorJID) : "",
+            messageStanzaPtr: String(stanza.messageStanzaPtr || messageStanzaPtr || "0x0"),
+          };
+          const key = RX_parallelMergeMakeKey(base);
+          RX_recoveryRecordHelperEvent(helperKey, "hit", {
+            helperName: helper.helperName,
+            symbol: helper.symbol,
+            messageStanzaPtr: String(base.messageStanzaPtr || ""),
+          });
+          const picked = RX_parallelReadHelperCandidate(dataFromProtobufPtr, originalMessageDataPtr);
+          if (!picked.ok || !picked.proto) {
+            RX_RECOVERY_STATS.helperDrops = (Number(RX_RECOVERY_STATS.helperDrops) || 0) + 1;
+            RX_recoveryRecordHelperEvent(helperKey, "empty_drop", {
+              helperName: helper.helperName,
+              symbol: helper.symbol,
+              messageStanzaPtr: String(base.messageStanzaPtr || ""),
+              originalMessageDataLen: Math.max(0, Number(picked.originalMessageData && picked.originalMessageData.totalBytes) || 0),
+              originalMessageDataReason: picked.originalMessageData && picked.originalMessageData.reason ? String(picked.originalMessageData.reason) : "",
+              originalMessageDataKind: picked.originalMessageData && picked.originalMessageData.kind ? String(picked.originalMessageData.kind) : "",
+              originalMessageDataClassName: picked.originalMessageData && picked.originalMessageData.className ? String(picked.originalMessageData.className) : "",
+              originalMessageDataPtr: picked.originalMessageData && picked.originalMessageData.ptr ? String(picked.originalMessageData.ptr) : String(originalMessageDataPtr || "0x0"),
+              originalMessageDataError: picked.originalMessageData && picked.originalMessageData.error ? String(picked.originalMessageData.error) : "",
+              recoveryMaterialSource: String(picked.source || "none"),
+              recoveryMaterialLen: Math.max(0, Number(picked.dataFromProtobuf && picked.dataFromProtobuf.totalBytes) || 0),
+              recoveryMaterialReason: picked.dataFromProtobuf && picked.dataFromProtobuf.reason ? String(picked.dataFromProtobuf.reason) : "",
+              recoveryMaterialKind: picked.dataFromProtobuf && picked.dataFromProtobuf.kind ? String(picked.dataFromProtobuf.kind) : "",
+              recoveryMaterialClassName: picked.dataFromProtobuf && picked.dataFromProtobuf.className ? String(picked.dataFromProtobuf.className) : "",
+              recoveryMaterialPtr: picked.dataFromProtobuf && picked.dataFromProtobuf.ptr ? String(picked.dataFromProtobuf.ptr) : String(dataFromProtobufPtr || "0x0"),
+              recoveryMaterialError: picked.dataFromProtobuf && picked.dataFromProtobuf.error ? String(picked.dataFromProtobuf.error) : (picked.error ? String(picked.error) : ""),
+              recoveryMaterialSelector: picked.dataFromProtobuf && picked.dataFromProtobuf.selector ? String(picked.dataFromProtobuf.selector) : "",
+            });
+            return;
+          }
+          RX_RECOVERY_STATS.helperProtoStored = (Number(RX_RECOVERY_STATS.helperProtoStored) || 0) + 1;
+          RX_RECOVERY_STATS.lastHelper = {
+            atMs: Date.now(),
+            pendingKey: String(key || ""),
+            stanzaId: String(base.stanzaId || ""),
+            uniqueKey: String(base.uniqueKey || ""),
+            messageStanzaPtr: String(base.messageStanzaPtr || ""),
+            helperRva: String(helper.sourceRva || ""),
+            protobufSource: String(picked.source || ""),
+          };
+          RX_RECOVERY_STATS.lastWrite = {
+            atMs: Date.now(),
+            pendingKey: String(key || ""),
+            stanzaId: String(base.stanzaId || ""),
+            uniqueKey: String(base.uniqueKey || ""),
+            messageStanzaPtr: String(base.messageStanzaPtr || ""),
+            helperRva: String(helper.sourceRva || ""),
+            protobufSource: String(picked.source || ""),
+          };
+          RX_recoveryRecordHelperEvent(helperKey, "write", {
+            helperName: helper.helperName,
+            symbol: helper.symbol,
+            messageStanzaPtr: String(base.messageStanzaPtr || ""),
+            cacheKey: String(key || ""),
+            recoveryMaterialLen: Math.max(0, Number(picked.material && picked.material.totalBytes) || 0),
+            recoveryMaterialSource: String(picked.source || ""),
+            recoveryMaterialKind: picked.material && picked.material.kind ? String(picked.material.kind) : "",
+            recoveryMaterialReason: picked.material && picked.material.reason ? String(picked.material.reason) : "",
+            recoveryMaterialClassName: picked.material && picked.material.className ? String(picked.material.className) : "",
+            recoveryMaterialPtr: picked.material && picked.material.ptr ? String(picked.material.ptr) : "",
+            recoveryMaterialSelector: picked.material && picked.material.selector ? String(picked.material.selector) : "",
+          });
+          if (!key) return;
+          const row = RX_parallelMergeGetRow(key, true);
+          if (!row) return;
+          row.helper = {
+            atMs: Date.now(),
+            proto: picked.proto,
+            protobufSource: String(picked.source || ""),
+            sourceRva: String(helper.sourceRva || ""),
+            helperName: String(helper.helperName || ""),
+          };
+          row.lastAt = Date.now();
+          if (row.main) {
+            RX_parallelEmitHelperResult(row, "helper_after_main");
+            RX_parallelMergeDelete(key);
+          }
+        } catch (e) {
+          RX_recoveryRecordHelperEvent(helperKey, "error", {
+            helperName: helper.helperName,
+            symbol: helper.symbol,
+            error: String(e),
+          });
+        }
+      },
+    });
+    RX_RECOVERY_STATS.helperInstalledCount = 1;
+    RX_RECOVERY_STATS.installed = true;
+    RX_RECOVERY_STATS.installedAt = String(addr);
+    RX_RECOVERY_STATS.installError = "";
+    RX_recoveryRecordHelperEvent(helperKey, "install", {
+      helperName: helper.helperName,
+      symbol: helper.symbol,
+      installed: true,
+      installAddr: String(addr),
+      installError: "",
+    });
+    return true;
+  } catch (e) {
+    RX_RECOVERY_STATS.installed = false;
+    RX_RECOVERY_STATS.installError = String(e);
+    return false;
+  }
+}
 
 function RX_shouldAutoRead(chatJid, stanzaId, senderJid, isGroup, fromMe) {
   try {
@@ -5387,6 +9919,13 @@ function RX_installObjCBySelectors(selectors) {
               const uniqueKey = stanza.uniqueKey ? String(stanza.uniqueKey) : "";
               const isStatus = (chatJID || "").toLowerCase() === "status@broadcast";
               const participantJID = isStatus ? statusAuthorJID : senderJID;
+              const quoted = RX_buildQuotedRecvInfo(parsed);
+              try {
+                RX_emitQuotedDiag("objc_post_decrypt_pinned_style", {
+                  chatJID: chatJID,
+                  isStatus: isStatus,
+                }, parsed, stanzaId);
+              } catch (_) {}
               send({
                 type: "wa.recv.update",
                 build: SCRIPT_BUILD_ID,
@@ -5406,6 +9945,7 @@ function RX_installObjCBySelectors(selectors) {
                     uniqueKey: uniqueKey,
                   },
                   protobuf: proto,
+                  quoted: quoted,
                   pb: parsed,
                   diag: { cmdSel: cmdSel ? String(cmdSel) : null, protobufSource: proto ? source : null, waVersion: RX_STATE.waVersion ? String(RX_STATE.waVersion) : null },
                   rawType: "wa.recv.objc_post_decrypt.pinned_style",
@@ -5508,54 +10048,64 @@ function RX_install() {
               const uniqueKey = stanza.uniqueKey ? String(stanza.uniqueKey) : "";
               const isStatus = (chatJID || "").toLowerCase() === "status@broadcast";
               const participantJID = isStatus ? statusAuthorJID : senderJID;
-
               try {
                 const tid = Process.getCurrentThreadId();
             if (reentry[tid] && typeof reentry[tid] === "object") {
               reentry[tid].autoRead = { chatJID: chatJID, stanzaId: stanzaId, senderJID: senderJID, isGroup: isGroup, fromMe: fromMe };
                 }
               } catch (_) {}
-              send({
-                type: "wa.recv.update",
-                build: SCRIPT_BUILD_ID,
-                ts: Date.now(),
-                phase: "native_post_decrypt_pinned_style",
-                data: {
-                  stanzaId: stanzaId,
-                  route: {
-                    via: "native_post_decrypt",
-                    chatJID: chatJID,
-                    remoteChat: chatJID,
-                    participantJID: participantJID,
-                    statusAuthorJID: statusAuthorJID,
-                    isStatus: isStatus,
-                    fromMe: fromMe === true,
-                    isGroup: isGroup,
-                    uniqueKey: uniqueKey,
-                  },
-                  protobuf: proto,
-                  diag: { cmdSel: cmdSel ? String(cmdSel) : null, protobufSource: proto ? source : null, waVersion: RX_STATE.waVersion ? String(RX_STATE.waVersion) : null },
+              const route = {
+                via: "native_post_decrypt",
+                chatJID: chatJID,
+                remoteChat: chatJID,
+                participantJID: participantJID,
+                statusAuthorJID: statusAuthorJID,
+                isStatus: isStatus,
+                fromMe: fromMe === true,
+                isGroup: isGroup,
+                uniqueKey: uniqueKey,
+              };
+              const eventBase = {
+                rxTs: now,
+                tid: tid,
+                cmdSel: cmdSel ? String(cmdSel) : "",
+                stanzaId: stanzaId,
+                uniqueKey: uniqueKey,
+                chatJID: chatJID,
+                senderJID: senderJID,
+                statusAuthorJID: statusAuthorJID,
+                messageStanzaPtr: String(stanza.messageStanzaPtr || "0x0"),
+                route: route,
+              };
+              const mergeKey = RX_parallelMergeMakeKey(eventBase);
+              const hasProtoBytes = !!(bytes && bytes.length);
+              if (hasProtoBytes) {
+                if (mergeKey) RX_parallelMergeDelete(mergeKey);
+                RX_emitRecvUpdate({
+                  phase: "native_post_decrypt_pinned_style",
                   rawType: "wa.recv.native_post_decrypt.pinned_style",
-                },
-              });
-              RX_STATE.hitsEmitted = (Number(RX_STATE.hitsEmitted) || 0) + 1;
-              if (RX_SAMPLE.enabled) {
-                send({
-                  type: "qqw.sample",
-                  event_id: 0,
-                  device_id: "",
-                  wa_version: RX_STATE.waVersion ? String(RX_STATE.waVersion) : "",
-                  script_build: SCRIPT_BUILD_ID,
-                  wa_event_type: "wa.recv.update",
-                  chat_jid: chatJID,
-                  stanza_id: stanzaId,
-                  msg_kind: String(RX_SAMPLE.msg_kind || "unknown"),
-                  quoted_kind: String(RX_SAMPLE.quoted_kind || "none"),
-                  quoted_stanza_id: String(RX_SAMPLE.quoted_stanza_id || ""),
-                  protobuf_len: data ? (data.totalLen | 0) : 0,
-                  protobuf_truncated: !!(data && data.truncated),
-                  protobuf_b64: b64 || ""
+                  stanzaId: stanzaId,
+                  route: route,
+                  protobuf: proto,
+                  parsed: parsed,
+                  diag: { cmdSel: cmdSel ? String(cmdSel) : null, protobufSource: proto ? source : null, waVersion: RX_STATE.waVersion ? String(RX_STATE.waVersion) : null },
                 });
+              } else {
+                const recovery = RX_parallelHandleMainNull(eventBase);
+                if (recovery.mode === "emit_now") {
+                  RX_emitRecvUpdate({
+                    phase: "native_post_decrypt_pinned_style",
+                    rawType: "wa.recv.native_post_decrypt.pinned_style",
+                    stanzaId: stanzaId,
+                    route: route,
+                    protobuf: null,
+                    diag: {
+                      cmdSel: cmdSel ? String(cmdSel) : null,
+                      protobufSource: null,
+                      waVersion: RX_STATE.waVersion ? String(RX_STATE.waVersion) : null,
+                    },
+                  });
+                }
               }
             } catch (_) {}
           };
@@ -5577,6 +10127,8 @@ function RX_install() {
         } catch (_) {}
       },
     });
+
+    try { RX_installParallelHelperHook(mod); } catch (_) {}
 
     RX_STATE.installed = true;
     RX_STATE.installedAt = String(addr);
@@ -5629,6 +10181,37 @@ setInterval(() => {
         ok: RX_AUTO_READ_STATS.ok | 0,
         fail: RX_AUTO_READ_STATS.fail | 0,
         last: RX_AUTO_READ_STATS.last || null,
+      },
+      statusAction: {
+        recvHits: Number(STATUS_ACTION_DIAG.recvHits) || 0,
+        waitReadyHits: Number(STATUS_ACTION_DIAG.waitReadyHits) || 0,
+        resultEmitHits: Number(STATUS_ACTION_DIAG.resultEmitHits) || 0,
+        resultEmitOk: Number(STATUS_ACTION_DIAG.resultEmitOk) || 0,
+        resultEmitFail: Number(STATUS_ACTION_DIAG.resultEmitFail) || 0,
+        loopErrors: Number(STATUS_ACTION_DIAG.loopErrors) || 0,
+        lastAt: Number(STATUS_ACTION_DIAG.lastAt) || 0,
+        lastStage: STATUS_ACTION_DIAG.lastStage ? String(STATUS_ACTION_DIAG.lastStage) : "",
+        lastOpId: STATUS_ACTION_DIAG.lastOpId ? String(STATUS_ACTION_DIAG.lastOpId) : "",
+        lastTaskId: STATUS_ACTION_DIAG.lastTaskId ? String(STATUS_ACTION_DIAG.lastTaskId) : "",
+        lastInstanceId: STATUS_ACTION_DIAG.lastInstanceId ? String(STATUS_ACTION_DIAG.lastInstanceId) : "",
+        lastAction: STATUS_ACTION_DIAG.lastAction ? String(STATUS_ACTION_DIAG.lastAction) : "",
+        lastChatJid: STATUS_ACTION_DIAG.lastChatJid ? String(STATUS_ACTION_DIAG.lastChatJid) : "",
+        lastStatusStanzaId: STATUS_ACTION_DIAG.lastStatusStanzaId ? String(STATUS_ACTION_DIAG.lastStatusStanzaId) : "",
+        lastParticipantJid: STATUS_ACTION_DIAG.lastParticipantJid ? String(STATUS_ACTION_DIAG.lastParticipantJid) : "",
+        lastOk: STATUS_ACTION_DIAG.lastOk,
+        lastError: STATUS_ACTION_DIAG.lastError ? String(STATUS_ACTION_DIAG.lastError) : "",
+        lastUsed: STATUS_ACTION_DIAG.lastUsed ? String(STATUS_ACTION_DIAG.lastUsed) : "",
+      },
+      quotedRx: {
+        hits: Number(RX_QUOTED_DIAG.hits) || 0,
+        lastAt: Number(RX_QUOTED_DIAG.lastAt) || 0,
+        lastPhase: RX_QUOTED_DIAG.lastPhase ? String(RX_QUOTED_DIAG.lastPhase) : "",
+        lastRouteChatJid: RX_QUOTED_DIAG.lastRouteChatJid ? String(RX_QUOTED_DIAG.lastRouteChatJid) : "",
+        lastRouteIsStatus: !!RX_QUOTED_DIAG.lastRouteIsStatus,
+        lastQuotedChatJid: RX_QUOTED_DIAG.lastQuotedChatJid ? String(RX_QUOTED_DIAG.lastQuotedChatJid) : "",
+        lastQuotedStanzaId: RX_QUOTED_DIAG.lastQuotedStanzaId ? String(RX_QUOTED_DIAG.lastQuotedStanzaId) : "",
+        lastQuotedTextLen: Number(RX_QUOTED_DIAG.lastQuotedTextLen) || 0,
+        lastQuotedStatusHint: !!RX_QUOTED_DIAG.lastQuotedStatusHint,
       },
     });
   } catch (_) {}

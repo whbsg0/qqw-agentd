@@ -2103,6 +2103,56 @@ func (a *Agent) emitTxSendResult(opId string, kind string, jid string, ok bool, 
 	a.eventQueue.Enqueue(b)
 }
 
+// emitTxAvatarURLResult 向本地事件队列补发头像 URL 查询结果，确保 worker 能推进 accepted 状态。
+// 参数：opId 为操作 ID；jid 为目标 JID；ok 表示是否成功；avatarURL 为成功时的地址；errMsg 为失败描述。
+// 返回：无。
+func (a *Agent) emitTxAvatarURLResult(opId string, jid string, ok bool, avatarURL string, errMsg string) {
+	opId = strings.TrimSpace(opId)
+	jid = strings.TrimSpace(jid)
+	if opId == "" || jid == "" {
+		return
+	}
+	b, _ := json.Marshal(map[string]any{
+		"type":      "wa.tx.avatar_url.result",
+		"build":     "agentd",
+		"ts":        time.Now().UnixMilli(),
+		"opId":      opId,
+		"op_id":     opId,
+		"jid":       jid,
+		"ok":        ok,
+		"avatarUrl": strings.TrimSpace(avatarURL),
+		"error":     strings.TrimSpace(errMsg),
+	})
+	a.eventQueue.Enqueue(b)
+}
+
+// waitRunnerScriptReady 轮询 runner 健康接口，直到脚本 ready 或等待超时。
+// 参数：timeoutMs 为最长等待毫秒数。
+// 返回：runner 脚本 ready 时返回 nil；否则返回最后一次健康检查错误。
+func (a *Agent) waitRunnerScriptReady(timeoutMs int) error {
+	if timeoutMs <= 0 {
+		timeoutMs = 5000
+	}
+	deadline := time.Now().Add(time.Duration(timeoutMs) * time.Millisecond)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		h, err := a.getRunnerRPCHealth()
+		if err == nil && h.ScriptReady {
+			return nil
+		}
+		if err != nil {
+			lastErr = err
+		} else {
+			lastErr = errors.New("runner script not ready")
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if lastErr != nil {
+		return lastErr
+	}
+	return errors.New("runner script ready timeout")
+}
+
 type productAssetsManifestEntry struct {
 	ProductCode string `json:"productCode"`
 	Version     string `json:"version,omitempty"`
@@ -2587,7 +2637,20 @@ func (a *Agent) handleTxAvatarURL(in Envelope) {
 		p.TimeoutMs = 20_000
 	}
 	if a.runnerPid.Load() == 0 {
-		_ = a.startRunner()
+		if err := a.startRunnerWithOptions(false, 0); err != nil {
+			a.emitTxAvatarURLResult(p.OpID, p.JID, false, "", "runner start failed: "+err.Error())
+			a.logf("tx_avatar_url: runner start failed: %v", err)
+			return
+		}
+	}
+	waitReadyMs := 5000
+	if p.TimeoutMs > 0 && p.TimeoutMs < waitReadyMs {
+		waitReadyMs = p.TimeoutMs
+	}
+	if err := a.waitRunnerScriptReady(waitReadyMs); err != nil {
+		a.emitTxAvatarURLResult(p.OpID, p.JID, false, "", "runner not ready: "+err.Error())
+		a.logf("tx_avatar_url: runner not ready: %v", err)
+		return
 	}
 	rpcURL := "http://127.0.0.1:17172/rpc/avatar/url"
 	body, _ := json.Marshal(map[string]any{
@@ -2600,12 +2663,14 @@ func (a *Agent) handleTxAvatarURL(in Envelope) {
 	defer cancel()
 	req, err := http.NewRequestWithContext(cctx, http.MethodPost, rpcURL, bytes.NewReader(body))
 	if err != nil {
+		a.emitTxAvatarURLResult(p.OpID, p.JID, false, "", "build request failed: "+err.Error())
 		a.logf("tx_avatar_url: build request failed: %v", err)
 		return
 	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
+		a.emitTxAvatarURLResult(p.OpID, p.JID, false, "", "runner rpc failed: "+err.Error())
 		a.logf("tx_avatar_url: rpc failed: %v", err)
 		return
 	}
@@ -2616,6 +2681,7 @@ func (a *Agent) handleTxAvatarURL(in Envelope) {
 		if msg == "" {
 			msg = resp.Status
 		}
+		a.emitTxAvatarURLResult(p.OpID, p.JID, false, "", "runner rpc status: "+msg)
 		a.logf("tx_avatar_url: rpc status=%d err=%s", resp.StatusCode, msg)
 		return
 	}
