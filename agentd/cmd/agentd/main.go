@@ -1650,10 +1650,19 @@ func (a *Agent) sendPing(ctx context.Context, ws *websocket.Conn, sessionID stri
 		NextRetryAtMs         int64  `json:"nextRetryAtMs,omitempty"`
 		FrontmostQueryEnabled bool   `json:"frontmostQueryEnabled"`
 	}
+	type queueHealth struct {
+		OffsetBytes     int64  `json:"offsetBytes,omitempty"`
+		FileSizeBytes   int64  `json:"fileSizeBytes,omitempty"`
+		PendingBytes    int64  `json:"pendingBytes,omitempty"`
+		LastEnqueueAtMs int64  `json:"lastEnqueueAtMs,omitempty"`
+		LastFlushAtMs   int64  `json:"lastFlushAtMs,omitempty"`
+		LastFlushErr    string `json:"lastFlushErr,omitempty"`
+	}
 	type pingPayload struct {
 		Runner runnerHealth `json:"runner"`
 		Script scriptHealth `json:"script"`
 		Guard  guardHealth  `json:"guard"`
+		Queue  queueHealth  `json:"queue"`
 	}
 
 	now := time.Now().UnixMilli()
@@ -1675,6 +1684,7 @@ func (a *Agent) sendPing(ctx context.Context, ws *websocket.Conn, sessionID stri
 	}
 	lastErr, _ := a.scriptLastError.Load().(string)
 	guard := a.getGuardRuntimeSnapshot(a.getCfg())
+	queue := a.eventQueue.Snapshot()
 	payload := pingPayload{
 		Runner: rh,
 		Script: scriptHealth{
@@ -1697,6 +1707,14 @@ func (a *Agent) sendPing(ctx context.Context, ws *websocket.Conn, sessionID stri
 			RemainingRetryCount:   guard.RemainingRetryCount,
 			NextRetryAtMs:         guard.NextRetryAtMs,
 			FrontmostQueryEnabled: guard.FrontmostQueryEnabled,
+		},
+		Queue: queueHealth{
+			OffsetBytes:     queue.OffsetBytes,
+			FileSizeBytes:   queue.FileSizeBytes,
+			PendingBytes:    queue.PendingBytes,
+			LastEnqueueAtMs: queue.LastEnqueueAtMs,
+			LastFlushAtMs:   queue.LastFlushAtMs,
+			LastFlushErr:    strings.TrimSpace(queue.LastFlushErr),
 		},
 	}
 	pb, _ := json.Marshal(payload)

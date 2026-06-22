@@ -87,10 +87,20 @@ type GuardHealthPayload struct {
 	FrontmostQueryEnabled bool   `json:"frontmostQueryEnabled"`
 }
 
+type QueueHealthPayload struct {
+	OffsetBytes     int64  `json:"offsetBytes,omitempty"`
+	FileSizeBytes   int64  `json:"fileSizeBytes,omitempty"`
+	PendingBytes    int64  `json:"pendingBytes,omitempty"`
+	LastEnqueueAtMs int64  `json:"lastEnqueueAtMs,omitempty"`
+	LastFlushAtMs   int64  `json:"lastFlushAtMs,omitempty"`
+	LastFlushErr    string `json:"lastFlushErr,omitempty"`
+}
+
 type PingPayload struct {
 	Runner RunnerHealthPayload `json:"runner"`
 	Script ScriptHealthPayload `json:"script"`
 	Guard  GuardHealthPayload  `json:"guard"`
+	Queue  QueueHealthPayload  `json:"queue"`
 }
 
 type OpenTunnelPayload struct {
@@ -1856,6 +1866,12 @@ func (b *Broker) recordSessionSeen(deviceID, sessionID, ip string, health *PingP
 	var guardRemainingRetryCount sql.NullInt64
 	var guardNextRetryAt sql.NullInt64
 	var guardFrontmostQueryEnabled sql.NullBool
+	var queueOffsetBytes sql.NullInt64
+	var queueFileSizeBytes sql.NullInt64
+	var queuePendingBytes sql.NullInt64
+	var queueLastEnqueueAt sql.NullInt64
+	var queueLastFlushAt sql.NullInt64
+	var queueLastFlushErr sql.NullString
 
 	if health != nil {
 		runnerPid = sql.NullInt64{Valid: true, Int64: health.Runner.Pid}
@@ -1883,6 +1899,12 @@ func (b *Broker) recordSessionSeen(deviceID, sessionID, ip string, health *PingP
 		guardRemainingRetryCount = sql.NullInt64{Valid: true, Int64: int64(health.Guard.RemainingRetryCount)}
 		guardNextRetryAt = sql.NullInt64{Valid: true, Int64: health.Guard.NextRetryAtMs}
 		guardFrontmostQueryEnabled = sql.NullBool{Valid: true, Bool: health.Guard.FrontmostQueryEnabled}
+		queueOffsetBytes = sql.NullInt64{Valid: true, Int64: health.Queue.OffsetBytes}
+		queueFileSizeBytes = sql.NullInt64{Valid: true, Int64: health.Queue.FileSizeBytes}
+		queuePendingBytes = sql.NullInt64{Valid: true, Int64: health.Queue.PendingBytes}
+		queueLastEnqueueAt = sql.NullInt64{Valid: true, Int64: health.Queue.LastEnqueueAtMs}
+		queueLastFlushAt = sql.NullInt64{Valid: true, Int64: health.Queue.LastFlushAtMs}
+		queueLastFlushErr = sql.NullString{Valid: strings.TrimSpace(health.Queue.LastFlushErr) != "", String: strings.TrimSpace(health.Queue.LastFlushErr)}
 	}
 
 	if _, err := b.db.ExecContext(ctx, `
@@ -1913,7 +1935,13 @@ update agent_sessions set
   guard_max_recovery_attempts=coalesce($25, guard_max_recovery_attempts),
   guard_remaining_retry_count=coalesce($26, guard_remaining_retry_count),
   guard_next_retry_at_ms=coalesce($27, guard_next_retry_at_ms),
-  guard_frontmost_query_enabled=coalesce($28, guard_frontmost_query_enabled)
+  guard_frontmost_query_enabled=coalesce($28, guard_frontmost_query_enabled),
+  queue_offset_bytes=coalesce($29, queue_offset_bytes),
+  queue_file_size_bytes=coalesce($30, queue_file_size_bytes),
+  queue_pending_bytes=coalesce($31, queue_pending_bytes),
+  queue_last_enqueue_at_ms=coalesce($32, queue_last_enqueue_at_ms),
+  queue_last_flush_at_ms=coalesce($33, queue_last_flush_at_ms),
+  queue_last_flush_err=coalesce(nullif($34,''), queue_last_flush_err)
 where device_id=$1 and session_id=$2 and disconnected_at is null
 `, deviceID, sessionID, ip,
 		runnerPid, runnerRpcOk, runnerScriptReady, runnerScriptBuild, runnerScriptSha,
@@ -1921,6 +1949,7 @@ where device_id=$1 and session_id=$2 and disconnected_at is null
 		scriptPath, scriptUpdatedAt, scriptLastEventTs, scriptLastPongTs, scriptLastErr,
 		guardEnabled, guardState, guardRunnerState, guardReasonCode, guardListeningReady, guardProcessRunning,
 		guardLastRecoveryAt, guardRecoveryAttempts, guardMaxRecoveryAttempts, guardRemainingRetryCount, guardNextRetryAt, guardFrontmostQueryEnabled,
+		queueOffsetBytes, queueFileSizeBytes, queuePendingBytes, queueLastEnqueueAt, queueLastFlushAt, queueLastFlushErr,
 	); err != nil {
 		if b.shouldLogDBErr(deviceID) {
 			logJSON("db_write_failed", map[string]any{"op": "agent_sessions_ping", "deviceId": deviceID, "sessionId": sessionID, "err": err.Error()})

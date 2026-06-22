@@ -18,11 +18,23 @@ import (
 )
 
 type EventQueue struct {
-	mu         sync.Mutex
-	path       string
-	offsetPath string
-	offset     int64
-	wake       chan struct{}
+	mu              sync.Mutex
+	path            string
+	offsetPath      string
+	offset          int64
+	lastEnqueueAtMs int64
+	lastFlushAtMs   int64
+	lastFlushErr    string
+	wake            chan struct{}
+}
+
+type EventQueueSnapshot struct {
+	OffsetBytes     int64
+	FileSizeBytes   int64
+	PendingBytes    int64
+	LastEnqueueAtMs int64
+	LastFlushAtMs   int64
+	LastFlushErr    string
 }
 
 func NewEventQueue(dir string) *EventQueue {
@@ -51,6 +63,7 @@ func (q *EventQueue) Enqueue(body []byte) {
 	_, _ = f.Write(body)
 	_, _ = f.Write([]byte("\n"))
 	_ = f.Close()
+	q.lastEnqueueAtMs = time.Now().UnixMilli()
 	select {
 	case q.wake <- struct{}{}:
 	default:
@@ -68,6 +81,11 @@ func (q *EventQueue) Run(ctx context.Context, deviceID string, getCfg func() Con
 			return
 		}
 		n, err := q.flushOnce(ctx, deviceID, getCfg)
+		if err != nil {
+			q.noteFlushResult(err)
+		} else if n > 0 {
+			q.noteFlushResult(nil)
+		}
 		if err == nil && n > 0 {
 			backoff = 250 * time.Millisecond
 			continue
@@ -84,6 +102,17 @@ func (q *EventQueue) Run(ctx context.Context, deviceID string, getCfg func() Con
 		case <-time.After(backoff):
 		}
 	}
+}
+
+func (q *EventQueue) noteFlushResult(err error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.lastFlushAtMs = time.Now().UnixMilli()
+	if err != nil {
+		q.lastFlushErr = strings.TrimSpace(err.Error())
+		return
+	}
+	q.lastFlushErr = ""
 }
 
 func minDuration(a, b time.Duration) time.Duration {
@@ -238,6 +267,32 @@ func (q *EventQueue) writeOffset(n int64) {
 	q.offset = n
 	q.mu.Unlock()
 	_ = os.WriteFile(q.offsetPath, []byte(strconv.FormatInt(n, 10)+"\n"), 0o644)
+}
+
+func (q *EventQueue) Snapshot() EventQueueSnapshot {
+	q.mu.Lock()
+	offset := q.offset
+	lastEnqueueAtMs := q.lastEnqueueAtMs
+	lastFlushAtMs := q.lastFlushAtMs
+	lastFlushErr := strings.TrimSpace(q.lastFlushErr)
+	path := q.path
+	q.mu.Unlock()
+	fileSize := int64(0)
+	if st, err := os.Stat(path); err == nil && st != nil {
+		fileSize = st.Size()
+	}
+	pending := fileSize - offset
+	if pending < 0 {
+		pending = 0
+	}
+	return EventQueueSnapshot{
+		OffsetBytes:     offset,
+		FileSizeBytes:   fileSize,
+		PendingBytes:    pending,
+		LastEnqueueAtMs: lastEnqueueAtMs,
+		LastFlushAtMs:   lastFlushAtMs,
+		LastFlushErr:    lastFlushErr,
+	}
 }
 
 func postEventJSON(ctx context.Context, target, deviceID, deviceSecret string, body []byte) (bool, error) {
