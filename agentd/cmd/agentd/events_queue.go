@@ -5,7 +5,9 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -205,14 +207,14 @@ func (q *EventQueue) flushOnce(ctx context.Context, deviceID string, getCfg func
 			break
 		}
 		batch := buildJSONArray(lines)
-		ok, status, postErr := postEventsJSON(ctx, target, deviceID, secret, batch, true)
+		ok, status, respBody, postErr := postEventsJSON(ctx, target, deviceID, secret, batch, true)
 		if !ok && (status == http.StatusBadRequest || status == http.StatusUnsupportedMediaType) {
 			ok = true
 			for i := range lines {
-				ok1, err1 := postEventJSON(ctx, target, deviceID, secret, lines[i])
+				ok1, status1, body1, err1 := postEventJSON(ctx, target, deviceID, secret, lines[i])
 				if !ok1 {
 					ok = false
-					postErr = err1
+					postErr = explainEventPostFailure("single", status1, body1, err1, lines[i], i+1, len(lines))
 					break
 				}
 				sent++
@@ -221,7 +223,7 @@ func (q *EventQueue) flushOnce(ctx context.Context, deviceID string, getCfg func
 			}
 			if !ok {
 				if postErr == nil {
-					postErr = errors.New("post failed")
+					postErr = explainBatchPostFailure("single", status, respBody, nil, lines)
 				}
 				return sent, postErr
 			}
@@ -229,7 +231,9 @@ func (q *EventQueue) flushOnce(ctx context.Context, deviceID string, getCfg func
 		}
 		if !ok {
 			if postErr == nil {
-				postErr = errors.New("post failed")
+				postErr = explainBatchPostFailure("batch", status, respBody, nil, lines)
+			} else {
+				postErr = explainBatchPostFailure("batch", status, respBody, postErr, lines)
 			}
 			return sent, postErr
 		}
@@ -241,6 +245,81 @@ func (q *EventQueue) flushOnce(ctx context.Context, deviceID string, getCfg func
 		}
 	}
 	return sent, nil
+}
+
+// summarizeQueuedEvent 返回队列单条事件的最小摘要，便于定位是哪类事件拖死了整批上传。
+// 参数：body 为单条 JSON 事件内容。
+// 返回：包含 type/opId/jid 的紧凑字符串；若无法解析则返回截断后的原文预览。
+func summarizeQueuedEvent(body []byte) string {
+	body = bytes.TrimSpace(body)
+	if len(body) == 0 {
+		return "empty"
+	}
+	var env struct {
+		Type  string `json:"type"`
+		OpID  string `json:"op_id"`
+		OpID2 string `json:"opId"`
+		JID   string `json:"jid"`
+	}
+	if err := json.Unmarshal(body, &env); err != nil {
+		return "raw=" + clipString(string(body), 160)
+	}
+	opID := strings.TrimSpace(env.OpID)
+	if opID == "" {
+		opID = strings.TrimSpace(env.OpID2)
+	}
+	return strings.TrimSpace(fmt.Sprintf("type=%s opId=%s jid=%s", strings.TrimSpace(env.Type), opID, strings.TrimSpace(env.JID)))
+}
+
+// clipString 截断调试字符串，避免把超长响应体或原始事件整体塞进健康状态。
+// 参数：s 为原始文本；maxLen 为最大保留长度。
+// 返回：截断后的字符串，必要时追加省略号。
+func clipString(s string, maxLen int) string {
+	s = strings.TrimSpace(s)
+	if maxLen <= 0 || len(s) <= maxLen {
+		return s
+	}
+	return strings.TrimSpace(s[:maxLen]) + "..."
+}
+
+// explainBatchPostFailure 统一生成批量上传失败摘要，用于判断批量链路本身是否正确。
+// 参数：mode 为上传模式；status/body/err 为 HTTP 结果；lines 为本批事件。
+// 返回：包含状态码、响应体与首尾事件摘要的错误对象。
+func explainBatchPostFailure(mode string, status int, body string, err error, lines [][]byte) error {
+	if err != nil {
+		return fmt.Errorf("%s post failed err=%v count=%d first={%s} last={%s}", strings.TrimSpace(mode), err, len(lines), summarizeBatchEdge(lines, true), summarizeBatchEdge(lines, false))
+	}
+	if status > 0 {
+		return fmt.Errorf("%s post failed status=%d body=%s count=%d first={%s} last={%s}", strings.TrimSpace(mode), status, clipString(body, 240), len(lines), summarizeBatchEdge(lines, true), summarizeBatchEdge(lines, false))
+	}
+	return fmt.Errorf("%s post failed count=%d first={%s} last={%s}", strings.TrimSpace(mode), len(lines), summarizeBatchEdge(lines, true), summarizeBatchEdge(lines, false))
+}
+
+// explainEventPostFailure 统一生成逐条上传失败摘要，便于判断是否为特定事件毒化整批队列。
+// 参数：mode 为上传模式；status/body/err 为 HTTP 结果；line 为当前事件；index/total 为序号。
+// 返回：包含状态码、响应体和当前事件摘要的错误对象。
+func explainEventPostFailure(mode string, status int, body string, err error, line []byte, index, total int) error {
+	eventSummary := summarizeQueuedEvent(line)
+	if err != nil {
+		return fmt.Errorf("%s post failed err=%v event=%d/%d {%s}", strings.TrimSpace(mode), err, index, total, eventSummary)
+	}
+	if status > 0 {
+		return fmt.Errorf("%s post failed status=%d body=%s event=%d/%d {%s}", strings.TrimSpace(mode), status, clipString(body, 240), index, total, eventSummary)
+	}
+	return fmt.Errorf("%s post failed event=%d/%d {%s}", strings.TrimSpace(mode), index, total, eventSummary)
+}
+
+// summarizeBatchEdge 返回批量首条或末条事件的摘要，帮助判断是哪类事件与头像结果一起被卡住。
+// 参数：lines 为本批事件；first 为 true 时取首条，否则取末条。
+// 返回：单条事件摘要；若批次为空则返回 empty-batch。
+func summarizeBatchEdge(lines [][]byte, first bool) string {
+	if len(lines) == 0 {
+		return "empty-batch"
+	}
+	if first {
+		return summarizeQueuedEvent(lines[0])
+	}
+	return summarizeQueuedEvent(lines[len(lines)-1])
 }
 
 func (q *EventQueue) readOffset() int64 {
@@ -295,32 +374,38 @@ func (q *EventQueue) Snapshot() EventQueueSnapshot {
 	}
 }
 
-func postEventJSON(ctx context.Context, target, deviceID, deviceSecret string, body []byte) (bool, error) {
+// postEventJSON 以单条模式上传一条设备事件，并返回状态码与响应体摘要。
+// 参数：ctx 为请求上下文；target 为目标 URL；deviceID/deviceSecret 为设备鉴权；body 为单条 JSON。
+// 返回：ok 表示是否返回 200；status 为 HTTP 状态码；respBody 为响应体摘要；err 为网络层错误。
+func postEventJSON(ctx context.Context, target, deviceID, deviceSecret string, body []byte) (ok bool, status int, respBody string, err error) {
 	ctx, cancel := context.WithTimeout(ctx, 8*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, target, bytes.NewReader(body))
 	if err != nil {
-		return false, err
+		return false, 0, "", err
 	}
 	req.Header.Set("X-Device-Id", deviceID)
 	req.Header.Set("X-Device-Secret", deviceSecret)
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return false, err
+		return false, 0, "", err
 	}
 	defer resp.Body.Close()
-	_, _ = io.ReadAll(io.LimitReader(resp.Body, 1024))
-	return resp.StatusCode == http.StatusOK, nil
+	bs, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+	return resp.StatusCode == http.StatusOK, resp.StatusCode, clipString(string(bs), 240), nil
 }
 
-func postEventsJSON(ctx context.Context, target, deviceID, deviceSecret string, body []byte, gzipBody bool) (ok bool, status int, err error) {
+// postEventsJSON 以批量模式上传设备事件数组，并返回状态码与响应体摘要。
+// 参数：ctx 为请求上下文；target 为目标 URL；deviceID/deviceSecret 为设备鉴权；body 为 JSON 数组；gzipBody 表示是否 gzip 压缩。
+// 返回：ok 表示是否返回 200；status 为 HTTP 状态码；respBody 为响应体摘要；err 为网络层错误。
+func postEventsJSON(ctx context.Context, target, deviceID, deviceSecret string, body []byte, gzipBody bool) (ok bool, status int, respBody string, err error) {
 	ctx, cancel := context.WithTimeout(ctx, 8*time.Second)
 	defer cancel()
 	var reader io.Reader = bytes.NewReader(body)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, target, nil)
 	if err != nil {
-		return false, 0, err
+		return false, 0, "", err
 	}
 	req.Header.Set("X-Device-Id", deviceID)
 	req.Header.Set("X-Device-Secret", deviceSecret)
@@ -336,11 +421,11 @@ func postEventsJSON(ctx context.Context, target, deviceID, deviceSecret string, 
 	req.Body = io.NopCloser(reader)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return false, 0, err
+		return false, 0, "", err
 	}
 	defer resp.Body.Close()
-	_, _ = io.ReadAll(io.LimitReader(resp.Body, 1024))
-	return resp.StatusCode == http.StatusOK, resp.StatusCode, nil
+	bs, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+	return resp.StatusCode == http.StatusOK, resp.StatusCode, clipString(string(bs), 240), nil
 }
 
 func buildJSONArray(lines [][]byte) []byte {
