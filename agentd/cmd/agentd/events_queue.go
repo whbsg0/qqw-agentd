@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -31,13 +32,14 @@ type EventQueue struct {
 }
 
 type EventQueueSnapshot struct {
-	OffsetBytes     int64
-	FileSizeBytes   int64
-	PendingBytes    int64
-	LastEnqueueAtMs int64
-	LastFlushAtMs   int64
-	LastFlushErr    string
-	InspectReport   string
+	OffsetBytes      int64
+	FileSizeBytes    int64
+	PendingBytes     int64
+	LastEnqueueAtMs  int64
+	LastFlushAtMs    int64
+	LastFlushErr     string
+	InspectReport    string
+	RawExportGzipB64 string
 }
 
 type EventQueueInspectIssue struct {
@@ -65,6 +67,19 @@ type EventQueueInspectReport struct {
 	EntryCount       int                      `json:"entryCount"`
 	BadEntryCount    int                      `json:"badEntryCount"`
 	Entries          []EventQueueInspectEntry `json:"entries"`
+}
+
+type EventQueueRawEntry struct {
+	Index       int    `json:"index"`
+	OffsetBytes int64  `json:"offsetBytes"`
+	Raw         string `json:"raw"`
+}
+
+type EventQueueRawExport struct {
+	Encoding         string               `json:"encoding"`
+	StartOffsetBytes int64                `json:"startOffsetBytes"`
+	EntryCount       int                  `json:"entryCount"`
+	Entries          []EventQueueRawEntry `json:"entries"`
 }
 
 func NewEventQueue(dir string) *EventQueue {
@@ -157,6 +172,58 @@ func (q *EventQueue) InspectBatchAtOffset(offset int64, limit int) (EventQueueIn
 	}
 	report.EntryCount = len(report.Entries)
 	return report, nil
+}
+
+// ExportBatchRawAtOffset 只读导出指定 offset 开始的一批原始事件文本。
+// 参数：offset 为起始字节位置；limit 为最多读取的非空事件数。
+// 返回：原始导出结果；若读取失败则返回错误。
+func (q *EventQueue) ExportBatchRawAtOffset(offset int64, limit int) (EventQueueRawExport, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	out := EventQueueRawExport{
+		Encoding:         "utf-8",
+		StartOffsetBytes: maxInt64(offset, 0),
+		Entries:          make([]EventQueueRawEntry, 0, limit),
+	}
+	f, err := os.Open(q.path)
+	if err != nil {
+		return out, err
+	}
+	defer f.Close()
+	if out.StartOffsetBytes > 0 {
+		if _, err := f.Seek(out.StartOffsetBytes, io.SeekStart); err != nil {
+			return out, err
+		}
+	}
+	r := bufio.NewReaderSize(f, 256*1024)
+	curOffset := out.StartOffsetBytes
+	for len(out.Entries) < limit {
+		raw, err := r.ReadBytes('\n')
+		rawLen := len(raw)
+		if rawLen == 0 && err != nil {
+			break
+		}
+		line := bytes.TrimSpace(raw)
+		lineOffset := curOffset
+		curOffset += int64(rawLen)
+		if len(line) == 0 {
+			if err != nil {
+				break
+			}
+			continue
+		}
+		out.Entries = append(out.Entries, EventQueueRawEntry{
+			Index:       len(out.Entries) + 1,
+			OffsetBytes: lineOffset,
+			Raw:         string(line),
+		})
+		if err != nil {
+			break
+		}
+	}
+	out.EntryCount = len(out.Entries)
+	return out, nil
 }
 
 func (q *EventQueue) Enqueue(body []byte) {
@@ -771,17 +838,20 @@ func (q *EventQueue) Snapshot() EventQueueSnapshot {
 		pending = 0
 	}
 	inspectReport := ""
+	rawExportGzipB64 := ""
 	if pending > 0 {
 		inspectReport = q.BuildInspectReportAtOffset(offset, 50)
+		rawExportGzipB64 = q.BuildRawExportAtOffset(offset, 50)
 	}
 	return EventQueueSnapshot{
-		OffsetBytes:     offset,
-		FileSizeBytes:   fileSize,
-		PendingBytes:    pending,
-		LastEnqueueAtMs: lastEnqueueAtMs,
-		LastFlushAtMs:   lastFlushAtMs,
-		LastFlushErr:    lastFlushErr,
-		InspectReport:   inspectReport,
+		OffsetBytes:      offset,
+		FileSizeBytes:    fileSize,
+		PendingBytes:     pending,
+		LastEnqueueAtMs:  lastEnqueueAtMs,
+		LastFlushAtMs:    lastFlushAtMs,
+		LastFlushErr:     lastFlushErr,
+		InspectReport:    inspectReport,
+		RawExportGzipB64: rawExportGzipB64,
 	}
 }
 
@@ -832,6 +902,48 @@ func (q *EventQueue) BuildInspectReportAtOffset(offset int64, limit int) string 
 		return strings.TrimSpace(fmt.Sprintf(`{"ok":false,"offsetBytes":%d,"error":%q}`, report.StartOffsetBytes, clipString(err.Error(), 240)))
 	}
 	return clipString(string(bs), 60000)
+}
+
+// BuildRawExportAtOffset 导出指定 offset 开始的一批原始事件，并编码为 gzip+base64 文本。
+// 参数：offset 为起始字节位置；limit 为最多导出的事件条数。
+// 返回：gzip+base64 编码的 JSON；若读取失败则返回错误摘要 JSON。
+func (q *EventQueue) BuildRawExportAtOffset(offset int64, limit int) string {
+	exported, err := q.ExportBatchRawAtOffset(offset, limit)
+	if err != nil {
+		return strings.TrimSpace(fmt.Sprintf(`{"ok":false,"encoding":"plain-json","offsetBytes":%d,"error":%q}`, maxInt64(offset, 0), clipString(err.Error(), 240)))
+	}
+	bs, err := json.Marshal(exported)
+	if err != nil {
+		return strings.TrimSpace(fmt.Sprintf(`{"ok":false,"encoding":"plain-json","offsetBytes":%d,"error":%q}`, exported.StartOffsetBytes, clipString(err.Error(), 240)))
+	}
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	if _, err := zw.Write(bs); err != nil {
+		_ = zw.Close()
+		return strings.TrimSpace(fmt.Sprintf(`{"ok":false,"encoding":"plain-json","offsetBytes":%d,"error":%q}`, exported.StartOffsetBytes, clipString(err.Error(), 240)))
+	}
+	if err := zw.Close(); err != nil {
+		return strings.TrimSpace(fmt.Sprintf(`{"ok":false,"encoding":"plain-json","offsetBytes":%d,"error":%q}`, exported.StartOffsetBytes, clipString(err.Error(), 240)))
+	}
+	type payload struct {
+		OK               bool   `json:"ok"`
+		Encoding         string `json:"encoding"`
+		StartOffsetBytes int64  `json:"startOffsetBytes"`
+		EntryCount       int    `json:"entryCount"`
+		GzipBase64       string `json:"gzipBase64"`
+	}
+	out := payload{
+		OK:               true,
+		Encoding:         "gzip+base64+json",
+		StartOffsetBytes: exported.StartOffsetBytes,
+		EntryCount:       exported.EntryCount,
+		GzipBase64:       base64.StdEncoding.EncodeToString(buf.Bytes()),
+	}
+	outBytes, err := json.Marshal(out)
+	if err != nil {
+		return strings.TrimSpace(fmt.Sprintf(`{"ok":false,"encoding":"plain-json","offsetBytes":%d,"error":%q}`, exported.StartOffsetBytes, clipString(err.Error(), 240)))
+	}
+	return clipString(string(outBytes), 120000)
 }
 
 // postEventJSON 以单条模式上传一条设备事件，并返回状态码与响应体摘要。
