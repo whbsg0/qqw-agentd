@@ -32,14 +32,12 @@ type EventQueue struct {
 }
 
 type EventQueueSnapshot struct {
-	OffsetBytes      int64
-	FileSizeBytes    int64
-	PendingBytes     int64
-	LastEnqueueAtMs  int64
-	LastFlushAtMs    int64
-	LastFlushErr     string
-	InspectReport    string
-	RawExportGzipB64 string
+	OffsetBytes     int64
+	FileSizeBytes   int64
+	PendingBytes    int64
+	LastEnqueueAtMs int64
+	LastFlushAtMs   int64
+	LastFlushErr    string
 }
 
 type EventQueueInspectIssue struct {
@@ -837,21 +835,13 @@ func (q *EventQueue) Snapshot() EventQueueSnapshot {
 	if pending < 0 {
 		pending = 0
 	}
-	inspectReport := ""
-	rawExportGzipB64 := ""
-	if pending > 0 {
-		inspectReport = q.BuildInspectReportAtOffset(offset, 50)
-		rawExportGzipB64 = q.BuildRawExportAtOffset(offset, 50)
-	}
 	return EventQueueSnapshot{
-		OffsetBytes:      offset,
-		FileSizeBytes:    fileSize,
-		PendingBytes:     pending,
-		LastEnqueueAtMs:  lastEnqueueAtMs,
-		LastFlushAtMs:    lastFlushAtMs,
-		LastFlushErr:     lastFlushErr,
-		InspectReport:    inspectReport,
-		RawExportGzipB64: rawExportGzipB64,
+		OffsetBytes:     offset,
+		FileSizeBytes:   fileSize,
+		PendingBytes:    pending,
+		LastEnqueueAtMs: lastEnqueueAtMs,
+		LastFlushAtMs:   lastFlushAtMs,
+		LastFlushErr:    lastFlushErr,
 	}
 }
 

@@ -120,7 +120,7 @@ func handleFridaMessageJSONLine(poster *eventPoster, line string) {
 		eventType, opID, jid := summarizeFridaPayload(msg.Payload)
 		summary := strings.TrimSpace(fmt.Sprintf("runner_event_post_failed type=%s opId=%s jid=%s err=%v", eventType, opID, jid, err))
 		setRunnerLastHealthErr(summary)
-		log.Printf("%s payload=%s", summary, string(bytes.TrimSpace(msg.Payload)))
+		log.Printf("%s", summary)
 		return
 	}
 	setRunnerLastHealthErr("")

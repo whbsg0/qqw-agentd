@@ -1686,14 +1686,12 @@ func (a *Agent) sendPing(ctx context.Context, ws *websocket.Conn, sessionID stri
 		FrontmostQueryEnabled bool   `json:"frontmostQueryEnabled"`
 	}
 	type queueHealth struct {
-		OffsetBytes      int64  `json:"offsetBytes,omitempty"`
-		FileSizeBytes    int64  `json:"fileSizeBytes,omitempty"`
-		PendingBytes     int64  `json:"pendingBytes,omitempty"`
-		LastEnqueueAtMs  int64  `json:"lastEnqueueAtMs,omitempty"`
-		LastFlushAtMs    int64  `json:"lastFlushAtMs,omitempty"`
-		LastFlushErr     string `json:"lastFlushErr,omitempty"`
-		InspectReport    string `json:"inspectReport,omitempty"`
-		RawExportGzipB64 string `json:"rawExportGzipB64,omitempty"`
+		OffsetBytes     int64  `json:"offsetBytes,omitempty"`
+		FileSizeBytes   int64  `json:"fileSizeBytes,omitempty"`
+		PendingBytes    int64  `json:"pendingBytes,omitempty"`
+		LastEnqueueAtMs int64  `json:"lastEnqueueAtMs,omitempty"`
+		LastFlushAtMs   int64  `json:"lastFlushAtMs,omitempty"`
+		LastFlushErr    string `json:"lastFlushErr,omitempty"`
 	}
 	type pingPayload struct {
 		Runner runnerHealth `json:"runner"`
@@ -1746,14 +1744,12 @@ func (a *Agent) sendPing(ctx context.Context, ws *websocket.Conn, sessionID stri
 			FrontmostQueryEnabled: guard.FrontmostQueryEnabled,
 		},
 		Queue: queueHealth{
-			OffsetBytes:      queue.OffsetBytes,
-			FileSizeBytes:    queue.FileSizeBytes,
-			PendingBytes:     queue.PendingBytes,
-			LastEnqueueAtMs:  queue.LastEnqueueAtMs,
-			LastFlushAtMs:    queue.LastFlushAtMs,
-			LastFlushErr:     strings.TrimSpace(queue.LastFlushErr),
-			InspectReport:    strings.TrimSpace(queue.InspectReport),
-			RawExportGzipB64: strings.TrimSpace(queue.RawExportGzipB64),
+			OffsetBytes:     queue.OffsetBytes,
+			FileSizeBytes:   queue.FileSizeBytes,
+			PendingBytes:    queue.PendingBytes,
+			LastEnqueueAtMs: queue.LastEnqueueAtMs,
+			LastFlushAtMs:   queue.LastFlushAtMs,
+			LastFlushErr:    strings.TrimSpace(queue.LastFlushErr),
 		},
 	}
 	pb, _ := json.Marshal(payload)

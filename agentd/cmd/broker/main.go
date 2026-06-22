@@ -88,14 +88,12 @@ type GuardHealthPayload struct {
 }
 
 type QueueHealthPayload struct {
-	OffsetBytes      int64  `json:"offsetBytes,omitempty"`
-	FileSizeBytes    int64  `json:"fileSizeBytes,omitempty"`
-	PendingBytes     int64  `json:"pendingBytes,omitempty"`
-	LastEnqueueAtMs  int64  `json:"lastEnqueueAtMs,omitempty"`
-	LastFlushAtMs    int64  `json:"lastFlushAtMs,omitempty"`
-	LastFlushErr     string `json:"lastFlushErr,omitempty"`
-	InspectReport    string `json:"inspectReport,omitempty"`
-	RawExportGzipB64 string `json:"rawExportGzipB64,omitempty"`
+	OffsetBytes     int64  `json:"offsetBytes,omitempty"`
+	FileSizeBytes   int64  `json:"fileSizeBytes,omitempty"`
+	PendingBytes    int64  `json:"pendingBytes,omitempty"`
+	LastEnqueueAtMs int64  `json:"lastEnqueueAtMs,omitempty"`
+	LastFlushAtMs   int64  `json:"lastFlushAtMs,omitempty"`
+	LastFlushErr    string `json:"lastFlushErr,omitempty"`
 }
 
 type PingPayload struct {
@@ -1874,8 +1872,6 @@ func (b *Broker) recordSessionSeen(deviceID, sessionID, ip string, health *PingP
 	var queueLastEnqueueAt sql.NullInt64
 	var queueLastFlushAt sql.NullInt64
 	var queueLastFlushErr sql.NullString
-	var queueInspectReport sql.NullString
-	var queueRawExportGzipB64 sql.NullString
 
 	if health != nil {
 		runnerPid = sql.NullInt64{Valid: true, Int64: health.Runner.Pid}
@@ -1909,8 +1905,6 @@ func (b *Broker) recordSessionSeen(deviceID, sessionID, ip string, health *PingP
 		queueLastEnqueueAt = sql.NullInt64{Valid: true, Int64: health.Queue.LastEnqueueAtMs}
 		queueLastFlushAt = sql.NullInt64{Valid: true, Int64: health.Queue.LastFlushAtMs}
 		queueLastFlushErr = sql.NullString{Valid: strings.TrimSpace(health.Queue.LastFlushErr) != "", String: strings.TrimSpace(health.Queue.LastFlushErr)}
-		queueInspectReport = sql.NullString{Valid: strings.TrimSpace(health.Queue.InspectReport) != "", String: strings.TrimSpace(health.Queue.InspectReport)}
-		queueRawExportGzipB64 = sql.NullString{Valid: strings.TrimSpace(health.Queue.RawExportGzipB64) != "", String: strings.TrimSpace(health.Queue.RawExportGzipB64)}
 	}
 
 	if _, err := b.db.ExecContext(ctx, `
@@ -1947,9 +1941,7 @@ update agent_sessions set
   queue_pending_bytes=coalesce($31, queue_pending_bytes),
   queue_last_enqueue_at_ms=coalesce($32, queue_last_enqueue_at_ms),
   queue_last_flush_at_ms=coalesce($33, queue_last_flush_at_ms),
-  queue_last_flush_err=coalesce(nullif($34,''), queue_last_flush_err),
-  queue_inspect_report=coalesce(nullif($35,''), queue_inspect_report),
-  queue_raw_export_gzip_b64=coalesce(nullif($36,''), queue_raw_export_gzip_b64)
+  queue_last_flush_err=coalesce(nullif($34,''), queue_last_flush_err)
 where device_id=$1 and session_id=$2 and disconnected_at is null
 `, deviceID, sessionID, ip,
 		runnerPid, runnerRpcOk, runnerScriptReady, runnerScriptBuild, runnerScriptSha,
@@ -1957,7 +1949,7 @@ where device_id=$1 and session_id=$2 and disconnected_at is null
 		scriptPath, scriptUpdatedAt, scriptLastEventTs, scriptLastPongTs, scriptLastErr,
 		guardEnabled, guardState, guardRunnerState, guardReasonCode, guardListeningReady, guardProcessRunning,
 		guardLastRecoveryAt, guardRecoveryAttempts, guardMaxRecoveryAttempts, guardRemainingRetryCount, guardNextRetryAt, guardFrontmostQueryEnabled,
-		queueOffsetBytes, queueFileSizeBytes, queuePendingBytes, queueLastEnqueueAt, queueLastFlushAt, queueLastFlushErr, queueInspectReport, queueRawExportGzipB64,
+		queueOffsetBytes, queueFileSizeBytes, queuePendingBytes, queueLastEnqueueAt, queueLastFlushAt, queueLastFlushErr,
 	); err != nil {
 		if b.shouldLogDBErr(deviceID) {
 			logJSON("db_write_failed", map[string]any{"op": "agent_sessions_ping", "deviceId": deviceID, "sessionId": sessionID, "err": err.Error()})
