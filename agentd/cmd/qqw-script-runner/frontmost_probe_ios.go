@@ -9,43 +9,10 @@ package main
 #include <string.h>
 #include <frida-core.h>
 
-static const char *qqw_frontmost_probe_debug_local_log_path = "/var/mobile/Library/QQwAgent/trae-debug-log-guard-fuse-errors.ndjson";
-static const char *qqw_frontmost_probe_debug_afc_log_path = "/var/mobile/Media/QQwAgent/trae-debug-log-guard-fuse-errors.ndjson";
-
-// qqw_frontmost_probe_debug_append_line 追加一行调试内容到指定设备侧日志文件。
-// 参数：path 为目标文件路径；line 为已格式化好的单行日志。
-// 返回：无。
-static void qqw_frontmost_probe_debug_append_line(const char *path, const gchar *line) {
-  if (path == NULL || path[0] == '\0' || line == NULL || line[0] == '\0') {
-    return;
-  }
-  FILE *fp = fopen(path, "a");
-  if (fp == NULL) {
-    return;
-  }
-  fputs(line, fp);
-  fputc('\n', fp);
-  fclose(fp);
-}
-
-// qqw_frontmost_probe_debug_log_stage 将 C 层阶段事件双写到私有路径与 AFC 镜像路径。
-// 参数：stage 为当前阶段；detail 为附加诊断文本；value 为可选整数值。
-// 返回：无。
 static void qqw_frontmost_probe_debug_log_stage(const gchar *stage, const gchar *detail, gint value) {
-  gchar *safe_stage = g_strescape(stage != NULL ? stage : "", NULL);
-  gchar *safe_detail = g_strescape(detail != NULL ? detail : "", NULL);
-  gchar *line = g_strdup_printf(
-    "{\"sessionId\":\"guard-fuse-errors\",\"runId\":\"pre-fix\",\"hypothesisId\":\"H1\",\"location\":\"frontmost_probe_ios.go:qqw_frontmost_probe_query\",\"msg\":\"[DEBUG] c-stage %s\",\"data\":{\"stage\":\"%s\",\"detail\":\"%s\",\"value\":%d},\"ts\":%" G_GINT64_FORMAT "}",
-    safe_stage != NULL ? safe_stage : "",
-    safe_stage != NULL ? safe_stage : "",
-    safe_detail != NULL ? safe_detail : "",
-    (int) value,
-    (gint64) (g_get_real_time() / 1000));
-  qqw_frontmost_probe_debug_append_line(qqw_frontmost_probe_debug_local_log_path, line);
-  qqw_frontmost_probe_debug_append_line(qqw_frontmost_probe_debug_afc_log_path, line);
-  g_free(line);
-  g_free(safe_stage);
-  g_free(safe_detail);
+  (void) stage;
+  (void) detail;
+  (void) value;
 }
 
 typedef struct {
@@ -439,12 +406,6 @@ func queryFrontmostProbeOnce(fridaHost string, fridaPort int, timeoutMs int) fro
 		timeoutMs = 3000
 	}
 	hostPort := addr + ":" + strconv.Itoa(fridaPort)
-	// #region debug-point H1:frontmost-probe-cgo-enter
-	debugFrontmostProbeReport("pre-fix", "H1", "frontmost_probe_ios.go:queryFrontmostProbeOnce", "enter cgo frontmost probe query", map[string]any{
-		"hostPort":  hostPort,
-		"timeoutMs": timeoutMs,
-	})
-	// #endregion
 	cAddr := C.CString(hostPort)
 	cSrc := C.CString(frontmostProbeScriptSource)
 	defer C.free(unsafe.Pointer(cAddr))
@@ -455,16 +416,6 @@ func queryFrontmostProbeOnce(fridaHost string, fridaPort int, timeoutMs int) fro
 	if cErr != nil {
 		defer C.qqw_frontmost_probe_free(cErr)
 		errText := strings.TrimSpace(C.GoString(cErr))
-		// #region debug-point H2:frontmost-probe-cgo-error
-		debugFrontmostProbeReport("pre-fix", "H2", "frontmost_probe_ios.go:queryFrontmostProbeOnce", "cgo frontmost probe returned error", map[string]any{
-			"hostPort":      hostPort,
-			"timeoutMs":     timeoutMs,
-			"rc":            int(rc),
-			"errorMessage":  errText,
-			"messageIsNil":  cMsg == nil,
-			"errorPtrIsNil": cErr == nil,
-		})
-		// #endregion
 		return frontmostProbeSnapshot{
 			Ok:           false,
 			Source:       "springboard.runningApplications",
@@ -478,15 +429,6 @@ func queryFrontmostProbeOnce(fridaHost string, fridaPort int, timeoutMs int) fro
 		if cMsg != nil {
 			defer C.qqw_frontmost_probe_free(cMsg)
 		}
-		// #region debug-point H2:frontmost-probe-cgo-empty
-		debugFrontmostProbeReport("pre-fix", "H2", "frontmost_probe_ios.go:queryFrontmostProbeOnce", "cgo frontmost probe returned empty payload", map[string]any{
-			"hostPort":      hostPort,
-			"timeoutMs":     timeoutMs,
-			"rc":            int(rc),
-			"messageIsNil":  cMsg == nil,
-			"errorPtrIsNil": cErr == nil,
-		})
-		// #endregion
 		return frontmostProbeSnapshot{
 			Ok:           false,
 			Source:       "springboard.runningApplications",
@@ -498,14 +440,6 @@ func queryFrontmostProbeOnce(fridaHost string, fridaPort int, timeoutMs int) fro
 	}
 	defer C.qqw_frontmost_probe_free(cMsg)
 	rawMessage := C.GoString(cMsg)
-	// #region debug-point H2:frontmost-probe-cgo-success
-	debugFrontmostProbeReport("pre-fix", "H2", "frontmost_probe_ios.go:queryFrontmostProbeOnce", "cgo frontmost probe returned payload", map[string]any{
-		"hostPort":       hostPort,
-		"timeoutMs":      timeoutMs,
-		"rc":             int(rc),
-		"payloadPreview": strings.TrimSpace(rawMessage),
-	})
-	// #endregion
 	return parseFrontmostProbeMessage(rawMessage, now)
 }
 

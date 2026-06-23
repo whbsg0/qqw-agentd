@@ -52,20 +52,9 @@ static void qqw_runner_debug_append_line(const char *path, const gchar *line) {
 // 参数：stage 为阶段名；detail 为附加文本；value 为阶段相关整数值。
 // 返回：无。
 static void qqw_runner_debug_log_stage(const gchar *stage, const gchar *detail, gint value) {
-  gchar *safe_stage = g_strescape(stage != NULL ? stage : "", NULL);
-  gchar *safe_detail = g_strescape(detail != NULL ? detail : "", NULL);
-  gchar *line = g_strdup_printf(
-    "{\"sessionId\":\"guard-fuse-errors\",\"runId\":\"runner-load\",\"hypothesisId\":\"H3\",\"location\":\"run_ios.go:qqw_run\",\"msg\":\"[DEBUG] runner-stage %s\",\"data\":{\"stage\":\"%s\",\"detail\":\"%s\",\"value\":%d},\"ts\":%" G_GINT64_FORMAT "}",
-    safe_stage != NULL ? safe_stage : "",
-    safe_stage != NULL ? safe_stage : "",
-    safe_detail != NULL ? safe_detail : "",
-    (int) value,
-    (gint64) (g_get_real_time() / 1000));
-  qqw_runner_debug_append_line(qqw_runner_debug_local_log_path, line);
-  qqw_runner_debug_append_line(qqw_runner_debug_afc_log_path, line);
-  g_free(line);
-  g_free(safe_stage);
-  g_free(safe_detail);
+  (void) stage;
+  (void) detail;
+  (void) value;
 }
 
 static void qqw_set_script(FridaScript *script) {

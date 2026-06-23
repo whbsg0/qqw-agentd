@@ -1,13 +1,7 @@
 package main
 
 import (
-	"bytes"
-	"context"
-	"encoding/json"
 	"fmt"
-	"net/http"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -39,91 +33,6 @@ var (
 	frontmostProbeStateMu sync.RWMutex
 	frontmostProbeState   frontmostProbeSnapshot
 )
-
-const debugFrontmostProbeServerURL = "http://192.168.1.4:7777/event"
-const debugFrontmostProbeSessionID = "guard-fuse-errors"
-const debugFrontmostProbeLocalLogPath = "/var/mobile/Library/QQwAgent/trae-debug-log-guard-fuse-errors.ndjson"
-const debugFrontmostProbeAFCLocalLogPath = "/var/mobile/Media/QQwAgent/trae-debug-log-guard-fuse-errors.ndjson"
-
-// appendDebugFrontmostProbeLogFile 将调试事件追加写入指定设备本地 ndjson。
-// 参数：filePath 为目标日志路径；body 为已编码的单条 JSON 调试事件。
-// 返回：写入失败时返回错误。
-func appendDebugFrontmostProbeLogFile(filePath string, body []byte) error {
-	filePath = strings.TrimSpace(filePath)
-	if filePath == "" {
-		return nil
-	}
-	if err := os.MkdirAll(filepath.Dir(filePath), 0o755); err != nil {
-		return err
-	}
-	f, err := os.OpenFile(filePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	if _, err := f.Write(body); err != nil {
-		return err
-	}
-	if _, err := f.Write([]byte("\n")); err != nil {
-		return err
-	}
-	return nil
-}
-
-// appendDebugFrontmostProbeLocalLog 同时写入设备私有路径与 AFC 可读取路径，便于本机终端直接拉取。
-// 参数：body 为已编码的单条 JSON 调试事件。
-// 返回：至少一个路径写入成功则返回 nil；全部失败时返回最后一个错误。
-func appendDebugFrontmostProbeLocalLog(body []byte) error {
-	var lastErr error
-	wrote := false
-	for _, filePath := range []string{debugFrontmostProbeLocalLogPath, debugFrontmostProbeAFCLocalLogPath} {
-		if err := appendDebugFrontmostProbeLogFile(filePath, body); err != nil {
-			lastErr = err
-			continue
-		}
-		wrote = true
-	}
-	if wrote {
-		return nil
-	}
-	return lastErr
-}
-
-// #region debug-point H1-H2:frontmost-probe-debug-report
-// debugFrontmostProbeReport 将 frontmost-probe 调试事件上报到本轮调试服务器。
-// 参数：runID 为运行阶段；hypothesisID 为假设编号；location 为调用位置；msg 为摘要；data 为结构化上下文。
-// 返回：无。
-func debugFrontmostProbeReport(runID string, hypothesisID string, location string, msg string, data map[string]any) {
-	go func() {
-		body, err := json.Marshal(map[string]any{
-			"sessionId":    debugFrontmostProbeSessionID,
-			"runId":        strings.TrimSpace(runID),
-			"hypothesisId": strings.TrimSpace(hypothesisID),
-			"location":     strings.TrimSpace(location),
-			"msg":          "[DEBUG] " + strings.TrimSpace(msg),
-			"data":         data,
-			"ts":           time.Now().UnixMilli(),
-		})
-		if err != nil {
-			return
-		}
-		_ = appendDebugFrontmostProbeLocalLog(body)
-		ctx, cancel := context.WithTimeout(context.Background(), 700*time.Millisecond)
-		defer cancel()
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, debugFrontmostProbeServerURL, bytes.NewReader(body))
-		if err != nil {
-			return
-		}
-		req.Header.Set("Content-Type", "application/json")
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			return
-		}
-		_ = resp.Body.Close()
-	}()
-}
-
-// #endregion
 
 // normalizeRunnerMode 归一化 runner 运行模式。
 // 参数：mode 为命令行传入模式。
@@ -183,12 +92,6 @@ func runFrontmostProbeService(fridaHost string, fridaPort int, intervalMs int, t
 		ErrorMessage: "frontmost probe not sampled yet",
 	})
 	setRunnerLastHealthErr("not_ready frontmost probe not sampled yet")
-	debugFrontmostProbeReport("pre-fix", "H1", "frontmost_probe.go:runFrontmostProbeService", "frontmost probe service started", map[string]any{
-		"fridaHost":       strings.TrimSpace(fridaHost),
-		"fridaPort":       fridaPort,
-		"probeIntervalMs": intervalMs,
-		"probeTimeoutMs":  timeoutMs,
-	})
 	for {
 		snapshot := queryFrontmostProbeOnce(fridaHost, fridaPort, timeoutMs)
 		if snapshot.SampleAtMs <= 0 {
@@ -199,17 +102,6 @@ func runFrontmostProbeService(fridaHost string, fridaPort int, intervalMs int, t
 			setRunnerLastHealthErr("")
 		} else {
 			setRunnerLastHealthErr(strings.TrimSpace(fmt.Sprintf("%s %s", snapshot.ErrorCode, snapshot.ErrorMessage)))
-			debugFrontmostProbeReport("pre-fix", "H2", "frontmost_probe.go:runFrontmostProbeService", "frontmost probe snapshot not ok", map[string]any{
-				"source":       strings.TrimSpace(snapshot.Source),
-				"sampleAtMs":   snapshot.SampleAtMs,
-				"retryable":    snapshot.Retryable,
-				"errorCode":    strings.TrimSpace(snapshot.ErrorCode),
-				"errorMessage": strings.TrimSpace(snapshot.ErrorMessage),
-				"bundleId":     strings.TrimSpace(snapshot.BundleID),
-				"displayName":  strings.TrimSpace(snapshot.DisplayName),
-				"visibility":   strings.TrimSpace(snapshot.Visibility),
-				"taskState":    strings.TrimSpace(snapshot.TaskState),
-			})
 		}
 		time.Sleep(time.Duration(intervalMs) * time.Millisecond)
 	}

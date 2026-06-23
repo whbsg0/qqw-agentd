@@ -725,10 +725,17 @@ func (a *Agent) detectWhatsAppFrontmost() (bool, error) {
 	}
 	if cErr != nil {
 		defer C.qqw_guard_free(cErr)
-		err := errors.New(C.GoString(cErr))
+		errText := C.GoString(cErr)
+		if strings.TrimSpace(detail) != "" {
+			errText += ": " + strings.TrimSpace(detail)
+		}
+		err := errors.New(errText)
 		return false, err
 	}
 	if rc < 0 {
+		if strings.TrimSpace(detail) != "" {
+			return false, errors.New("frontmost query failed: " + strings.TrimSpace(detail))
+		}
 		return false, errors.New("frontmost query failed")
 	}
 	matched := rc != 0
