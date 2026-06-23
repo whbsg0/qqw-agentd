@@ -1997,13 +1997,19 @@ func (b *Broker) maybeEmitWaAccountPatched(deviceID, status string, lastSeenMs i
 	guardState := ""
 	guardReasonCode := ""
 	guardListeningReady := false
+	runnerRpcOk := false
+	runnerScriptReady := false
+	scriptPongFresh := false
 	if health != nil {
 		guardEnabled = health.Guard.Enabled
 		guardState = strings.TrimSpace(health.Guard.State)
 		guardReasonCode = strings.TrimSpace(health.Guard.ReasonCode)
 		guardListeningReady = health.Guard.ListeningReady
+		runnerRpcOk = health.Runner.RpcOk
+		runnerScriptReady = health.Runner.ScriptReady
+		scriptPongFresh = health.Script.LastPongTsMs > 0 && lastSeenMs-health.Script.LastPongTsMs <= 45_000
 	}
-	key := status + "|" + scriptState + "|" + strconv.FormatBool(guardEnabled) + "|" + guardState + "|" + guardReasonCode + "|" + strconv.FormatBool(guardListeningReady)
+	key := status + "|" + scriptState + "|" + strconv.FormatBool(runnerRpcOk) + "|" + strconv.FormatBool(runnerScriptReady) + "|" + strconv.FormatBool(scriptPongFresh) + "|" + strconv.FormatBool(guardEnabled) + "|" + guardState + "|" + guardReasonCode + "|" + strconv.FormatBool(guardListeningReady)
 	b.presenceEmitMu.Lock()
 	lastAt := b.lastPresenceEmitMs[deviceID]
 	lastKey := b.lastPresenceEmitKey[deviceID]
@@ -2030,9 +2036,12 @@ func (b *Broker) maybeEmitWaAccountPatched(deviceID, status string, lastSeenMs i
 		payload["runnerPid"] = health.Runner.Pid
 		payload["runnerRpcOk"] = health.Runner.RpcOk
 		payload["runnerScriptReady"] = health.Runner.ScriptReady
+		payload["runnerLastHealthAtMs"] = health.Runner.LastHealthAtMs
+		payload["runnerLastHealthErr"] = strings.TrimSpace(health.Runner.LastHealthErr)
 		payload["scriptUpdatedAtMs"] = health.Script.UpdatedAtMs
 		payload["scriptLastEventTsMs"] = health.Script.LastEventTsMs
 		payload["scriptLastPongTsMs"] = health.Script.LastPongTsMs
+		payload["scriptPongFresh"] = scriptPongFresh
 		payload["guardEnabled"] = health.Guard.Enabled
 		payload["guardState"] = strings.TrimSpace(health.Guard.State)
 		payload["guardRunnerState"] = strings.TrimSpace(health.Guard.RunnerState)

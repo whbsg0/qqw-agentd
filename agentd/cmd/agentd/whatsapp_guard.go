@@ -1,26 +1,123 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"net/http"
 	"os/exec"
 	"strings"
 	"time"
 )
 
+const debugGuardServerURL = "http://192.168.1.4:7777/event"
+const debugGuardSessionID = "multi-device-guard-drift"
+
+// #region debug-point H1-H5:guard-debug-report
+func debugGuardReport(runID string, hypothesisID string, location string, msg string, data map[string]any) {
+	go func() {
+		body, err := json.Marshal(map[string]any{
+			"sessionId":    debugGuardSessionID,
+			"runId":        runID,
+			"hypothesisId": hypothesisID,
+			"location":     location,
+			"msg":          "[DEBUG] " + strings.TrimSpace(msg),
+			"data":         data,
+			"ts":           time.Now().UnixMilli(),
+		})
+		if err != nil {
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 700*time.Millisecond)
+		defer cancel()
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, debugGuardServerURL, bytes.NewReader(body))
+		if err != nil {
+			return
+		}
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return
+		}
+		_ = resp.Body.Close()
+	}()
+}
+
+func debugGuardSamplePS(output string) []string {
+	src := strings.Split(output, "\n")
+	out := make([]string, 0, 4)
+	for _, line := range src {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if strings.Contains(strings.ToLower(line), "whatsapp") || len(out) == 0 {
+			out = append(out, line)
+		}
+		if len(out) >= 4 {
+			break
+		}
+	}
+	return out
+}
+
+// #endregion
+
 // guardRuntimeSnapshot 表示当前守护循环的运行态快照。
 // 字段用途：用于 `/status`、`/guard/status` 和手机端守护状态展示。
 type guardRuntimeSnapshot struct {
-	State                 string
-	RunnerState           string
-	ReasonCode            string
-	ListeningReady        bool
-	ProcessRunning        bool
-	LastRecoveryAtMs      int64
-	RecoveryAttempts      int
-	MaxRecoveryAttempts   int
-	RemainingRetryCount   int
-	NextRetryAtMs         int64
+	GuardEnabled   bool
+	State          string
+	GuardState     string
+	RunnerState    string
+	ReasonCode     string
+	ListeningReady bool
+
+	ProcessRunning    bool
+	ProcessProbeErr   string
+	ProcessSampleAtMs int64
+
+	Frontmost           bool
+	FrontmostErr        string
+	FrontmostSampleAtMs int64
+	FrontmostFresh      bool
+
+	RunnerProcessAlive      bool
+	RunnerPid               int64
+	RunnerRPCOK             bool
+	ScriptReady             bool
+	RunnerScriptBuild       string
+	RunnerScriptSha256      string
+	RunnerSampleAtMs        int64
+	RunnerLastHealthErr     string
+	RunnerLastHealthErrAtMs int64
+
+	ScriptInstalledPath        string
+	ScriptInstalledUpdatedAtMs int64
+	ScriptInstalledBuild       string
+	ScriptInstalledSha256      string
+	ScriptLastEventTsMs        int64
+	ScriptLastPongTsMs         int64
+	ScriptEventFresh           bool
+	ScriptPongFresh            bool
+	ScriptBuildMatch           bool
+	ScriptSha256Match          bool
+
+	ProbeEpoch    int64
+	RecoveryEpoch int64
+
+	LastRecoveryAtMs        int64
+	RecoveryAttempts        int
+	MaxRecoveryAttempts     int
+	RemainingRetryCount     int
+	NextRetryAtMs           int64
+	RecoveryInFlight        bool
+	RecoveryPending         bool
+	RecoveryAction          string
+	RecoveryRequestedState  string
+	RecoveryRequestedReason string
+
 	FrontmostQueryEnabled bool
 }
 
@@ -31,15 +128,18 @@ func defaultGuardRuntimeSnapshot(cfg Config) guardRuntimeSnapshot {
 	state := "guard_off"
 	reason := "guard_switch_off"
 	if cfg.WhatsApp.AutoGuardEnabled {
-		state = "wa_not_running"
-		reason = ""
+		state = "wa_process_probe_failed"
+		reason = "probe_not_sampled_yet"
 	}
 	return guardRuntimeSnapshot{
+		GuardEnabled:          cfg.WhatsApp.AutoGuardEnabled,
 		State:                 state,
+		GuardState:            state,
 		RunnerState:           "runner_down",
 		ReasonCode:            reason,
 		ListeningReady:        false,
 		ProcessRunning:        false,
+		FrontmostFresh:        !guardFrontmostQueryEnabled(),
 		LastRecoveryAtMs:      0,
 		RecoveryAttempts:      0,
 		MaxRecoveryAttempts:   cfg.WhatsApp.MaxRecoveryAttempts,
@@ -73,6 +173,20 @@ func (a *Agent) setGuardRuntimeSnapshot(snapshot guardRuntimeSnapshot) {
 	a.guardStateMu.Lock()
 	a.guardState = snapshot
 	a.guardStateMu.Unlock()
+	// #region debug-point H4:guard-snapshot
+	debugGuardReport("pre-fix", "H4", "whatsapp_guard.go:setGuardRuntimeSnapshot", "guard snapshot updated", map[string]any{
+		"state":            snapshot.State,
+		"runnerState":      snapshot.RunnerState,
+		"reasonCode":       snapshot.ReasonCode,
+		"listeningReady":   snapshot.ListeningReady,
+		"processRunning":   snapshot.ProcessRunning,
+		"frontmostFresh":   snapshot.FrontmostFresh,
+		"runnerRpcOk":      snapshot.RunnerRPCOK,
+		"scriptReady":      snapshot.ScriptReady,
+		"recoveryAttempts": snapshot.RecoveryAttempts,
+		"nextRetryAtMs":    snapshot.NextRetryAtMs,
+	})
+	// #endregion
 }
 
 // wakeGuardLoop 唤醒守护循环，使配置切换和手工动作能尽快生效。
@@ -92,16 +206,42 @@ func (a *Agent) wakeGuardLoop() {
 // 参数：ctx 为循环上下文。
 // 返回：无。
 func (a *Agent) runGuardLoop(ctx context.Context) {
+	cfg := a.getCfg()
 	var confirmStartedAt time.Time
-	a.setGuardRuntimeSnapshot(defaultGuardRuntimeSnapshot(a.getCfg()))
+	a.setGuardRuntimeSnapshot(defaultGuardRuntimeSnapshot(cfg))
+	a.startGuardWorkers(ctx)
+	a.bumpGuardProbeEpoch("guard_loop_start")
 	for {
 		if ctx.Err() != nil {
 			return
 		}
-		waitFor := a.runGuardIteration(ctx, &confirmStartedAt)
-		if waitFor <= 0 {
-			waitFor = time.Second
+		cfg = a.getCfg()
+		now := time.Now()
+		trimmedAttempts, blocked, err := a.trimGuardRecoveryAttemptsPersisted(now.UnixMilli(), cfg.WhatsApp.RecoveryWindowMs)
+		if err != nil {
+			a.recordGuardAction("guard_store_trim", err)
 		}
+		if blocked && trimmedAttempts == 0 {
+			if err := a.clearGuardRecoveryState(); err == nil {
+				blocked = false
+			}
+		}
+		manualRecover := a.consumeGuardForceRecoverRequest()
+		recoveryStatus := a.getGuardRecoveryStatus()
+		snapshot := deriveGuardRuntimeSnapshot(
+			cfg,
+			a.getGuardProbeSnapshot(),
+			trimmedAttempts,
+			blocked,
+			recoveryStatus,
+			now,
+			&confirmStartedAt,
+		)
+		a.setGuardRuntimeSnapshot(snapshot)
+		if !snapshot.RecoveryInFlight && !snapshot.RecoveryPending {
+			_ = a.maybeScheduleGuardRecovery(cfg, snapshot, manualRecover)
+		}
+		waitFor := time.Duration(maxInt(cfg.WhatsApp.HealthCheckMs, 1000)) * time.Millisecond
 		select {
 		case <-ctx.Done():
 			return
@@ -109,483 +249,6 @@ func (a *Agent) runGuardLoop(ctx context.Context) {
 		case <-time.After(waitFor):
 		}
 	}
-}
-
-// runGuardIteration 执行一轮守护检查与恢复决策。
-// 参数：ctx 为循环上下文；confirmStartedAt 用于跨轮记住确认窗口起点。
-// 返回：下一轮建议等待时长。
-func (a *Agent) runGuardIteration(ctx context.Context, confirmStartedAt *time.Time) time.Duration {
-	cfg := a.getCfg()
-	now := time.Now()
-	frontmostEnabled := guardFrontmostQueryEnabled()
-	trimmedAttempts, blocked, err := a.trimGuardRecoveryAttemptsPersisted(now.UnixMilli(), cfg.WhatsApp.RecoveryWindowMs)
-	if !cfg.WhatsApp.AutoGuardEnabled {
-		*confirmStartedAt = time.Time{}
-		a.setGuardRuntimeSnapshot(defaultGuardRuntimeSnapshot(cfg))
-		return time.Duration(cfg.WhatsApp.HealthCheckMs) * time.Millisecond
-	}
-	if err != nil {
-		a.recordGuardAction("guard_store_trim", err)
-		return time.Duration(cfg.WhatsApp.HealthCheckMs) * time.Millisecond
-	}
-	if blocked {
-		*confirmStartedAt = time.Time{}
-		snapshot := a.getGuardRuntimeSnapshot(cfg)
-		snapshot.State = "wa_crash_loop_blocked"
-		snapshot.RunnerState = "runner_down"
-		snapshot.ReasonCode = "recovery_retry_exhausted"
-		snapshot.ListeningReady = false
-		snapshot.RecoveryAttempts = trimmedAttempts
-		snapshot.RemainingRetryCount = 0
-		snapshot.NextRetryAtMs = 0
-		snapshot.FrontmostQueryEnabled = frontmostEnabled
-		a.setGuardRuntimeSnapshot(snapshot)
-		return time.Duration(cfg.WhatsApp.HealthCheckMs) * time.Millisecond
-	}
-	manualRecover := a.consumeGuardForceRecoverRequest()
-
-	processRunning, processErr := a.detectWhatsAppProcess()
-	runnerState, runnerReady, runnerReason := a.queryRunnerGuardState(cfg)
-	frontmost := false
-	var frontmostErr error
-	if processErr != nil {
-		if runnerReady {
-			processRunning = true
-		} else {
-			snapshot := a.getGuardRuntimeSnapshot(cfg)
-			snapshot.State = "wa_background"
-			snapshot.RunnerState = runnerState
-			snapshot.ReasonCode = "wa_process_probe_failed"
-			snapshot.ListeningReady = false
-			snapshot.ProcessRunning = false
-			snapshot.RecoveryAttempts = trimmedAttempts
-			snapshot.RemainingRetryCount = clampRemainingRetries(cfg.WhatsApp.MaxRecoveryAttempts, trimmedAttempts)
-			snapshot.NextRetryAtMs = 0
-			snapshot.FrontmostQueryEnabled = frontmostEnabled
-			a.setGuardRuntimeSnapshot(snapshot)
-			return time.Duration(cfg.WhatsApp.HealthCheckMs) * time.Millisecond
-		}
-	}
-
-	if frontmostEnabled {
-		if processRunning {
-			frontmost, frontmostErr = a.detectWhatsAppFrontmost()
-		}
-		if processRunning && frontmostErr != nil {
-			snapshot := a.getGuardRuntimeSnapshot(cfg)
-			snapshot.State = "wa_background"
-			snapshot.RunnerState = runnerState
-			snapshot.ReasonCode = "wa_frontmost_query_failed"
-			snapshot.ListeningReady = false
-			snapshot.ProcessRunning = processRunning
-			snapshot.RecoveryAttempts = trimmedAttempts
-			snapshot.RemainingRetryCount = clampRemainingRetries(cfg.WhatsApp.MaxRecoveryAttempts, trimmedAttempts)
-			snapshot.NextRetryAtMs = 0
-			snapshot.FrontmostQueryEnabled = true
-			a.setGuardRuntimeSnapshot(snapshot)
-			return time.Duration(cfg.WhatsApp.HealthCheckMs) * time.Millisecond
-		}
-		if processRunning && frontmost && runnerReady {
-			*confirmStartedAt = time.Time{}
-			snapshot := a.getGuardRuntimeSnapshot(cfg)
-			snapshot.State = "wa_foreground_ready"
-			snapshot.RunnerState = "runner_ready"
-			snapshot.ReasonCode = ""
-			snapshot.ListeningReady = true
-			snapshot.ProcessRunning = true
-			snapshot.RecoveryAttempts = trimmedAttempts
-			snapshot.RemainingRetryCount = clampRemainingRetries(cfg.WhatsApp.MaxRecoveryAttempts, trimmedAttempts)
-			snapshot.NextRetryAtMs = 0
-			snapshot.FrontmostQueryEnabled = true
-			a.setGuardRuntimeSnapshot(snapshot)
-			return time.Duration(cfg.WhatsApp.HealthCheckMs) * time.Millisecond
-		}
-		if processRunning && frontmost && runnerState == "runner_starting" {
-			snapshot := a.getGuardRuntimeSnapshot(cfg)
-			snapshot.State = "wa_wait_foreground_stable"
-			snapshot.RunnerState = "runner_starting"
-			snapshot.ReasonCode = ""
-			snapshot.ListeningReady = false
-			snapshot.ProcessRunning = true
-			snapshot.RecoveryAttempts = trimmedAttempts
-			snapshot.RemainingRetryCount = clampRemainingRetries(cfg.WhatsApp.MaxRecoveryAttempts, trimmedAttempts)
-			snapshot.FrontmostQueryEnabled = true
-			a.setGuardRuntimeSnapshot(snapshot)
-			return time.Duration(maxInt(cfg.WhatsApp.HealthCheckMs, 1000)) * time.Millisecond
-		}
-		if processRunning && frontmost {
-			*confirmStartedAt = time.Time{}
-			if manualRecover && runnerReady {
-				return time.Duration(cfg.WhatsApp.HealthCheckMs) * time.Millisecond
-			}
-			return a.runGuardRunnerRecovery(ctx, cfg, firstNonEmpty(runnerReason, "runner_detached"))
-		}
-	}
-
-	if manualRecover {
-		*confirmStartedAt = time.Time{}
-		if !processRunning {
-			return a.runGuardRecovery(ctx, cfg, "wa_process_missing", false)
-		}
-		if frontmostEnabled && frontmostErr == nil && !frontmost {
-			return a.runGuardRecovery(ctx, cfg, firstNonEmpty(runnerReason, "wa_not_frontmost"), true)
-		}
-		if !frontmostEnabled && runnerReady {
-			return time.Duration(cfg.WhatsApp.HealthCheckMs) * time.Millisecond
-		}
-		return a.runGuardRecovery(ctx, cfg, firstNonEmpty(runnerReason, "wa_not_frontmost"), processRunning)
-	}
-
-	if processRunning && runnerReady {
-		*confirmStartedAt = time.Time{}
-		snapshot := a.getGuardRuntimeSnapshot(cfg)
-		snapshot.State = "wa_foreground_ready"
-		snapshot.RunnerState = "runner_ready"
-		snapshot.ReasonCode = ""
-		snapshot.ListeningReady = true
-		snapshot.ProcessRunning = true
-		snapshot.RecoveryAttempts = trimmedAttempts
-		snapshot.RemainingRetryCount = clampRemainingRetries(cfg.WhatsApp.MaxRecoveryAttempts, trimmedAttempts)
-		snapshot.NextRetryAtMs = 0
-		snapshot.FrontmostQueryEnabled = frontmostEnabled
-		a.setGuardRuntimeSnapshot(snapshot)
-		return time.Duration(cfg.WhatsApp.HealthCheckMs) * time.Millisecond
-	}
-
-	if processRunning && runnerState == "runner_starting" {
-		snapshot := a.getGuardRuntimeSnapshot(cfg)
-		snapshot.State = "wa_wait_foreground_stable"
-		snapshot.RunnerState = "runner_starting"
-		snapshot.ReasonCode = ""
-		snapshot.ListeningReady = false
-		snapshot.ProcessRunning = true
-		snapshot.RecoveryAttempts = trimmedAttempts
-		snapshot.RemainingRetryCount = clampRemainingRetries(cfg.WhatsApp.MaxRecoveryAttempts, trimmedAttempts)
-		snapshot.FrontmostQueryEnabled = frontmostEnabled
-		a.setGuardRuntimeSnapshot(snapshot)
-		return time.Duration(maxInt(cfg.WhatsApp.HealthCheckMs, 1000)) * time.Millisecond
-	}
-
-	if !processRunning {
-		*confirmStartedAt = time.Time{}
-		return a.runGuardRecovery(ctx, cfg, "wa_process_missing", false)
-	}
-
-	if confirmStartedAt.IsZero() {
-		*confirmStartedAt = now
-		snapshot := a.getGuardRuntimeSnapshot(cfg)
-		snapshot.State = "wa_wait_foreground_confirm"
-		snapshot.RunnerState = runnerState
-		snapshot.ReasonCode = firstNonEmpty(runnerReason, "wa_not_frontmost")
-		snapshot.ListeningReady = false
-		snapshot.ProcessRunning = true
-		snapshot.RecoveryAttempts = trimmedAttempts
-		snapshot.RemainingRetryCount = clampRemainingRetries(cfg.WhatsApp.MaxRecoveryAttempts, trimmedAttempts)
-		snapshot.FrontmostQueryEnabled = frontmostEnabled
-		a.setGuardRuntimeSnapshot(snapshot)
-		return time.Second
-	}
-
-	if now.Sub(*confirmStartedAt) < time.Duration(cfg.WhatsApp.ForegroundConfirmMs)*time.Millisecond {
-		snapshot := a.getGuardRuntimeSnapshot(cfg)
-		snapshot.State = "wa_wait_foreground_confirm"
-		snapshot.RunnerState = runnerState
-		snapshot.ReasonCode = firstNonEmpty(runnerReason, "wa_not_frontmost")
-		snapshot.ListeningReady = false
-		snapshot.ProcessRunning = true
-		snapshot.RecoveryAttempts = trimmedAttempts
-		snapshot.RemainingRetryCount = clampRemainingRetries(cfg.WhatsApp.MaxRecoveryAttempts, trimmedAttempts)
-		snapshot.FrontmostQueryEnabled = frontmostEnabled
-		a.setGuardRuntimeSnapshot(snapshot)
-		return time.Second
-	}
-
-	*confirmStartedAt = time.Time{}
-	return a.runGuardRecovery(ctx, cfg, firstNonEmpty(runnerReason, "wa_not_frontmost"), true)
-}
-
-// runGuardRecovery 执行一轮恢复流程。
-// 参数：ctx 为循环上下文；cfg 为当前配置；reasonCode 为本轮恢复原因；processRunning 表示恢复前是否已有进程。
-// 返回：下一轮建议等待时长。
-func (a *Agent) runGuardRecovery(ctx context.Context, cfg Config, reasonCode string, processRunning bool) time.Duration {
-	nowMs := time.Now().UnixMilli()
-	attemptNo, blocked, attemptsCount, err := a.appendGuardRecoveryAttemptPersisted(nowMs, cfg.WhatsApp.RecoveryWindowMs, cfg.WhatsApp.MaxRecoveryAttempts)
-	if err != nil {
-		a.recordGuardAction("guard_store_append", err)
-		return time.Duration(cfg.WhatsApp.HealthCheckMs) * time.Millisecond
-	}
-	remaining := clampRemainingRetries(cfg.WhatsApp.MaxRecoveryAttempts, attemptsCount)
-	if blocked {
-		_ = a.stopRunnerIfRunning()
-		a.recordGuardAction("guard_blocked", errors.New("recovery retry exhausted"))
-		snapshot := a.getGuardRuntimeSnapshot(cfg)
-		snapshot.State = "wa_crash_loop_blocked"
-		snapshot.RunnerState = "runner_down"
-		snapshot.ReasonCode = "recovery_retry_exhausted"
-		snapshot.ListeningReady = false
-		snapshot.ProcessRunning = processRunning
-		snapshot.RecoveryAttempts = attemptsCount
-		snapshot.RemainingRetryCount = 0
-		snapshot.NextRetryAtMs = 0
-		snapshot.FrontmostQueryEnabled = guardFrontmostQueryEnabled()
-		a.setGuardRuntimeSnapshot(snapshot)
-		return time.Duration(cfg.WhatsApp.HealthCheckMs) * time.Millisecond
-	}
-
-	backoff := guardRecoveryBackoff(attemptNo)
-	nextRetryAtMs := time.Now().Add(backoff).UnixMilli()
-	snapshot := a.getGuardRuntimeSnapshot(cfg)
-	snapshot.State = "wa_launching"
-	snapshot.RunnerState = "runner_down"
-	snapshot.ReasonCode = reasonCode
-	snapshot.ListeningReady = false
-	snapshot.ProcessRunning = processRunning
-	snapshot.RecoveryAttempts = attemptsCount
-	snapshot.RemainingRetryCount = remaining
-	snapshot.NextRetryAtMs = nextRetryAtMs
-	snapshot.FrontmostQueryEnabled = guardFrontmostQueryEnabled()
-	a.setGuardRuntimeSnapshot(snapshot)
-
-	if backoff > 0 {
-		if !waitGuardDuration(ctx, a.guardWake, backoff) {
-			return time.Second
-		}
-	}
-	if !a.getCfg().WhatsApp.AutoGuardEnabled {
-		return time.Second
-	}
-
-	_ = a.stopRunnerIfRunning()
-	a.recordGuardAction("guard_recover_begin", nil)
-	if err := a.launchWhatsApp(); err != nil {
-		a.recordGuardAction("guard_recover_launch_failed", err)
-		snapshot := a.getGuardRuntimeSnapshot(cfg)
-		snapshot.State = "wa_not_running"
-		snapshot.RunnerState = "runner_down"
-		snapshot.ReasonCode = "wa_launch_failed"
-		snapshot.ListeningReady = false
-		snapshot.ProcessRunning = false
-		snapshot.RecoveryAttempts = attemptsCount
-		snapshot.RemainingRetryCount = remaining
-		snapshot.NextRetryAtMs = 0
-		snapshot.FrontmostQueryEnabled = guardFrontmostQueryEnabled()
-		a.setGuardRuntimeSnapshot(snapshot)
-		return time.Duration(cfg.WhatsApp.HealthCheckMs) * time.Millisecond
-	}
-
-	snapshot = a.getGuardRuntimeSnapshot(cfg)
-	snapshot.State = "wa_wait_foreground_stable"
-	snapshot.RunnerState = "runner_starting"
-	snapshot.ReasonCode = ""
-	snapshot.ListeningReady = false
-	snapshot.ProcessRunning = true
-	snapshot.RecoveryAttempts = attemptsCount
-	snapshot.RemainingRetryCount = remaining
-	snapshot.NextRetryAtMs = 0
-	a.setGuardRuntimeSnapshot(snapshot)
-
-	if err := a.startRunner(); err != nil {
-		a.recordGuardAction("guard_recover_runner_start_failed", err)
-		snapshot := a.getGuardRuntimeSnapshot(cfg)
-		snapshot.State = "wa_background"
-		snapshot.RunnerState = "runner_broken"
-		snapshot.ReasonCode = "runner_start_failed"
-		snapshot.ListeningReady = false
-		snapshot.ProcessRunning = true
-		snapshot.RecoveryAttempts = attemptsCount
-		snapshot.RemainingRetryCount = remaining
-		snapshot.FrontmostQueryEnabled = guardFrontmostQueryEnabled()
-		a.setGuardRuntimeSnapshot(snapshot)
-		return time.Duration(cfg.WhatsApp.HealthCheckMs) * time.Millisecond
-	}
-
-	if a.waitRunnerReadyAfterRecovery(ctx, cfg, attemptsCount, remaining) {
-		return time.Duration(cfg.WhatsApp.HealthCheckMs) * time.Millisecond
-	}
-	return time.Duration(cfg.WhatsApp.HealthCheckMs) * time.Millisecond
-}
-
-// runGuardRunnerRecovery 在 WhatsApp 已前台时只恢复 runner，不重复拉起 app。
-// 参数：ctx 为循环上下文；cfg 为当前配置；reasonCode 为本轮恢复原因。
-// 返回：下一轮建议等待时长。
-func (a *Agent) runGuardRunnerRecovery(ctx context.Context, cfg Config, reasonCode string) time.Duration {
-	nowMs := time.Now().UnixMilli()
-	attemptNo, blocked, attemptsCount, err := a.appendGuardRecoveryAttemptPersisted(nowMs, cfg.WhatsApp.RecoveryWindowMs, cfg.WhatsApp.MaxRecoveryAttempts)
-	if err != nil {
-		a.recordGuardAction("guard_store_append", err)
-		return time.Duration(cfg.WhatsApp.HealthCheckMs) * time.Millisecond
-	}
-	remaining := clampRemainingRetries(cfg.WhatsApp.MaxRecoveryAttempts, attemptsCount)
-	if blocked {
-		_ = a.stopRunnerIfRunning()
-		a.recordGuardAction("guard_runner_blocked", errors.New("recovery retry exhausted"))
-		snapshot := a.getGuardRuntimeSnapshot(cfg)
-		snapshot.State = "wa_crash_loop_blocked"
-		snapshot.RunnerState = "runner_down"
-		snapshot.ReasonCode = "recovery_retry_exhausted"
-		snapshot.ListeningReady = false
-		snapshot.ProcessRunning = true
-		snapshot.RecoveryAttempts = attemptsCount
-		snapshot.RemainingRetryCount = 0
-		snapshot.NextRetryAtMs = 0
-		snapshot.FrontmostQueryEnabled = guardFrontmostQueryEnabled()
-		a.setGuardRuntimeSnapshot(snapshot)
-		return time.Duration(cfg.WhatsApp.HealthCheckMs) * time.Millisecond
-	}
-
-	backoff := guardRecoveryBackoff(attemptNo)
-	nextRetryAtMs := time.Now().Add(backoff).UnixMilli()
-	snapshot := a.getGuardRuntimeSnapshot(cfg)
-	snapshot.State = "wa_wait_foreground_stable"
-	snapshot.RunnerState = "runner_down"
-	snapshot.ReasonCode = reasonCode
-	snapshot.ListeningReady = false
-	snapshot.ProcessRunning = true
-	snapshot.RecoveryAttempts = attemptsCount
-	snapshot.RemainingRetryCount = remaining
-	snapshot.NextRetryAtMs = nextRetryAtMs
-	snapshot.FrontmostQueryEnabled = guardFrontmostQueryEnabled()
-	a.setGuardRuntimeSnapshot(snapshot)
-
-	if backoff > 0 {
-		if !waitGuardDuration(ctx, a.guardWake, backoff) {
-			return time.Second
-		}
-	}
-	if !a.getCfg().WhatsApp.AutoGuardEnabled {
-		return time.Second
-	}
-
-	_ = a.stopRunnerIfRunning()
-	a.recordGuardAction("guard_runner_recover_begin", nil)
-	if err := a.startRunner(); err != nil {
-		a.recordGuardAction("guard_runner_recover_start_failed", err)
-		snapshot := a.getGuardRuntimeSnapshot(cfg)
-		snapshot.State = "wa_foreground_ready"
-		snapshot.RunnerState = "runner_broken"
-		snapshot.ReasonCode = "runner_start_failed"
-		snapshot.ListeningReady = false
-		snapshot.ProcessRunning = true
-		snapshot.RecoveryAttempts = attemptsCount
-		snapshot.RemainingRetryCount = remaining
-		snapshot.NextRetryAtMs = 0
-		snapshot.FrontmostQueryEnabled = guardFrontmostQueryEnabled()
-		a.setGuardRuntimeSnapshot(snapshot)
-		return time.Duration(cfg.WhatsApp.HealthCheckMs) * time.Millisecond
-	}
-
-	if a.waitRunnerReadyAfterRecovery(ctx, cfg, attemptsCount, remaining) {
-		return time.Duration(cfg.WhatsApp.HealthCheckMs) * time.Millisecond
-	}
-	return time.Duration(cfg.WhatsApp.HealthCheckMs) * time.Millisecond
-}
-
-// waitRunnerReadyAfterRecovery 在恢复启动后等待 runner 进入 ready。
-// 参数：ctx 为循环上下文；cfg 为当前配置；attemptsCount 为当前窗口内恢复次数；remaining 为剩余可重试次数。
-// 返回：进入 ready 返回 true，否则返回 false。
-func (a *Agent) waitRunnerReadyAfterRecovery(ctx context.Context, cfg Config, attemptsCount int, remaining int) bool {
-	waitMs := maxInt(cfg.WhatsApp.ForegroundStableMs, cfg.WhatsApp.HealthCheckMs*2)
-	deadline := time.Now().Add(time.Duration(waitMs) * time.Millisecond)
-	frontmostEnabled := guardFrontmostQueryEnabled()
-	for time.Now().Before(deadline) {
-		if ctx.Err() != nil {
-			return false
-		}
-		if !a.getCfg().WhatsApp.AutoGuardEnabled {
-			return false
-		}
-		processRunning, _ := a.detectWhatsAppProcess()
-		frontmost := processRunning
-		frontmostReason := ""
-		if processRunning && frontmostEnabled {
-			var err error
-			frontmost, err = a.detectWhatsAppFrontmost()
-			if err != nil {
-				frontmostReason = "wa_frontmost_query_failed"
-			}
-		}
-		runnerState, runnerReady, runnerReason := a.queryRunnerGuardState(cfg)
-		if processRunning && frontmost && runnerReady {
-			a.recordGuardAction("guard_recover_success", nil)
-			snapshot := a.getGuardRuntimeSnapshot(cfg)
-			snapshot.State = "wa_foreground_ready"
-			snapshot.RunnerState = "runner_ready"
-			snapshot.ReasonCode = ""
-			snapshot.ListeningReady = true
-			snapshot.ProcessRunning = true
-			snapshot.LastRecoveryAtMs = time.Now().UnixMilli()
-			snapshot.RecoveryAttempts = attemptsCount
-			snapshot.RemainingRetryCount = remaining
-			snapshot.NextRetryAtMs = 0
-			snapshot.FrontmostQueryEnabled = frontmostEnabled
-			a.setGuardRuntimeSnapshot(snapshot)
-			return true
-		}
-		snapshot := a.getGuardRuntimeSnapshot(cfg)
-		switch {
-		case !processRunning:
-			snapshot.State = "wa_not_running"
-			snapshot.ReasonCode = "wa_process_missing"
-		case frontmostReason != "":
-			snapshot.State = "wa_background"
-			snapshot.ReasonCode = frontmostReason
-		case !frontmost:
-			snapshot.State = "wa_background"
-			snapshot.ReasonCode = "wa_not_frontmost"
-		case runnerState == "runner_starting":
-			snapshot.State = "wa_wait_foreground_stable"
-			snapshot.ReasonCode = ""
-		default:
-			snapshot.State = "wa_foreground_ready"
-			snapshot.ReasonCode = runnerReason
-		}
-		snapshot.RunnerState = runnerState
-		snapshot.ListeningReady = false
-		snapshot.ProcessRunning = processRunning
-		snapshot.RecoveryAttempts = attemptsCount
-		snapshot.RemainingRetryCount = remaining
-		snapshot.FrontmostQueryEnabled = frontmostEnabled
-		a.setGuardRuntimeSnapshot(snapshot)
-		if !waitGuardDuration(ctx, a.guardWake, 500*time.Millisecond) {
-			return false
-		}
-	}
-	a.recordGuardAction("guard_recover_health_failed", errors.New("runner health wait timeout"))
-	snapshot := a.getGuardRuntimeSnapshot(cfg)
-	snapshot.State = "wa_background"
-	snapshot.RunnerState = "runner_broken"
-	snapshot.ReasonCode = "runner_health_failed"
-	snapshot.ListeningReady = false
-	snapshot.ProcessRunning = true
-	snapshot.RecoveryAttempts = attemptsCount
-	snapshot.RemainingRetryCount = remaining
-	snapshot.FrontmostQueryEnabled = frontmostEnabled
-	a.setGuardRuntimeSnapshot(snapshot)
-	return false
-}
-
-// queryRunnerGuardState 查询当前 runner 是否可视为守护 ready。
-// 参数：cfg 为当前配置。
-// 返回：runner 状态、是否 ready、失败原因码。
-func (a *Agent) queryRunnerGuardState(cfg Config) (string, bool, string) {
-	if a.runnerPid.Load() <= 0 {
-		return "runner_down", false, ""
-	}
-	health, err := a.getRunnerRPCHealth()
-	if err != nil {
-		return "runner_broken", false, "runner_health_failed"
-	}
-	if !health.ScriptReady {
-		graceMs := int64(maxInt(cfg.WhatsApp.ForegroundStableMs, cfg.WhatsApp.HealthCheckMs*2))
-		if graceMs <= 0 {
-			graceMs = 3000
-		}
-		if health.StartedAtMs > 0 && time.Now().UnixMilli()-health.StartedAtMs < graceMs {
-			return "runner_starting", false, ""
-		}
-		return "runner_broken", false, "runner_health_failed"
-	}
-	return "runner_ready", true, ""
 }
 
 // detectWhatsAppProcess 检查当前设备上是否存在 WhatsApp 进程。
@@ -617,13 +280,34 @@ func (a *Agent) detectWhatsAppProcess() (bool, error) {
 			} else {
 				lastErr = err
 			}
+			// #region debug-point H1:ps-command-error
+			debugGuardReport("pre-fix", "H1", "whatsapp_guard.go:detectWhatsAppProcess", "ps command failed", map[string]any{
+				"path":  command.path,
+				"args":  command.args,
+				"error": lastErr.Error(),
+			})
+			// #endregion
 			continue
 		}
-		return parsePSContainsWhatsApp(string(out)), nil
+		matched := parsePSContainsWhatsApp(string(out))
+		// #region debug-point H1:ps-command-result
+		debugGuardReport("pre-fix", "H1", "whatsapp_guard.go:detectWhatsAppProcess", "ps command parsed", map[string]any{
+			"path":    command.path,
+			"args":    command.args,
+			"matched": matched,
+			"sample":  debugGuardSamplePS(string(out)),
+		})
+		// #endregion
+		return matched, nil
 	}
 	if lastErr == nil {
 		lastErr = errors.New("ps not available")
 	}
+	// #region debug-point H1:ps-unavailable
+	debugGuardReport("pre-fix", "H1", "whatsapp_guard.go:detectWhatsAppProcess", "all ps commands unavailable", map[string]any{
+		"error": lastErr.Error(),
+	})
+	// #endregion
 	return false, lastErr
 }
 

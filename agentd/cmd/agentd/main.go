@@ -299,6 +299,16 @@ type Agent struct {
 	guardWake             chan struct{}
 	guardStateMu          sync.RWMutex
 	guardState            guardRuntimeSnapshot
+	guardWorkersOnce      sync.Once
+	guardProbeMu          sync.RWMutex
+	guardProcessProbe     processProbeResult
+	guardFrontmostProbe   frontmostProbeResult
+	guardRunnerProbe      runnerProbeResult
+	guardProbeEpoch       atomic.Int64
+	guardRecoveryEpoch    atomic.Int64
+	guardRecoveryQueue    chan guardRecoveryTask
+	guardRecoveryMu       sync.RWMutex
+	guardRecoveryState    guardRecoveryStatus
 	guardPersistMu        sync.Mutex
 	guardStorePath        string
 	guardRecoveryAttempts []int64
@@ -344,14 +354,15 @@ func main() {
 	}
 
 	a := &Agent{
-		cfg:          cfg,
-		deviceID:     deviceID,
-		scriptPath:   filepath.Join(filepath.Dir(cfg.DeviceIDPath), "scripts", "current.js"),
-		tunnels:      make(map[string]*Tunnel),
-		startedAt:    time.Now(),
-		reconnectNow: make(chan struct{}, 1),
-		guardWake:    make(chan struct{}, 1),
-		eventQueue:   NewEventQueue(filepath.Join(filepath.Dir(cfg.DeviceIDPath), "events")),
+		cfg:                cfg,
+		deviceID:           deviceID,
+		scriptPath:         filepath.Join(filepath.Dir(cfg.DeviceIDPath), "scripts", "current.js"),
+		tunnels:            make(map[string]*Tunnel),
+		startedAt:          time.Now(),
+		reconnectNow:       make(chan struct{}, 1),
+		guardWake:          make(chan struct{}, 1),
+		guardRecoveryQueue: make(chan guardRecoveryTask, 1),
+		eventQueue:         NewEventQueue(filepath.Join(filepath.Dir(cfg.DeviceIDPath), "events")),
 	}
 	if err := a.initGuardPersistentState(cfg); err != nil {
 		fmt.Fprintln(os.Stderr, "guard state:", err)
@@ -868,14 +879,44 @@ func (a *Agent) startControlServer(cfgPath string) {
 		a.runnerMu.Lock()
 		running = a.runnerCmd != nil && a.runnerCmd.Process != nil
 		a.runnerMu.Unlock()
+		runtime := a.getGuardRuntimeSnapshot(a.getCfg())
+		// #region debug-point H2:script-status
+		debugGuardReport("pre-fix", "H2", "main.go:/script/status", "script status served", map[string]any{
+			"running":          running,
+			"scriptPath":       a.scriptPath,
+			"updatedAtTsMs":    a.scriptUpdatedAtTS.Load(),
+			"lastError":        strings.TrimSpace(lastErr),
+			"lastEventTsMs":    a.scriptLastEventTS.Load(),
+			"lastPongTsMs":     a.scriptLastPongTS.Load(),
+			"runnerPid":        a.runnerPid.Load(),
+			"runnerRpcOk":      runtime.RunnerRPCOK,
+			"scriptReady":      runtime.ScriptReady,
+			"scriptBuildMatch": runtime.ScriptBuildMatch,
+			"scriptPongFresh":  runtime.ScriptPongFresh,
+		})
+		// #endregion
 		writeJSON(w, http.StatusOK, map[string]any{
-			"ok":            true,
-			"running":       running,
-			"scriptPath":    a.scriptPath,
-			"updatedAtTsMs": a.scriptUpdatedAtTS.Load(),
-			"lastError":     strings.TrimSpace(lastErr),
-			"lastEventTsMs": a.scriptLastEventTS.Load(),
-			"lastPongTsMs":  a.scriptLastPongTS.Load(),
+			"ok":                    true,
+			"running":               running,
+			"scriptPath":            a.scriptPath,
+			"updatedAtTsMs":         a.scriptUpdatedAtTS.Load(),
+			"lastError":             strings.TrimSpace(lastErr),
+			"lastEventTsMs":         a.scriptLastEventTS.Load(),
+			"lastPongTsMs":          a.scriptLastPongTS.Load(),
+			"runnerProcessAlive":    runtime.RunnerProcessAlive,
+			"runnerPid":             runtime.RunnerPid,
+			"runnerRpcOk":           runtime.RunnerRPCOK,
+			"scriptReady":           runtime.ScriptReady,
+			"runnerScriptBuild":     runtime.RunnerScriptBuild,
+			"runnerScriptSha256":    runtime.RunnerScriptSha256,
+			"scriptInstalledBuild":  runtime.ScriptInstalledBuild,
+			"scriptInstalledSha256": runtime.ScriptInstalledSha256,
+			"scriptBuildMatch":      runtime.ScriptBuildMatch,
+			"scriptSha256Match":     runtime.ScriptSha256Match,
+			"scriptEventFresh":      runtime.ScriptEventFresh,
+			"scriptPongFresh":       runtime.ScriptPongFresh,
+			"runnerLastHealthErr":   runtime.RunnerLastHealthErr,
+			"runnerLastHealthAtMs":  runtime.RunnerLastHealthErrAtMs,
 		})
 	})
 
@@ -894,6 +935,7 @@ func (a *Agent) startControlServer(cfgPath string) {
 			return
 		}
 		a.scriptLastError.Store("")
+		a.bumpGuardProbeEpoch("script_start_http")
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 	})
 
@@ -912,6 +954,7 @@ func (a *Agent) startControlServer(cfgPath string) {
 			return
 		}
 		a.scriptLastError.Store("")
+		a.bumpGuardProbeEpoch("script_stop_http")
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 	})
 	mux.HandleFunc("/script/uninstall", func(w http.ResponseWriter, r *http.Request) {
@@ -927,6 +970,7 @@ func (a *Agent) startControlServer(cfgPath string) {
 		a.scriptLastError.Store("")
 		a.scriptLastEventTS.Store(0)
 		a.scriptLastPongTS.Store(0)
+		a.bumpGuardProbeEpoch("script_uninstall_http")
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 	})
 
@@ -946,6 +990,7 @@ func (a *Agent) startControlServer(cfgPath string) {
 			return
 		}
 		a.scriptLastError.Store("")
+		a.bumpGuardProbeEpoch("script_update_http")
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "downloadUrl": downloadURL, "updatedAtTsMs": updatedAt})
 	})
 
@@ -1082,6 +1127,16 @@ func (a *Agent) startRunnerWithOptions(requireForeground bool, waitForegroundMs 
 	}
 	a.runnerCmd = cmd
 	a.runnerPid.Store(int64(cmd.Process.Pid))
+	a.bumpGuardProbeEpoch("runner_started")
+	// #region debug-point H2:runner-start
+	debugGuardReport("pre-fix", "H2", "main.go:startRunner", "runner process started", map[string]any{
+		"runnerPid":  a.runnerPid.Load(),
+		"scriptPath": a.scriptPath,
+		"bundleId":   strings.TrimSpace(cfg.WhatsApp.BundleID),
+		"fridaHost":  strings.TrimSpace(cfg.Frida.Host),
+		"fridaPort":  cfg.Frida.Port,
+	})
+	// #endregion
 	go func() {
 		err := cmd.Wait()
 		a.runnerMu.Lock()
@@ -1100,6 +1155,22 @@ func (a *Agent) startRunnerWithOptions(requireForeground bool, waitForegroundMs 
 		} else {
 			a.scriptLastError.Store("")
 		}
+		lastErr, _ := a.scriptLastError.Load().(string)
+		a.bumpGuardProbeEpoch("runner_exited")
+		// #region debug-point H2:runner-exit
+		debugGuardReport("pre-fix", "H2", "main.go:startRunner.wait", "runner process exited", map[string]any{
+			"exitError": func() string {
+				if err != nil {
+					return err.Error()
+				}
+				return ""
+			}(),
+			"storedLastErr": strings.TrimSpace(lastErr),
+			"updatedAtTsMs": a.scriptUpdatedAtTS.Load(),
+			"lastEventTsMs": a.scriptLastEventTS.Load(),
+			"lastPongTsMs":  a.scriptLastPongTS.Load(),
+		})
+		// #endregion
 	}()
 	return nil
 }
@@ -1116,6 +1187,7 @@ func (a *Agent) stopRunner() error {
 	}
 	a.runnerCmd = nil
 	a.runnerPid.Store(0)
+	a.bumpGuardProbeEpoch("runner_stopped")
 	return nil
 }
 
@@ -1131,6 +1203,7 @@ func (a *Agent) stopRunnerIfRunning() error {
 	}
 	a.runnerCmd = nil
 	a.runnerPid.Store(0)
+	a.bumpGuardProbeEpoch("runner_stop_if_running")
 	return nil
 }
 
@@ -1141,23 +1214,60 @@ func (a *Agent) guardStatusSnapshot(cfg Config) map[string]any {
 	lastAction := strings.TrimSpace(valueOrEmptyString(a.guardLastAction.Load()))
 	lastError := strings.TrimSpace(valueOrEmptyString(a.guardLastError.Load()))
 	runtime := a.getGuardRuntimeSnapshot(cfg)
+	probes := a.getGuardProbeSnapshot()
 	return map[string]any{
-		"enabled":               cfg.WhatsApp.AutoGuardEnabled,
-		"state":                 runtime.State,
-		"bundleId":              strings.TrimSpace(cfg.WhatsApp.BundleID),
-		"lastAction":            lastAction,
-		"lastActionTs":          a.guardLastActionTS.Load(),
-		"lastError":             lastError,
-		"runnerState":           runtime.RunnerState,
-		"reasonCode":            runtime.ReasonCode,
-		"listeningReady":        runtime.ListeningReady,
-		"processRunning":        runtime.ProcessRunning,
-		"lastRecoveryAtMs":      runtime.LastRecoveryAtMs,
-		"recoveryAttempts":      runtime.RecoveryAttempts,
-		"maxRecoveryAttempts":   runtime.MaxRecoveryAttempts,
-		"remainingRetryCount":   runtime.RemainingRetryCount,
-		"nextRetryAtMs":         runtime.NextRetryAtMs,
-		"frontmostQueryEnabled": runtime.FrontmostQueryEnabled,
+		"enabled":                    cfg.WhatsApp.AutoGuardEnabled,
+		"state":                      runtime.State,
+		"guardState":                 runtime.GuardState,
+		"bundleId":                   strings.TrimSpace(cfg.WhatsApp.BundleID),
+		"lastAction":                 lastAction,
+		"lastActionTs":               a.guardLastActionTS.Load(),
+		"lastError":                  lastError,
+		"runnerState":                runtime.RunnerState,
+		"reasonCode":                 runtime.ReasonCode,
+		"listeningReady":             runtime.ListeningReady,
+		"processRunning":             runtime.ProcessRunning,
+		"lastRecoveryAtMs":           runtime.LastRecoveryAtMs,
+		"recoveryAttempts":           runtime.RecoveryAttempts,
+		"maxRecoveryAttempts":        runtime.MaxRecoveryAttempts,
+		"remainingRetryCount":        runtime.RemainingRetryCount,
+		"nextRetryAtMs":              runtime.NextRetryAtMs,
+		"recoveryInFlight":           runtime.RecoveryInFlight,
+		"recoveryPending":            runtime.RecoveryPending,
+		"recoveryAction":             runtime.RecoveryAction,
+		"recoveryRequestedState":     runtime.RecoveryRequestedState,
+		"recoveryRequestedReason":    runtime.RecoveryRequestedReason,
+		"probeEpoch":                 runtime.ProbeEpoch,
+		"recoveryEpoch":              runtime.RecoveryEpoch,
+		"frontmostQueryEnabled":      runtime.FrontmostQueryEnabled,
+		"processProbeErr":            runtime.ProcessProbeErr,
+		"processSampleAtMs":          runtime.ProcessSampleAtMs,
+		"frontmost":                  runtime.Frontmost,
+		"frontmostErr":               runtime.FrontmostErr,
+		"frontmostSampleAtMs":        runtime.FrontmostSampleAtMs,
+		"frontmostFresh":             runtime.FrontmostFresh,
+		"runnerProcessAlive":         runtime.RunnerProcessAlive,
+		"runnerPid":                  runtime.RunnerPid,
+		"runnerRpcOk":                runtime.RunnerRPCOK,
+		"scriptReady":                runtime.ScriptReady,
+		"runnerScriptBuild":          runtime.RunnerScriptBuild,
+		"runnerScriptSha256":         runtime.RunnerScriptSha256,
+		"runnerSampleAtMs":           runtime.RunnerSampleAtMs,
+		"runnerLastHealthErr":        runtime.RunnerLastHealthErr,
+		"runnerLastHealthAtMs":       runtime.RunnerLastHealthErrAtMs,
+		"scriptInstalledPath":        runtime.ScriptInstalledPath,
+		"scriptInstalledUpdatedAtMs": runtime.ScriptInstalledUpdatedAtMs,
+		"scriptInstalledBuild":       runtime.ScriptInstalledBuild,
+		"scriptInstalledSha256":      runtime.ScriptInstalledSha256,
+		"scriptLastEventTsMs":        runtime.ScriptLastEventTsMs,
+		"scriptLastPongTsMs":         runtime.ScriptLastPongTsMs,
+		"scriptEventFresh":           runtime.ScriptEventFresh,
+		"scriptPongFresh":            runtime.ScriptPongFresh,
+		"scriptBuildMatch":           runtime.ScriptBuildMatch,
+		"scriptSha256Match":          runtime.ScriptSha256Match,
+		"rawProcessProbe":            probes.Process,
+		"rawFrontmostProbe":          probes.Frontmost,
+		"rawRunnerProbe":             probes.Runner,
 	}
 }
 
@@ -1216,6 +1326,12 @@ func (a *Agent) setGuardEnabled(enabled bool) error {
 	} else {
 		a.recordGuardAction("guard_disable", nil)
 	}
+	if enabled {
+		a.bumpGuardProbeEpoch("guard_enable")
+	} else {
+		a.clearGuardRecoverySchedule()
+		a.bumpGuardProbeEpoch("guard_disable")
+	}
 	a.wakeGuardLoop()
 	return nil
 }
@@ -1238,6 +1354,7 @@ func (a *Agent) requestGuardRecover() error {
 	}
 	a.setGuardForceRecoverRequest(true)
 	a.recordGuardAction("guard_recover", nil)
+	a.bumpGuardProbeEpoch("guard_recover")
 	a.wakeGuardLoop()
 	return nil
 }
@@ -1251,6 +1368,8 @@ func (a *Agent) resetGuardRecoveryState() error {
 		return err
 	}
 	a.recordGuardAction("guard_reset", nil)
+	a.clearGuardRecoverySchedule()
+	a.bumpGuardProbeEpoch("guard_reset")
 	a.wakeGuardLoop()
 	return nil
 }
@@ -1884,6 +2003,7 @@ func (a *Agent) handleScriptStart() {
 		return
 	}
 	a.scriptLastError.Store("")
+	a.bumpGuardProbeEpoch("script_start_broker")
 }
 
 func (a *Agent) handleScriptStop() {
@@ -1892,6 +2012,7 @@ func (a *Agent) handleScriptStop() {
 		return
 	}
 	a.scriptLastError.Store("")
+	a.bumpGuardProbeEpoch("script_stop_broker")
 }
 
 func (a *Agent) handleScriptUpdate() {
@@ -1901,6 +2022,7 @@ func (a *Agent) handleScriptUpdate() {
 		return
 	}
 	a.scriptLastError.Store("")
+	a.bumpGuardProbeEpoch("script_update_broker")
 }
 
 func (a *Agent) handleScriptUninstall() {
@@ -1908,6 +2030,7 @@ func (a *Agent) handleScriptUninstall() {
 	a.scriptLastError.Store("")
 	a.scriptLastEventTS.Store(0)
 	a.scriptLastPongTS.Store(0)
+	a.bumpGuardProbeEpoch("script_uninstall_broker")
 }
 
 // handleWhatsAppOpen 处理 broker 下发的 WhatsApp 打开命令。
@@ -1994,6 +2117,7 @@ func (a *Agent) updateScriptAndRestart() (string, int64, error) {
 	}
 	now := time.Now().UnixMilli()
 	a.scriptUpdatedAtTS.Store(now)
+	a.bumpGuardProbeEpoch("script_file_updated")
 	if err := a.stopRunnerIfRunning(); err != nil {
 		return downloadURL, now, err
 	}
