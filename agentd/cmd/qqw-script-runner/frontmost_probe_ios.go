@@ -51,6 +51,7 @@ static void qqw_frontmost_probe_debug_log_stage(const gchar *stage, const gchar 
 typedef struct {
   GMainLoop *loop;
   gchar *message;
+  gboolean timeout_fired;
 } qqw_frontmost_probe_ctx_t;
 
 static guint qqw_frontmost_find_pid(FridaDevice *device, const gchar *name, GError **error) {
@@ -97,6 +98,7 @@ static void qqw_frontmost_on_detached(FridaSession *session, FridaSessionDetachR
 static gboolean qqw_frontmost_on_timeout(gpointer user_data) {
   qqw_frontmost_probe_ctx_t *ctx = (qqw_frontmost_probe_ctx_t *) user_data;
   if (ctx == NULL || ctx->loop == NULL) return G_SOURCE_REMOVE;
+  ctx->timeout_fired = TRUE;
   qqw_frontmost_probe_debug_log_stage("callback_timeout", NULL, 0);
   g_main_loop_quit(ctx->loop);
   return G_SOURCE_REMOVE;
@@ -116,6 +118,7 @@ static int qqw_frontmost_probe_query(const char *address, const char *script_sou
 
   ctx.loop = NULL;
   ctx.message = NULL;
+  ctx.timeout_fired = FALSE;
 
   manager = frida_device_manager_new();
   qqw_frontmost_probe_debug_log_stage("after_manager_new", NULL, manager != NULL ? 1 : 0);
@@ -214,17 +217,23 @@ static int qqw_frontmost_probe_query(const char *address, const char *script_sou
     return 2;
   }
 
-  if (timeout_ms > 0) {
-    timeout_source = g_timeout_add((guint) timeout_ms, qqw_frontmost_on_timeout, &ctx);
-    qqw_frontmost_probe_debug_log_stage("after_timeout_add", NULL, (gint) timeout_source);
+  if (ctx.message == NULL) {
+    if (timeout_ms > 0) {
+      timeout_source = g_timeout_add((guint) timeout_ms, qqw_frontmost_on_timeout, &ctx);
+      qqw_frontmost_probe_debug_log_stage("after_timeout_add", NULL, (gint) timeout_source);
+    }
+    qqw_frontmost_probe_debug_log_stage("before_main_loop_run", NULL, 0);
+    g_main_loop_run(ctx.loop);
+    qqw_frontmost_probe_debug_log_stage("after_main_loop_run", ctx.message, 0);
+  } else {
+    qqw_frontmost_probe_debug_log_stage("skip_main_loop_message_ready", ctx.message, 0);
   }
-  qqw_frontmost_probe_debug_log_stage("before_main_loop_run", NULL, 0);
-  g_main_loop_run(ctx.loop);
-  qqw_frontmost_probe_debug_log_stage("after_main_loop_run", ctx.message, 0);
-  if (timeout_source != 0) {
+  if (timeout_source != 0 && !ctx.timeout_fired) {
     qqw_frontmost_probe_debug_log_stage("before_remove_timeout", NULL, (gint) timeout_source);
     g_source_remove(timeout_source);
     qqw_frontmost_probe_debug_log_stage("after_remove_timeout", NULL, (gint) timeout_source);
+  } else if (timeout_source != 0) {
+    qqw_frontmost_probe_debug_log_stage("skip_remove_timeout_fired", NULL, (gint) timeout_source);
   }
 
   if (ctx.message != NULL) {
