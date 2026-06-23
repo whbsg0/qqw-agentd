@@ -321,6 +321,9 @@ func buildGuardRecoveryTask(snapshot guardRuntimeSnapshot, manual bool) (guardRe
 		}
 		return guardRecoveryTask{GuardState: state, ReasonCode: reason, Manual: manual, Actions: actions}, true
 	case "wa_frontmost_query_failed", "wa_frontmost_stale":
+		if state == "wa_frontmost_query_failed" && !manual && !shouldAutoRecoverFrontmostQueryFailure(snapshot.FrontmostErr) {
+			return guardRecoveryTask{}, false
+		}
 		return guardRecoveryTask{GuardState: state, ReasonCode: reason, Manual: manual, Actions: []string{"restart_frida_server", "restart_agentd", "open_whatsapp_after_recover"}}, true
 	case "wa_process_probe_failed":
 		if snapshot.RecoveryAttempts >= 2 || manual {
@@ -330,6 +333,28 @@ func buildGuardRecoveryTask(snapshot guardRuntimeSnapshot, manual bool) (guardRe
 	default:
 		return guardRecoveryTask{}, false
 	}
+}
+
+// shouldAutoRecoverFrontmostQueryFailure 判断 frontmost 查询失败是否仍值得自动触发重启链。
+// 参数：frontmostErr 为当前 frontmost probe 错误详情。
+// 返回：true 表示更像瞬时链路错误，可继续自动恢复；false 表示为稳定逻辑型错误，应避免进入重启循环。
+func shouldAutoRecoverFrontmostQueryFailure(frontmostErr string) bool {
+	errText := strings.ToLower(strings.TrimSpace(frontmostErr))
+	if errText == "" {
+		return true
+	}
+	nonRecoverableMarkers := []string{
+		"invalid front identifier",
+		"returned nil",
+		"invalid identifier type",
+		"invalid name type",
+	}
+	for _, marker := range nonRecoverableMarkers {
+		if strings.Contains(errText, marker) {
+			return false
+		}
+	}
+	return true
 }
 
 // joinGuardRecoveryActions 把恢复动作链格式化为便于展示的字符串。
