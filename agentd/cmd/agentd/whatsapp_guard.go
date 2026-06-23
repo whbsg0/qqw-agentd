@@ -208,6 +208,20 @@ func (a *Agent) runGuardLoop(ctx context.Context) {
 				)
 			}
 		}
+		if !blocked && guardRecoveryAttemptsClearEligible(snapshot, now.UnixMilli(), cfg) {
+			if err := a.clearGuardRecoveryState(); err == nil {
+				trimmedAttempts = 0
+				snapshot = deriveGuardRuntimeSnapshot(
+					cfg,
+					a.getGuardProbeSnapshot(),
+					trimmedAttempts,
+					false,
+					a.getGuardRecoveryStatus(),
+					now,
+					&confirmStartedAt,
+				)
+			}
+		}
 		graceUntilMs := a.getGuardRecoveryGraceUntilMs()
 		if graceUntilMs > 0 && now.UnixMilli() >= graceUntilMs {
 			a.clearGuardRecoveryGrace()
@@ -272,6 +286,19 @@ func guardRecoveryGraceClearEligible(snapshot guardRuntimeSnapshot) bool {
 		return false
 	}
 	return true
+}
+
+// guardRecoveryAttemptsClearEligible 判断恢复计数是否已满足“稳态成功后清账”的条件。
+// 参数：snapshot 为当前基于实时 probe 派生的 guard 快照；nowMs 为当前毫秒时间；cfg 为当前配置。
+// 返回：已持续恢复到稳态且历史计数可安全清空时返回 true。
+func guardRecoveryAttemptsClearEligible(snapshot guardRuntimeSnapshot, nowMs int64, cfg Config) bool {
+	if snapshot.RecoveryAttempts <= 0 || snapshot.LastRecoveryAtMs <= 0 {
+		return false
+	}
+	if !guardRecoveryGraceClearEligible(snapshot) {
+		return false
+	}
+	return nowMs-snapshot.LastRecoveryAtMs >= guardRecoveryAttemptsSuccessClearMs(cfg)
 }
 
 // detectWhatsAppProcess 检查当前设备上是否存在 WhatsApp 进程。
@@ -401,6 +428,14 @@ func appendGuardRecoveryAttempt(nowMs int64, windowMs int, maxAttempts int, atte
 func guardResetRecoveryGraceMs(cfg Config) int64 {
 	baseMs := cfg.WhatsApp.ForegroundConfirmMs + cfg.WhatsApp.ForegroundStableMs + maxInt(cfg.WhatsApp.HealthCheckMs*4, 12_000)
 	return int64(maxInt(baseMs, 30_000))
+}
+
+// guardRecoveryAttemptsSuccessClearMs 返回稳态恢复成功后自动清空历史恢复计数的最短保持时间。
+// 参数：cfg 为当前配置。
+// 返回：用于区分“真正恢复成功”与“短暂假稳定”的保持毫秒数。
+func guardRecoveryAttemptsSuccessClearMs(cfg Config) int64 {
+	baseMs := maxInt(cfg.WhatsApp.ForegroundStableMs*3, cfg.WhatsApp.HealthCheckMs*5)
+	return int64(maxInt(baseMs, 15_000))
 }
 
 // guardRecoveryBackoff 返回当前恢复次数对应的退避时长。
