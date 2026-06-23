@@ -38,6 +38,39 @@ static gchar *qqw_guard_cfstring_to_utf8(CFStringRef value) {
   return buffer;
 }
 
+// qqw_guard_string_has_printable_text 判断 UTF-8 字符串是否包含可接受的可打印内容。
+// 参数：value 为待检查字符串。
+// 返回：true 表示字符串非空且不含控制字符；false 表示为空或含异常控制字符。
+static gboolean qqw_guard_string_has_printable_text(const gchar *value) {
+  if (value == NULL || value[0] == '\0') {
+    return FALSE;
+  }
+  for (const guchar *p = (const guchar *) value; *p != '\0'; p++) {
+    if (*p < 0x20 || *p == 0x7f) {
+      return FALSE;
+    }
+  }
+  return TRUE;
+}
+
+// qqw_guard_cfstring_to_utf8_checked 仅在对象确认为 CFString 时才转换为 UTF-8。
+// 参数：value 为待转换对象；label 为字段名；error_out 输出类型错误原因。
+// 返回：成功时返回 UTF-8 副本；失败时返回 NULL。
+static gchar *qqw_guard_cfstring_to_utf8_checked(CFTypeRef value, const gchar *label, char **error_out) {
+  if (value == NULL) {
+    return g_strdup("");
+  }
+  if (CFGetTypeID(value) != CFStringGetTypeID()) {
+    if (error_out != NULL) {
+      *error_out = g_strdup_printf("frontmost fallback sbs invalid %s type: %lu",
+        label != NULL ? label : "value",
+        (unsigned long) CFGetTypeID(value));
+    }
+    return NULL;
+  }
+  return qqw_guard_cfstring_to_utf8((CFStringRef) value);
+}
+
 // qqw_guard_query_frontmost_sbs 在 Frida frontmost 返回空值时改用 SBS 取前台 display identifier。
 // 参数：process_name 为目标进程名；bundle_id 为目标 bundle id；detail_out 输出诊断细节；error_out 输出失败原因。
 // 返回：1 表示目标前台；0 表示已明确不是目标前台；-1 表示 fallback 也无法得到可信前台真值。
@@ -91,15 +124,60 @@ static int qqw_guard_query_frontmost_sbs(const char *process_name, const char *b
     return -1;
   }
 
-  gchar *front_id = qqw_guard_cfstring_to_utf8(front_id_ref);
+  gchar *front_id = qqw_guard_cfstring_to_utf8_checked(front_id_ref, "identifier", error_out);
+  if (front_id == NULL) {
+    if (detail_out != NULL) {
+      *detail_out = g_strdup_printf("front.source=sbs front.id= front.name= expected.id=%s expected.name=%s invalid.id.type",
+        bid != NULL ? bid : "",
+        proc != NULL ? proc : "");
+    }
+    CFRelease(front_id_ref);
+    dlclose(handle);
+    return -1;
+  }
   CFStringRef front_name_ref = NULL;
   gchar *front_name = g_strdup("");
   if (copy_name != NULL) {
     front_name_ref = copy_name(front_id_ref);
     if (front_name_ref != NULL) {
       g_free(front_name);
-      front_name = qqw_guard_cfstring_to_utf8(front_name_ref);
+      front_name = qqw_guard_cfstring_to_utf8_checked(front_name_ref, "name", error_out);
+      if (front_name == NULL) {
+        if (detail_out != NULL) {
+          *detail_out = g_strdup_printf("front.source=sbs front.id= front.name= expected.id=%s expected.name=%s invalid.name.type",
+            bid != NULL ? bid : "",
+            proc != NULL ? proc : "");
+        }
+        if (front_name_ref != NULL) {
+          CFRelease(front_name_ref);
+        }
+        CFRelease(front_id_ref);
+        dlclose(handle);
+        return -1;
+      }
     }
+  }
+
+  if (!qqw_guard_string_has_printable_text(front_id)) {
+    if (detail_out != NULL) {
+      *detail_out = g_strdup_printf("front.source=sbs front.id=%s front.name=%s expected.id=%s expected.name=%s invalid.front.id",
+        front_id != NULL ? front_id : "",
+        front_name != NULL ? front_name : "",
+        bid != NULL ? bid : "",
+        proc != NULL ? proc : "");
+    }
+    if (error_out != NULL) {
+      *error_out = g_strdup_printf("frontmost fallback sbs invalid front identifier: %s",
+        front_id != NULL ? front_id : "");
+    }
+    if (front_name_ref != NULL) {
+      CFRelease(front_name_ref);
+    }
+    CFRelease(front_id_ref);
+    g_free(front_id);
+    g_free(front_name);
+    dlclose(handle);
+    return -1;
   }
 
   if (detail_out != NULL) {
