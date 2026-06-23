@@ -13,6 +13,8 @@ extern void goFridaOnMessage(char *message);
 
 typedef struct {
   GMainLoop *loop;
+  gboolean detached;
+  FridaSessionDetachReason detached_reason;
 } qqw_ctx_t;
 
 static GMutex g_script_mu;
@@ -21,6 +23,14 @@ static const char *qqw_runner_debug_local_log_path = "/var/mobile/Library/QQwAge
 static const char *qqw_runner_debug_afc_log_path = "/var/mobile/Media/QQwAgent/trae-debug-log-guard-fuse-errors.ndjson";
 
 static gchar * qqw_strdup_printf2(const gchar *prefix, const gchar *msg);
+
+// qqw_runner_retryable_detach 判断当前 detach 原因是否属于可在进程内重连的临时断链。
+// 参数：reason 为 Frida 会话断开原因。
+// 返回：TRUE 表示允许在当前 runner 进程内重试；FALSE 表示应直接结束本轮。
+static gboolean qqw_runner_retryable_detach(FridaSessionDetachReason reason) {
+  return reason == FRIDA_SESSION_DETACH_REASON_CONNECTION_TERMINATED
+      || reason == FRIDA_SESSION_DETACH_REASON_DEVICE_LOST;
+}
 
 // qqw_runner_debug_append_line 追加一行调试文本到设备私有路径或 AFC 镜像路径。
 // 参数：path 为目标路径；line 为已经格式化完成的单行日志。
@@ -119,6 +129,8 @@ static void on_detached(FridaSession *session, FridaSessionDetachReason reason, 
   qqw_ctx_t *ctx = (qqw_ctx_t *) user_data;
   if (ctx == NULL || ctx->loop == NULL) return;
   fprintf(stderr, "frida detached: reason=%d\n", (int) reason);
+  ctx->detached = TRUE;
+  ctx->detached_reason = reason;
   qqw_runner_debug_log_stage("callback_detached", NULL, (gint) reason);
   qqw_set_script(NULL);
   g_main_loop_quit(ctx->loop);
@@ -152,6 +164,8 @@ static int qqw_run(const char *address, const char *process_name, const char *bu
   const gchar *proc = process_name != NULL && process_name[0] != '\0' ? process_name : "WhatsApp";
   const gchar *bid = bundle_id != NULL ? bundle_id : "";
   const int max_attempts = 3;
+  const int max_detach_retries = 3;
+  int detach_retry_count = 0;
 
   FridaDeviceManager *manager = NULL;
   FridaDevice *device = NULL;
@@ -282,6 +296,8 @@ static int qqw_run(const char *address, const char *process_name, const char *bu
 
     qqw_ctx_t ctx;
     ctx.loop = g_main_loop_new(NULL, FALSE);
+    ctx.detached = FALSE;
+    ctx.detached_reason = 0;
     qqw_runner_debug_log_stage("after_loop_new", NULL, ctx.loop != NULL ? 1 : 0);
     g_signal_connect(script, "message", G_CALLBACK(on_message), &ctx);
     g_signal_connect(session, "detached", G_CALLBACK(on_detached), &ctx);
@@ -305,6 +321,8 @@ static int qqw_run(const char *address, const char *process_name, const char *bu
     g_main_loop_run(ctx.loop);
     qqw_runner_debug_log_stage("after_main_loop_run", NULL, 0);
 
+    gboolean retryable_detach = ctx.detached && qqw_runner_retryable_detach(ctx.detached_reason);
+
     qqw_set_script(NULL);
     qqw_runner_debug_log_stage("before_script_unload", NULL, 0);
     frida_script_unload_sync(script, NULL, NULL);
@@ -314,6 +332,18 @@ static int qqw_run(const char *address, const char *process_name, const char *bu
     g_object_unref(session);
     g_object_unref(device);
     g_object_unref(manager);
+    if (retryable_detach) {
+      detach_retry_count++;
+      qqw_runner_debug_log_stage("retry_after_detach", NULL, detach_retry_count);
+      if (detach_retry_count <= max_detach_retries) {
+        attempt = 0;
+        g_usleep((gulong) (300000 * detach_retry_count));
+        continue;
+      }
+      *error_out = g_strdup_printf("detached: %d", (int) ctx.detached_reason);
+      return 2;
+    }
+    detach_retry_count = 0;
     qqw_runner_debug_log_stage("return_success", NULL, 0);
     return 0;
   }
