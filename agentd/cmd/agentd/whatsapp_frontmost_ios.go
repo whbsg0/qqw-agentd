@@ -7,9 +7,14 @@ package main
 #cgo LDFLAGS: -framework CoreFoundation
 #include <CoreFoundation/CoreFoundation.h>
 #include <dlfcn.h>
+#include <mach/mach.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/types.h>
 #include <frida-core.h>
+
+extern kern_return_t bootstrap_look_up_per_user (mach_port_t bp, const char * service_name, uid_t target_user, mach_port_t * sp);
+extern mach_port_t bootstrap_port;
 
 static gchar *qqw_guard_strdup2(const gchar *prefix, const gchar *msg) {
   if (prefix == NULL) prefix = "";
@@ -71,6 +76,33 @@ static gchar *qqw_guard_cfstring_to_utf8_checked(CFTypeRef value, const gchar *l
   return qqw_guard_cfstring_to_utf8((CFStringRef) value);
 }
 
+// qqw_guard_build_sbs_context 采集当前 SBS / bootstrap 上下文，便于定位 daemon 与 mobile user 端口差异。
+// 参数：handle 为已打开的 SpringBoardServices 动态库句柄。
+// 返回：调用方负责释放的上下文描述字符串。
+static gchar *qqw_guard_build_sbs_context(void *handle) {
+  typedef mach_port_t (*qqw_sbs_springboard_background_server_port_fn)(void);
+
+  mach_port_t bg_port = MACH_PORT_NULL;
+  mach_port_t lookup_port = MACH_PORT_NULL;
+  kern_return_t lookup_kr = -1;
+  const gchar *lookup_service = "com.apple.springboard.backgroundappservices";
+
+  dlerror();
+  qqw_sbs_springboard_background_server_port_fn background_port =
+    (qqw_sbs_springboard_background_server_port_fn) dlsym(handle, "SBSSpringBoardBackgroundServerPort");
+  const char *port_sym_error = dlerror();
+  if (background_port != NULL && port_sym_error == NULL) {
+    bg_port = background_port();
+  }
+
+  lookup_kr = bootstrap_look_up_per_user(bootstrap_port, lookup_service, 501, &lookup_port);
+  return g_strdup_printf("sbs.bg_port=%u bootstrap.lookup.kr=%d bootstrap.lookup.port=%u bootstrap.service=%s",
+    (unsigned int) bg_port,
+    (int) lookup_kr,
+    (unsigned int) lookup_port,
+    lookup_service);
+}
+
 // qqw_guard_query_frontmost_sbs 在 Frida frontmost 返回空值时改用 SBS 取前台 display identifier。
 // 参数：process_name 为目标进程名；bundle_id 为目标 bundle id；detail_out 输出诊断细节；error_out 输出失败原因。
 // 返回：1 表示目标前台；0 表示已明确不是目标前台；-1 表示 fallback 也无法得到可信前台真值。
@@ -110,16 +142,20 @@ static int qqw_guard_query_frontmost_sbs(const char *process_name, const char *b
     copy_name = NULL;
   }
 
+  gchar *sbs_ctx = qqw_guard_build_sbs_context(handle);
+
   CFStringRef front_id_ref = copy_frontmost();
   if (front_id_ref == NULL) {
     if (detail_out != NULL) {
-      *detail_out = g_strdup_printf("front.source=sbs front.id= front.name= expected.id=%s expected.name=%s front=nil",
+      *detail_out = g_strdup_printf("front.source=sbs front.id= front.name= expected.id=%s expected.name=%s front=nil %s",
         bid != NULL ? bid : "",
-        proc != NULL ? proc : "");
+        proc != NULL ? proc : "",
+        sbs_ctx != NULL ? sbs_ctx : "");
     }
     if (error_out != NULL) {
       *error_out = g_strdup("frontmost fallback sbs returned nil");
     }
+    g_free(sbs_ctx);
     dlclose(handle);
     return -1;
   }
@@ -127,11 +163,13 @@ static int qqw_guard_query_frontmost_sbs(const char *process_name, const char *b
   gchar *front_id = qqw_guard_cfstring_to_utf8_checked(front_id_ref, "identifier", error_out);
   if (front_id == NULL) {
     if (detail_out != NULL) {
-      *detail_out = g_strdup_printf("front.source=sbs front.id= front.name= expected.id=%s expected.name=%s invalid.id.type",
+      *detail_out = g_strdup_printf("front.source=sbs front.id= front.name= expected.id=%s expected.name=%s invalid.id.type %s",
         bid != NULL ? bid : "",
-        proc != NULL ? proc : "");
+        proc != NULL ? proc : "",
+        sbs_ctx != NULL ? sbs_ctx : "");
     }
     CFRelease(front_id_ref);
+    g_free(sbs_ctx);
     dlclose(handle);
     return -1;
   }
@@ -144,14 +182,16 @@ static int qqw_guard_query_frontmost_sbs(const char *process_name, const char *b
       front_name = qqw_guard_cfstring_to_utf8_checked(front_name_ref, "name", error_out);
       if (front_name == NULL) {
         if (detail_out != NULL) {
-          *detail_out = g_strdup_printf("front.source=sbs front.id= front.name= expected.id=%s expected.name=%s invalid.name.type",
+          *detail_out = g_strdup_printf("front.source=sbs front.id= front.name= expected.id=%s expected.name=%s invalid.name.type %s",
             bid != NULL ? bid : "",
-            proc != NULL ? proc : "");
+            proc != NULL ? proc : "",
+            sbs_ctx != NULL ? sbs_ctx : "");
         }
         if (front_name_ref != NULL) {
           CFRelease(front_name_ref);
         }
         CFRelease(front_id_ref);
+        g_free(sbs_ctx);
         dlclose(handle);
         return -1;
       }
@@ -160,11 +200,12 @@ static int qqw_guard_query_frontmost_sbs(const char *process_name, const char *b
 
   if (!qqw_guard_string_has_printable_text(front_id)) {
     if (detail_out != NULL) {
-      *detail_out = g_strdup_printf("front.source=sbs front.id=%s front.name=%s expected.id=%s expected.name=%s invalid.front.id",
+      *detail_out = g_strdup_printf("front.source=sbs front.id=%s front.name=%s expected.id=%s expected.name=%s invalid.front.id %s",
         front_id != NULL ? front_id : "",
         front_name != NULL ? front_name : "",
         bid != NULL ? bid : "",
-        proc != NULL ? proc : "");
+        proc != NULL ? proc : "",
+        sbs_ctx != NULL ? sbs_ctx : "");
     }
     if (error_out != NULL) {
       *error_out = g_strdup_printf("frontmost fallback sbs invalid front identifier: %s",
@@ -176,16 +217,18 @@ static int qqw_guard_query_frontmost_sbs(const char *process_name, const char *b
     CFRelease(front_id_ref);
     g_free(front_id);
     g_free(front_name);
+    g_free(sbs_ctx);
     dlclose(handle);
     return -1;
   }
 
   if (detail_out != NULL) {
-    *detail_out = g_strdup_printf("front.source=sbs front.id=%s front.name=%s expected.id=%s expected.name=%s",
+    *detail_out = g_strdup_printf("front.source=sbs front.id=%s front.name=%s expected.id=%s expected.name=%s %s",
       front_id != NULL ? front_id : "",
       front_name != NULL ? front_name : "",
       bid != NULL ? bid : "",
-      proc != NULL ? proc : "");
+      proc != NULL ? proc : "",
+      sbs_ctx != NULL ? sbs_ctx : "");
   }
 
   int matched = 0;
@@ -201,6 +244,7 @@ static int qqw_guard_query_frontmost_sbs(const char *process_name, const char *b
   CFRelease(front_id_ref);
   g_free(front_id);
   g_free(front_name);
+  g_free(sbs_ctx);
   dlclose(handle);
   return matched;
 }
