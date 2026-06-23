@@ -9,14 +9,57 @@ package main
 #include <string.h>
 #include <frida-core.h>
 
+static const char *qqw_frontmost_probe_debug_local_log_path = "/var/mobile/Library/QQwAgent/trae-debug-log-guard-fuse-errors.ndjson";
+static const char *qqw_frontmost_probe_debug_afc_log_path = "/var/mobile/Media/QQwAgent/trae-debug-log-guard-fuse-errors.ndjson";
+
+// qqw_frontmost_probe_debug_append_line 追加一行调试内容到指定设备侧日志文件。
+// 参数：path 为目标文件路径；line 为已格式化好的单行日志。
+// 返回：无。
+static void qqw_frontmost_probe_debug_append_line(const char *path, const gchar *line) {
+  if (path == NULL || path[0] == '\0' || line == NULL || line[0] == '\0') {
+    return;
+  }
+  FILE *fp = fopen(path, "a");
+  if (fp == NULL) {
+    return;
+  }
+  fputs(line, fp);
+  fputc('\n', fp);
+  fclose(fp);
+}
+
+// qqw_frontmost_probe_debug_log_stage 将 C 层阶段事件双写到私有路径与 AFC 镜像路径。
+// 参数：stage 为当前阶段；detail 为附加诊断文本；value 为可选整数值。
+// 返回：无。
+static void qqw_frontmost_probe_debug_log_stage(const gchar *stage, const gchar *detail, gint value) {
+  gchar *safe_stage = g_strescape(stage != NULL ? stage : "", NULL);
+  gchar *safe_detail = g_strescape(detail != NULL ? detail : "", NULL);
+  gchar *line = g_strdup_printf(
+    "{\"sessionId\":\"guard-fuse-errors\",\"runId\":\"pre-fix\",\"hypothesisId\":\"H1\",\"location\":\"frontmost_probe_ios.go:qqw_frontmost_probe_query\",\"msg\":\"[DEBUG] c-stage %s\",\"data\":{\"stage\":\"%s\",\"detail\":\"%s\",\"value\":%d},\"ts\":%" G_GINT64_FORMAT "}",
+    safe_stage != NULL ? safe_stage : "",
+    safe_stage != NULL ? safe_stage : "",
+    safe_detail != NULL ? safe_detail : "",
+    (int) value,
+    (gint64) (g_get_real_time() / 1000));
+  qqw_frontmost_probe_debug_append_line(qqw_frontmost_probe_debug_local_log_path, line);
+  qqw_frontmost_probe_debug_append_line(qqw_frontmost_probe_debug_afc_log_path, line);
+  g_free(line);
+  g_free(safe_stage);
+  g_free(safe_detail);
+}
+
 typedef struct {
   GMainLoop *loop;
   gchar *message;
 } qqw_frontmost_probe_ctx_t;
 
 static guint qqw_frontmost_find_pid(FridaDevice *device, const gchar *name, GError **error) {
+  qqw_frontmost_probe_debug_log_stage("before_enumerate_processes", name, 0);
   FridaProcessList *plist = frida_device_enumerate_processes_sync(device, NULL, NULL, error);
-  if (*error != NULL) return 0;
+  if (*error != NULL) {
+    qqw_frontmost_probe_debug_log_stage("enumerate_processes_error", (*error)->message, 0);
+    return 0;
+  }
   gint n = frida_process_list_size(plist);
   guint pid = 0;
   for (gint i = 0; i < n; i++) {
@@ -30,12 +73,14 @@ static guint qqw_frontmost_find_pid(FridaDevice *device, const gchar *name, GErr
     g_object_unref(p);
   }
   g_object_unref(plist);
+  qqw_frontmost_probe_debug_log_stage("after_enumerate_processes", name, (gint) pid);
   return pid;
 }
 
 static void qqw_frontmost_on_message(FridaScript *script, const gchar *message, GBytes *data, gpointer user_data) {
   qqw_frontmost_probe_ctx_t *ctx = (qqw_frontmost_probe_ctx_t *) user_data;
   if (ctx == NULL || ctx->loop == NULL || message == NULL) return;
+  qqw_frontmost_probe_debug_log_stage("callback_message", message, 0);
   if (ctx->message == NULL) {
     ctx->message = g_strdup(message);
   }
@@ -45,18 +90,22 @@ static void qqw_frontmost_on_message(FridaScript *script, const gchar *message, 
 static void qqw_frontmost_on_detached(FridaSession *session, FridaSessionDetachReason reason, gpointer crash, gpointer user_data) {
   qqw_frontmost_probe_ctx_t *ctx = (qqw_frontmost_probe_ctx_t *) user_data;
   if (ctx == NULL || ctx->loop == NULL) return;
+  qqw_frontmost_probe_debug_log_stage("callback_detached", NULL, (gint) reason);
   g_main_loop_quit(ctx->loop);
 }
 
 static gboolean qqw_frontmost_on_timeout(gpointer user_data) {
   qqw_frontmost_probe_ctx_t *ctx = (qqw_frontmost_probe_ctx_t *) user_data;
   if (ctx == NULL || ctx->loop == NULL) return G_SOURCE_REMOVE;
+  qqw_frontmost_probe_debug_log_stage("callback_timeout", NULL, 0);
   g_main_loop_quit(ctx->loop);
   return G_SOURCE_REMOVE;
 }
 
 static int qqw_frontmost_probe_query(const char *address, const char *script_source, int timeout_ms, char **message_out, char **error_out) {
+  qqw_frontmost_probe_debug_log_stage("enter_c_function", address, timeout_ms);
   frida_init();
+  qqw_frontmost_probe_debug_log_stage("after_frida_init", NULL, timeout_ms);
   GError *error = NULL;
   FridaDeviceManager *manager = NULL;
   FridaDevice *device = NULL;
@@ -69,17 +118,25 @@ static int qqw_frontmost_probe_query(const char *address, const char *script_sou
   ctx.message = NULL;
 
   manager = frida_device_manager_new();
+  qqw_frontmost_probe_debug_log_stage("after_manager_new", NULL, manager != NULL ? 1 : 0);
+  qqw_frontmost_probe_debug_log_stage("before_add_remote_device", address, 0);
   device = frida_device_manager_add_remote_device_sync(manager, address, NULL, NULL, &error);
   if (error != NULL && address != NULL) {
+    qqw_frontmost_probe_debug_log_stage("add_remote_device_primary_error", error->message, 0);
     const char *colon = strchr(address, ':');
     if (colon != NULL) {
       gchar *host_only = g_strndup(address, (gsize) (colon - address));
       g_error_free(error);
       error = NULL;
+      qqw_frontmost_probe_debug_log_stage("before_add_remote_device_host_only", host_only, 0);
       device = frida_device_manager_add_remote_device_sync(manager, host_only, NULL, NULL, &error);
+      if (error != NULL) {
+        qqw_frontmost_probe_debug_log_stage("add_remote_device_host_only_error", error->message, 0);
+      }
       g_free(host_only);
     }
   }
+  qqw_frontmost_probe_debug_log_stage("after_add_remote_device", error != NULL ? error->message : NULL, device != NULL ? 1 : 0);
   if (error != NULL || device == NULL) {
     if (error_out != NULL) {
       *error_out = g_strdup_printf("add_remote_device: %s", error != NULL ? error->message : "failed");
@@ -109,7 +166,9 @@ static int qqw_frontmost_probe_query(const char *address, const char *script_sou
     return 2;
   }
 
+  qqw_frontmost_probe_debug_log_stage("before_attach", "SpringBoard", (gint) pid);
   session = frida_device_attach_sync(device, pid, NULL, NULL, &error);
+  qqw_frontmost_probe_debug_log_stage("after_attach", error != NULL ? error->message : NULL, session != NULL ? 1 : 0);
   if (error != NULL || session == NULL) {
     if (error_out != NULL) {
       *error_out = g_strdup_printf("attach: %s", error != NULL ? error->message : "failed");
@@ -120,7 +179,9 @@ static int qqw_frontmost_probe_query(const char *address, const char *script_sou
     return 2;
   }
 
+  qqw_frontmost_probe_debug_log_stage("before_create_script", NULL, 0);
   script = frida_session_create_script_sync(session, script_source, NULL, NULL, &error);
+  qqw_frontmost_probe_debug_log_stage("after_create_script", error != NULL ? error->message : NULL, script != NULL ? 1 : 0);
   if (error != NULL || script == NULL) {
     if (error_out != NULL) {
       *error_out = g_strdup_printf("create_script: %s", error != NULL ? error->message : "failed");
@@ -133,10 +194,13 @@ static int qqw_frontmost_probe_query(const char *address, const char *script_sou
   }
 
   ctx.loop = g_main_loop_new(NULL, FALSE);
+  qqw_frontmost_probe_debug_log_stage("after_loop_new", NULL, ctx.loop != NULL ? 1 : 0);
   g_signal_connect(script, "message", G_CALLBACK(qqw_frontmost_on_message), &ctx);
   g_signal_connect(session, "detached", G_CALLBACK(qqw_frontmost_on_detached), &ctx);
 
+  qqw_frontmost_probe_debug_log_stage("before_script_load", NULL, 0);
   frida_script_load_sync(script, NULL, &error);
+  qqw_frontmost_probe_debug_log_stage("after_script_load", error != NULL ? error->message : NULL, 0);
   if (error != NULL) {
     if (error_out != NULL) {
       *error_out = g_strdup_printf("script_load: %s", error->message);
@@ -152,10 +216,15 @@ static int qqw_frontmost_probe_query(const char *address, const char *script_sou
 
   if (timeout_ms > 0) {
     timeout_source = g_timeout_add((guint) timeout_ms, qqw_frontmost_on_timeout, &ctx);
+    qqw_frontmost_probe_debug_log_stage("after_timeout_add", NULL, (gint) timeout_source);
   }
+  qqw_frontmost_probe_debug_log_stage("before_main_loop_run", NULL, 0);
   g_main_loop_run(ctx.loop);
+  qqw_frontmost_probe_debug_log_stage("after_main_loop_run", ctx.message, 0);
   if (timeout_source != 0) {
+    qqw_frontmost_probe_debug_log_stage("before_remove_timeout", NULL, (gint) timeout_source);
     g_source_remove(timeout_source);
+    qqw_frontmost_probe_debug_log_stage("after_remove_timeout", NULL, (gint) timeout_source);
   }
 
   if (ctx.message != NULL) {
@@ -167,9 +236,15 @@ static int qqw_frontmost_probe_query(const char *address, const char *script_sou
     *error_out = g_strdup("frontmost-probe timeout");
   }
 
+  qqw_frontmost_probe_debug_log_stage("before_script_unload", NULL, 0);
   frida_script_unload_sync(script, NULL, NULL);
+  qqw_frontmost_probe_debug_log_stage("after_script_unload", NULL, 0);
+  qqw_frontmost_probe_debug_log_stage("before_session_detach", NULL, 0);
   frida_session_detach_sync(session, NULL, NULL);
+  qqw_frontmost_probe_debug_log_stage("after_session_detach", NULL, 0);
+  qqw_frontmost_probe_debug_log_stage("before_loop_unref", NULL, 0);
   g_main_loop_unref(ctx.loop);
+  qqw_frontmost_probe_debug_log_stage("after_loop_unref", NULL, 0);
   g_object_unref(script);
   g_object_unref(session);
   g_object_unref(device);
@@ -177,6 +252,7 @@ static int qqw_frontmost_probe_query(const char *address, const char *script_sou
   if (ctx.message != NULL) {
     g_free(ctx.message);
   }
+  qqw_frontmost_probe_debug_log_stage("return_success", NULL, 0);
   return 0;
 }
 
