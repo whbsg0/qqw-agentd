@@ -322,22 +322,27 @@ const frontmostProbeScriptSource = `
   function pickForeground(apps) {
     var observed = null;
     var count = 0;
+    var debugItems = [];
     if (!apps) {
-      return { observed: null, count: 0 };
+      return { observed: null, count: 0, debugItems: debugItems };
     }
     if (apps.objectEnumerator) {
       var enumerator = apps.objectEnumerator();
       var item = enumerator ? enumerator.nextObject() : null;
       while (item && count < 20) {
         count += 1;
-        var parsed = parseDescription(textOf(item));
+        var raw = textOf(item);
+        if (debugItems.length < 6) {
+          debugItems.push(raw);
+        }
+        var parsed = parseDescription(raw);
         if (parsed.visibility === "Foreground") {
           observed = parsed;
           break;
         }
         item = enumerator.nextObject();
       }
-      return { observed: observed, count: count };
+      return { observed: observed, count: count, debugItems: debugItems };
     }
     if (apps.count && apps.objectAtIndex_) {
       var total = 0;
@@ -348,16 +353,20 @@ const frontmostProbeScriptSource = `
       }
       var limit = Math.min(total, 20);
       for (var i = 0; i < limit; i++) {
-        var parsedIndexed = parseDescription(textOf(apps.objectAtIndex_(i)));
+        var rawIndexed = textOf(apps.objectAtIndex_(i));
+        if (debugItems.length < 6) {
+          debugItems.push(rawIndexed);
+        }
+        var parsedIndexed = parseDescription(rawIndexed);
         count += 1;
         if (parsedIndexed.visibility === "Foreground") {
           observed = parsedIndexed;
           break;
         }
       }
-      return { observed: observed, count: count };
+      return { observed: observed, count: count, debugItems: debugItems };
     }
-    return { observed: null, count: count };
+    return { observed: null, count: count, debugItems: debugItems };
   }
   try {
     if (!ObjC.available) {
@@ -372,7 +381,7 @@ const frontmostProbeScriptSource = `
     var apps = controller.runningApplications();
     var picked = pickForeground(apps);
     if (!picked.observed || !picked.observed.bundleId) {
-      emit({ type: "qqw.frontmost_probe", ok: false, source: "springboard.runningApplications", sampleAtMs: Date.now(), retryable: true, errorCode: "not_ready", errorMessage: "foreground app not found" });
+      emit({ type: "qqw.frontmost_probe", ok: false, source: "springboard.runningApplications", sampleAtMs: Date.now(), retryable: true, errorCode: "not_ready", errorMessage: "foreground app not found", debugCount: picked.count || 0, debugItems: picked.debugItems || [] });
       return;
     }
     emit({
