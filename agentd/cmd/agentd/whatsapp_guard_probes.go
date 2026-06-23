@@ -64,6 +64,12 @@ type runnerProbeResult struct {
 	ScriptLastPongTsMs       int64
 	ScriptEventFresh         bool
 	ScriptPongFresh          bool
+	ScriptForegroundKnown    bool
+	ScriptForegroundActive   bool
+	ScriptForegroundState    string
+	ScriptForegroundSource   string
+	ScriptForegroundSampleAt int64
+	ScriptForegroundFresh    bool
 	ScriptBuildMatch         bool
 	ScriptSha256Match        bool
 	Epoch                    int64
@@ -246,6 +252,12 @@ func (a *Agent) sampleProcessProbe(epoch int64) processProbeResult {
 // 参数：epoch 为本轮采样绑定的 probe epoch。
 // 返回：前台 probe 结果。
 func (a *Agent) sampleFrontmostProbe(epoch int64) frontmostProbeResult {
+	if a.runnerOwnsFridaConnection() {
+		_ = a.stopFrontmostProbeIfRunning()
+		prev := a.getGuardProbeSnapshot().Frontmost
+		prev.Epoch = epoch
+		return prev
+	}
 	now := time.Now().UnixMilli()
 	result := frontmostProbeResult{
 		SampleAtMs: now,
@@ -372,10 +384,16 @@ func (a *Agent) sampleRunnerProbe(epoch int64) runnerProbeResult {
 		InstalledScriptSha256:    strings.TrimSpace(installed.Sha256),
 		ScriptLastEventTsMs:      a.scriptLastEventTS.Load(),
 		ScriptLastPongTsMs:       a.scriptLastPongTS.Load(),
+		ScriptForegroundKnown:    a.scriptForegroundKnown.Load(),
+		ScriptForegroundActive:   a.scriptForegroundActive.Load(),
+		ScriptForegroundState:    strings.TrimSpace(valueOrEmptyString(a.scriptForegroundState.Load())),
+		ScriptForegroundSource:   strings.TrimSpace(valueOrEmptyString(a.scriptForegroundSource.Load())),
+		ScriptForegroundSampleAt: a.scriptForegroundTS.Load(),
 		Epoch:                    epoch,
 	}
 	result.ScriptEventFresh = guardTimestampFresh(result.ScriptLastEventTsMs, guardScriptEventFreshnessThresholdMs(a.getCfg()), now)
 	result.ScriptPongFresh = guardTimestampFresh(result.ScriptLastPongTsMs, guardScriptPongFreshnessThresholdMs(), now)
+	result.ScriptForegroundFresh = guardTimestampFresh(result.ScriptForegroundSampleAt, guardScriptPongFreshnessThresholdMs(), now)
 	if !result.RunnerProcessAlive {
 		return result
 	}

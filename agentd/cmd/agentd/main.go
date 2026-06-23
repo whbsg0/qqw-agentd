@@ -284,14 +284,20 @@ type Agent struct {
 	lastDbSyncState     atomic.Value
 	lastDbSyncErr       atomic.Value
 
-	scriptUpdatedAtTS atomic.Int64
-	scriptLastError   atomic.Value
-	scriptLastEventTS atomic.Int64
-	scriptLastPongTS  atomic.Int64
+	scriptUpdatedAtTS      atomic.Int64
+	scriptLastError        atomic.Value
+	scriptLastEventTS      atomic.Int64
+	scriptLastPongTS       atomic.Int64
+	scriptForegroundTS     atomic.Int64
+	scriptForegroundKnown  atomic.Bool
+	scriptForegroundActive atomic.Bool
+	scriptForegroundState  atomic.Value
+	scriptForegroundSource atomic.Value
 
-	runnerMu  sync.Mutex
-	runnerCmd *exec.Cmd
-	runnerPid atomic.Int64
+	runnerMu            sync.Mutex
+	runnerCmd           *exec.Cmd
+	runnerPid           atomic.Int64
+	runnerOwnsFridaConn atomic.Bool
 
 	frontmostProbeMu  sync.Mutex
 	frontmostProbeCmd *exec.Cmd
@@ -828,6 +834,7 @@ func (a *Agent) startControlServer(cfgPath string) {
 		if err := json.Unmarshal(body, &m); err == nil {
 			if t, ok := m["type"].(string); ok && strings.TrimSpace(t) == "qqw.pong" {
 				a.scriptLastPongTS.Store(now)
+				a.updateScriptForegroundFromPong(m, now)
 			}
 		}
 		a.eventQueue.Enqueue(body)
@@ -1136,11 +1143,83 @@ func (a *Agent) startFrontmostProbe() error {
 	return nil
 }
 
+// runnerOwnsFridaConnection 判断当前是否应由 runner 独占 Frida 远端连接。
+// 参数：无。
+// 返回：runner 启动中或运行中返回 true，否则返回 false。
+func (a *Agent) runnerOwnsFridaConnection() bool {
+	return a.runnerOwnsFridaConn.Load() || a.runnerPid.Load() > 0
+}
+
+// resetScriptRuntimeMarkers 清理当前 runner 会话的事件、心跳与前台态缓存。
+// 参数：无。
+// 返回：无。
+func (a *Agent) resetScriptRuntimeMarkers() {
+	a.scriptLastEventTS.Store(0)
+	a.scriptLastPongTS.Store(0)
+	a.scriptForegroundTS.Store(0)
+	a.scriptForegroundKnown.Store(false)
+	a.scriptForegroundActive.Store(false)
+	a.scriptForegroundState.Store("")
+	a.scriptForegroundSource.Store("")
+}
+
+// updateScriptForegroundFromPong 从 `qqw.pong` payload 中提取 WhatsApp 自身前后台态。
+// 参数：payload 为已解析的脚本事件；sampleAtMs 为当前事件接收毫秒时间。
+// 返回：无。
+func (a *Agent) updateScriptForegroundFromPong(payload map[string]any, sampleAtMs int64) {
+	raw, ok := payload["foreground"].(map[string]any)
+	if !ok || raw == nil {
+		return
+	}
+	known, knownOK := jsonBool(raw["known"])
+	if !knownOK {
+		known, knownOK = jsonBool(raw["ok"])
+	}
+	if !knownOK {
+		return
+	}
+	active, _ := jsonBool(raw["active"])
+	if !known {
+		a.scriptForegroundTS.Store(0)
+		a.scriptForegroundKnown.Store(false)
+		a.scriptForegroundActive.Store(false)
+		a.scriptForegroundState.Store(strings.TrimSpace(valueOrEmptyString(raw["state"])))
+		a.scriptForegroundSource.Store(strings.TrimSpace(valueOrEmptyString(raw["source"])))
+		return
+	}
+	a.scriptForegroundTS.Store(sampleAtMs)
+	a.scriptForegroundKnown.Store(true)
+	a.scriptForegroundActive.Store(active)
+	a.scriptForegroundState.Store(strings.TrimSpace(valueOrEmptyString(raw["state"])))
+	a.scriptForegroundSource.Store(strings.TrimSpace(valueOrEmptyString(raw["source"])))
+}
+
+// jsonBool 安全解析 JSON 动态字段中的布尔值。
+// 参数：v 为待解析字段。
+// 返回：解析成功时返回值和 true，否则返回 false 和 false。
+func jsonBool(v any) (bool, bool) {
+	switch x := v.(type) {
+	case bool:
+		return x, true
+	case string:
+		switch strings.ToLower(strings.TrimSpace(x)) {
+		case "true", "1", "yes":
+			return true, true
+		case "false", "0", "no":
+			return false, true
+		}
+	}
+	return false, false
+}
+
 // ensureFrontmostProbeRunning 确保独立 frontmost-probe 已就绪。
 // 参数：无。
 // 返回：ready 返回 nil；否则返回错误。
 func (a *Agent) ensureFrontmostProbeRunning() error {
 	if !guardFrontmostQueryEnabled() {
+		return nil
+	}
+	if a.runnerOwnsFridaConnection() {
 		return nil
 	}
 	return a.startFrontmostProbe()
@@ -1185,10 +1264,20 @@ func (a *Agent) startRunnerWithOptions(requireForeground bool, waitForegroundMs 
 	if a.runnerCmd != nil && a.runnerCmd.Process != nil {
 		return errors.New("runner already running")
 	}
+	a.runnerOwnsFridaConn.Store(true)
+	defer func() {
+		if a.runnerCmd == nil || a.runnerCmd.Process == nil {
+			a.runnerOwnsFridaConn.Store(false)
+		}
+	}()
 	cfg := a.getCfg()
 	if strings.TrimSpace(cfg.ControlListen) == "" {
 		return errors.New("controlListen missing")
 	}
+	if err := a.stopFrontmostProbeIfRunning(); err != nil {
+		return err
+	}
+	a.resetScriptRuntimeMarkers()
 	runnerPath, err := a.runnerBinaryPath()
 	if err != nil {
 		return err
@@ -1232,6 +1321,7 @@ func (a *Agent) startRunnerWithOptions(requireForeground bool, waitForegroundMs 
 		if a.runnerCmd == cmd {
 			a.runnerCmd = nil
 			a.runnerPid.Store(0)
+			a.runnerOwnsFridaConn.Store(false)
 		}
 		a.runnerMu.Unlock()
 		if err != nil {
@@ -1276,6 +1366,7 @@ func (a *Agent) stopRunner() error {
 	}
 	a.runnerCmd = nil
 	a.runnerPid.Store(0)
+	a.runnerOwnsFridaConn.Store(false)
 	a.bumpGuardProbeEpoch("runner_stopped")
 	return nil
 }
@@ -1292,6 +1383,7 @@ func (a *Agent) stopRunnerIfRunning() error {
 	}
 	a.runnerCmd = nil
 	a.runnerPid.Store(0)
+	a.runnerOwnsFridaConn.Store(false)
 	a.bumpGuardProbeEpoch("runner_stop_if_running")
 	return nil
 }

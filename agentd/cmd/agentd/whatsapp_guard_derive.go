@@ -63,6 +63,24 @@ func deriveGuardRuntimeSnapshot(
 	snapshot.FrontmostQueryEnabled = frontmostEnabled
 	snapshot.RunnerState = deriveRunnerState(cfg, probes.Runner, nowMs)
 
+	if probes.Runner.RunnerProcessAlive && probes.Runner.ScriptForegroundKnown && probes.Runner.ScriptForegroundFresh {
+		snapshot.Frontmost = probes.Runner.ScriptForegroundActive
+		snapshot.FrontmostErr = ""
+		snapshot.FrontmostSampleAtMs = guardMaxInt64(snapshot.FrontmostSampleAtMs, probes.Runner.ScriptForegroundSampleAt)
+		snapshot.FrontmostFresh = true
+		snapshot.FrontmostSource = firstNonEmpty(strings.TrimSpace(probes.Runner.ScriptForegroundSource), "runner.qqw_pong")
+		if snapshot.Frontmost {
+			snapshot.FrontmostObservedID = firstNonEmpty(strings.TrimSpace(cfg.WhatsApp.BundleID), "net.whatsapp.WhatsApp")
+		} else {
+			snapshot.FrontmostObservedID = ""
+		}
+		stateText := strings.TrimSpace(probes.Runner.ScriptForegroundState)
+		if stateText == "" {
+			stateText = "unknown"
+		}
+		snapshot.FrontmostDetail = strings.TrimSpace("source=" + snapshot.FrontmostSource + "; appState=" + stateText + "; foreground=" + strings.ToLower(firstNonEmpty(boolText(snapshot.Frontmost), "false")))
+	}
+
 	if !cfg.WhatsApp.AutoGuardEnabled {
 		*confirmStartedAt = time.Time{}
 		snapshot.GuardEnabled = false
@@ -203,6 +221,16 @@ func deriveRunnerState(cfg Config, probe runnerProbeResult, nowMs int64) string 
 		return "runner_unresponsive"
 	}
 	return "runner_ready"
+}
+
+// boolText 将布尔值转为稳定文本，便于拼接 detail 摘要。
+// 参数：v 为布尔值。
+// 返回：true/false 文本。
+func boolText(v bool) string {
+	if v {
+		return "true"
+	}
+	return "false"
 }
 
 // guardMaxInt64 返回两个 int64 中的较大值。
