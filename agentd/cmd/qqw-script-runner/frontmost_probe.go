@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -42,12 +43,20 @@ var (
 const debugFrontmostProbeServerURL = "http://192.168.1.4:7777/event"
 const debugFrontmostProbeSessionID = "guard-fuse-errors"
 const debugFrontmostProbeLocalLogPath = "/var/mobile/Library/QQwAgent/trae-debug-log-guard-fuse-errors.ndjson"
+const debugFrontmostProbeAFCLocalLogPath = "/var/mobile/Media/QQwAgent/trae-debug-log-guard-fuse-errors.ndjson"
 
-// appendDebugFrontmostProbeLocalLog 将调试事件追加写入设备本地 ndjson，便于无本地调试服务器时直接取证。
-// 参数：body 为已编码的单条 JSON 调试事件。
+// appendDebugFrontmostProbeLogFile 将调试事件追加写入指定设备本地 ndjson。
+// 参数：filePath 为目标日志路径；body 为已编码的单条 JSON 调试事件。
 // 返回：写入失败时返回错误。
-func appendDebugFrontmostProbeLocalLog(body []byte) error {
-	f, err := os.OpenFile(debugFrontmostProbeLocalLogPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+func appendDebugFrontmostProbeLogFile(filePath string, body []byte) error {
+	filePath = strings.TrimSpace(filePath)
+	if filePath == "" {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(filePath), 0o755); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(filePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
 		return err
 	}
@@ -59,6 +68,25 @@ func appendDebugFrontmostProbeLocalLog(body []byte) error {
 		return err
 	}
 	return nil
+}
+
+// appendDebugFrontmostProbeLocalLog 同时写入设备私有路径与 AFC 可读取路径，便于本机终端直接拉取。
+// 参数：body 为已编码的单条 JSON 调试事件。
+// 返回：至少一个路径写入成功则返回 nil；全部失败时返回最后一个错误。
+func appendDebugFrontmostProbeLocalLog(body []byte) error {
+	var lastErr error
+	wrote := false
+	for _, filePath := range []string{debugFrontmostProbeLocalLogPath, debugFrontmostProbeAFCLocalLogPath} {
+		if err := appendDebugFrontmostProbeLogFile(filePath, body); err != nil {
+			lastErr = err
+			continue
+		}
+		wrote = true
+	}
+	if wrote {
+		return nil
+	}
+	return lastErr
 }
 
 // #region debug-point H1-H2:frontmost-probe-debug-report
