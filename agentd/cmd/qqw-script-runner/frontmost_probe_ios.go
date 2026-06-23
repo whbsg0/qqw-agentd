@@ -342,6 +342,12 @@ func queryFrontmostProbeOnce(fridaHost string, fridaPort int, timeoutMs int) fro
 		timeoutMs = 3000
 	}
 	hostPort := addr + ":" + strconv.Itoa(fridaPort)
+	// #region debug-point H1:frontmost-probe-cgo-enter
+	debugFrontmostProbeReport("pre-fix", "H1", "frontmost_probe_ios.go:queryFrontmostProbeOnce", "enter cgo frontmost probe query", map[string]any{
+		"hostPort":  hostPort,
+		"timeoutMs": timeoutMs,
+	})
+	// #endregion
 	cAddr := C.CString(hostPort)
 	cSrc := C.CString(frontmostProbeScriptSource)
 	defer C.free(unsafe.Pointer(cAddr))
@@ -351,19 +357,39 @@ func queryFrontmostProbeOnce(fridaHost string, fridaPort int, timeoutMs int) fro
 	rc := C.qqw_frontmost_probe_query(cAddr, cSrc, C.int(timeoutMs), &cMsg, &cErr)
 	if cErr != nil {
 		defer C.qqw_frontmost_probe_free(cErr)
+		errText := strings.TrimSpace(C.GoString(cErr))
+		// #region debug-point H2:frontmost-probe-cgo-error
+		debugFrontmostProbeReport("pre-fix", "H2", "frontmost_probe_ios.go:queryFrontmostProbeOnce", "cgo frontmost probe returned error", map[string]any{
+			"hostPort":      hostPort,
+			"timeoutMs":     timeoutMs,
+			"rc":            int(rc),
+			"errorMessage":  errText,
+			"messageIsNil":  cMsg == nil,
+			"errorPtrIsNil": cErr == nil,
+		})
+		// #endregion
 		return frontmostProbeSnapshot{
 			Ok:           false,
 			Source:       "springboard.runningApplications",
 			SampleAtMs:   now,
 			Retryable:    true,
 			ErrorCode:    "transport_unavailable",
-			ErrorMessage: strings.TrimSpace(C.GoString(cErr)),
+			ErrorMessage: errText,
 		}
 	}
 	if rc != 0 || cMsg == nil {
 		if cMsg != nil {
 			defer C.qqw_frontmost_probe_free(cMsg)
 		}
+		// #region debug-point H2:frontmost-probe-cgo-empty
+		debugFrontmostProbeReport("pre-fix", "H2", "frontmost_probe_ios.go:queryFrontmostProbeOnce", "cgo frontmost probe returned empty payload", map[string]any{
+			"hostPort":      hostPort,
+			"timeoutMs":     timeoutMs,
+			"rc":            int(rc),
+			"messageIsNil":  cMsg == nil,
+			"errorPtrIsNil": cErr == nil,
+		})
+		// #endregion
 		return frontmostProbeSnapshot{
 			Ok:           false,
 			Source:       "springboard.runningApplications",
@@ -374,7 +400,16 @@ func queryFrontmostProbeOnce(fridaHost string, fridaPort int, timeoutMs int) fro
 		}
 	}
 	defer C.qqw_frontmost_probe_free(cMsg)
-	return parseFrontmostProbeMessage(C.GoString(cMsg), now)
+	rawMessage := C.GoString(cMsg)
+	// #region debug-point H2:frontmost-probe-cgo-success
+	debugFrontmostProbeReport("pre-fix", "H2", "frontmost_probe_ios.go:queryFrontmostProbeOnce", "cgo frontmost probe returned payload", map[string]any{
+		"hostPort":       hostPort,
+		"timeoutMs":      timeoutMs,
+		"rc":             int(rc),
+		"payloadPreview": strings.TrimSpace(rawMessage),
+	})
+	// #endregion
+	return parseFrontmostProbeMessage(rawMessage, now)
 }
 
 // parseFrontmostProbeMessage 解析 Frida `send(...)` 返回的前台探测消息。
