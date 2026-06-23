@@ -303,27 +303,28 @@ type Agent struct {
 	frontmostProbeCmd *exec.Cmd
 	frontmostProbePid atomic.Int64
 
-	guardLastActionTS     atomic.Int64
-	guardLastAction       atomic.Value
-	guardLastError        atomic.Value
-	guardWake             chan struct{}
-	guardStateMu          sync.RWMutex
-	guardState            guardRuntimeSnapshot
-	guardWorkersOnce      sync.Once
-	guardProbeMu          sync.RWMutex
-	guardProcessProbe     processProbeResult
-	guardFrontmostProbe   frontmostProbeResult
-	guardRunnerProbe      runnerProbeResult
-	guardProbeEpoch       atomic.Int64
-	guardRecoveryEpoch    atomic.Int64
-	guardRecoveryQueue    chan guardRecoveryTask
-	guardRecoveryMu       sync.RWMutex
-	guardRecoveryState    guardRecoveryStatus
-	guardPersistMu        sync.Mutex
-	guardStorePath        string
-	guardRecoveryAttempts []int64
-	guardRecoveryBlocked  bool
-	guardForceRecover     bool
+	guardLastActionTS         atomic.Int64
+	guardLastAction           atomic.Value
+	guardLastError            atomic.Value
+	guardWake                 chan struct{}
+	guardStateMu              sync.RWMutex
+	guardState                guardRuntimeSnapshot
+	guardWorkersOnce          sync.Once
+	guardProbeMu              sync.RWMutex
+	guardProcessProbe         processProbeResult
+	guardFrontmostProbe       frontmostProbeResult
+	guardRunnerProbe          runnerProbeResult
+	guardProbeEpoch           atomic.Int64
+	guardRecoveryEpoch        atomic.Int64
+	guardRecoveryQueue        chan guardRecoveryTask
+	guardRecoveryMu           sync.RWMutex
+	guardRecoveryState        guardRecoveryStatus
+	guardPersistMu            sync.Mutex
+	guardStorePath            string
+	guardRecoveryAttempts     []int64
+	guardRecoveryBlocked      bool
+	guardForceRecover         bool
+	guardRecoveryGraceUntilMs int64
 
 	eventQueue *EventQueue
 }
@@ -1373,6 +1374,8 @@ func (a *Agent) guardStatusSnapshot(cfg Config) map[string]any {
 		"recoveryAttempts":           runtime.RecoveryAttempts,
 		"maxRecoveryAttempts":        runtime.MaxRecoveryAttempts,
 		"remainingRetryCount":        runtime.RemainingRetryCount,
+		"recoveryGraceActive":        runtime.RecoveryGraceActive,
+		"recoveryGraceUntilMs":       runtime.RecoveryGraceUntilMs,
 		"nextRetryAtMs":              runtime.NextRetryAtMs,
 		"recoveryInFlight":           runtime.RecoveryInFlight,
 		"recoveryPending":            runtime.RecoveryPending,
@@ -1456,6 +1459,7 @@ func (a *Agent) setGuardEnabled(enabled bool) error {
 			return err
 		}
 	}
+	a.clearGuardRecoveryGrace()
 	if err := a.persistAndSetConfig(nextCfg); err != nil {
 		a.recordGuardAction("guard_set", err)
 		return err
@@ -1504,13 +1508,19 @@ func (a *Agent) requestGuardRecover() error {
 	return nil
 }
 
-// resetGuardRecoveryState 清空 crash loop 计数和熔断状态，并唤醒 guard loop。
+// resetGuardRecoveryState 清空 crash loop 计数和熔断状态，并进入一次恢复宽限窗口。
 // 参数：无。
 // 返回：清空失败时返回错误。
 func (a *Agent) resetGuardRecoveryState() error {
+	cfg := a.getCfg()
 	if err := a.clearGuardRecoveryState(); err != nil {
 		a.recordGuardAction("guard_reset", err)
 		return err
+	}
+	if cfg.WhatsApp.AutoGuardEnabled {
+		a.armGuardRecoveryGrace(time.Now().Add(time.Duration(guardResetRecoveryGraceMs(cfg)) * time.Millisecond).UnixMilli())
+	} else {
+		a.clearGuardRecoveryGrace()
 	}
 	a.recordGuardAction("guard_reset", nil)
 	a.clearGuardRecoverySchedule()
@@ -1946,6 +1956,8 @@ func (a *Agent) sendPing(ctx context.Context, ws *websocket.Conn, sessionID stri
 		RecoveryAttempts      int    `json:"recoveryAttempts,omitempty"`
 		MaxRecoveryAttempts   int    `json:"maxRecoveryAttempts,omitempty"`
 		RemainingRetryCount   int    `json:"remainingRetryCount,omitempty"`
+		RecoveryGraceActive   bool   `json:"recoveryGraceActive"`
+		RecoveryGraceUntilMs  int64  `json:"recoveryGraceUntilMs,omitempty"`
 		NextRetryAtMs         int64  `json:"nextRetryAtMs,omitempty"`
 		FrontmostQueryEnabled bool   `json:"frontmostQueryEnabled"`
 	}
@@ -2004,6 +2016,8 @@ func (a *Agent) sendPing(ctx context.Context, ws *websocket.Conn, sessionID stri
 			RecoveryAttempts:      guard.RecoveryAttempts,
 			MaxRecoveryAttempts:   guard.MaxRecoveryAttempts,
 			RemainingRetryCount:   guard.RemainingRetryCount,
+			RecoveryGraceActive:   guard.RecoveryGraceActive,
+			RecoveryGraceUntilMs:  guard.RecoveryGraceUntilMs,
 			NextRetryAtMs:         guard.NextRetryAtMs,
 			FrontmostQueryEnabled: guard.FrontmostQueryEnabled,
 		},

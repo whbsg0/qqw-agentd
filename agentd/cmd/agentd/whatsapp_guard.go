@@ -82,6 +82,8 @@ type guardRuntimeSnapshot struct {
 	RecoveryAction          string
 	RecoveryRequestedState  string
 	RecoveryRequestedReason string
+	RecoveryGraceActive     bool
+	RecoveryGraceUntilMs    int64
 
 	FrontmostQueryEnabled bool
 }
@@ -110,6 +112,8 @@ func defaultGuardRuntimeSnapshot(cfg Config) guardRuntimeSnapshot {
 		MaxRecoveryAttempts:   cfg.WhatsApp.MaxRecoveryAttempts,
 		RemainingRetryCount:   cfg.WhatsApp.MaxRecoveryAttempts,
 		NextRetryAtMs:         0,
+		RecoveryGraceActive:   false,
+		RecoveryGraceUntilMs:  0,
 		FrontmostQueryEnabled: guardFrontmostQueryEnabled(),
 	}
 }
@@ -204,6 +208,18 @@ func (a *Agent) runGuardLoop(ctx context.Context) {
 				)
 			}
 		}
+		graceUntilMs := a.getGuardRecoveryGraceUntilMs()
+		if graceUntilMs > 0 && now.UnixMilli() >= graceUntilMs {
+			a.clearGuardRecoveryGrace()
+			graceUntilMs = 0
+		}
+		snapshot.RecoveryGraceUntilMs = graceUntilMs
+		snapshot.RecoveryGraceActive = graceUntilMs > 0 && now.UnixMilli() < graceUntilMs
+		if snapshot.RecoveryGraceActive && guardRecoveryGraceClearEligible(snapshot) {
+			a.clearGuardRecoveryGrace()
+			snapshot.RecoveryGraceActive = false
+			snapshot.RecoveryGraceUntilMs = 0
+		}
 		a.setGuardRuntimeSnapshot(snapshot)
 		if !snapshot.RecoveryInFlight && !snapshot.RecoveryPending {
 			_ = a.maybeScheduleGuardRecovery(cfg, snapshot, manualRecover)
@@ -235,6 +251,25 @@ func guardBlockedAutoClearEligible(snapshot guardRuntimeSnapshot) bool {
 		if strings.TrimSpace(snapshot.FrontmostErr) != "" {
 			return false
 		}
+	}
+	return true
+}
+
+// guardRecoveryGraceClearEligible 判断 reset 后的恢复宽限是否已达到清理条件。
+// 参数：snapshot 为当前基于实时 probe 派生的 guard 快照。
+// 返回：系统已回到前台稳态且无恢复任务排队时返回 true。
+func guardRecoveryGraceClearEligible(snapshot guardRuntimeSnapshot) bool {
+	if !snapshot.GuardEnabled {
+		return false
+	}
+	if snapshot.GuardState != "wa_foreground_ready" {
+		return false
+	}
+	if snapshot.RunnerState != "runner_ready" {
+		return false
+	}
+	if snapshot.RecoveryInFlight || snapshot.RecoveryPending {
+		return false
 	}
 	return true
 }
@@ -358,6 +393,14 @@ func appendGuardRecoveryAttempt(nowMs int64, windowMs int, maxAttempts int, atte
 	*attempts = append(*attempts, nowMs)
 	count = len(*attempts)
 	return count, false, count
+}
+
+// guardResetRecoveryGraceMs 返回 `guard_reset` 后恢复计数宽限窗口时长。
+// 参数：cfg 为当前配置。
+// 返回：用于让自动恢复先把系统拉回稳态的宽限毫秒数。
+func guardResetRecoveryGraceMs(cfg Config) int64 {
+	baseMs := cfg.WhatsApp.ForegroundConfirmMs + cfg.WhatsApp.ForegroundStableMs + maxInt(cfg.WhatsApp.HealthCheckMs*4, 12_000)
+	return int64(maxInt(baseMs, 30_000))
 }
 
 // guardRecoveryBackoff 返回当前恢复次数对应的退避时长。

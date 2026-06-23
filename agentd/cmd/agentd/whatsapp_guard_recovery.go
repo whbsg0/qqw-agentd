@@ -124,7 +124,17 @@ func (a *Agent) runGuardRecoveryWorker(ctx context.Context) {
 func (a *Agent) executeGuardRecoveryTask(ctx context.Context, task guardRecoveryTask) {
 	cfg := a.getCfg()
 	nowMs := time.Now().UnixMilli()
-	attemptNo, blocked, _, err := a.appendGuardRecoveryAttemptPersisted(nowMs, cfg.WhatsApp.RecoveryWindowMs, cfg.WhatsApp.MaxRecoveryAttempts)
+	attemptNo := 1
+	blocked := false
+	graceActive := a.guardRecoveryGraceActive(nowMs)
+	var err error
+	if graceActive {
+		attempts, blockedState := a.getGuardRecoveryState()
+		attemptNo = trimGuardRecoveryAttempts(nowMs, cfg.WhatsApp.RecoveryWindowMs, &attempts) + 1
+		blocked = blockedState
+	} else {
+		attemptNo, blocked, _, err = a.appendGuardRecoveryAttemptPersisted(nowMs, cfg.WhatsApp.RecoveryWindowMs, cfg.WhatsApp.MaxRecoveryAttempts)
+	}
 	status := a.getGuardRecoveryStatus()
 	status.Pending = false
 	status.InFlight = false

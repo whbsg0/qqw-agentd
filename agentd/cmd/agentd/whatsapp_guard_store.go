@@ -39,6 +39,7 @@ func (a *Agent) initGuardPersistentState(cfg Config) error {
 	a.guardRecoveryAttempts = cloneGuardAttempts(state.RecoveryAttemptsMs)
 	a.guardRecoveryBlocked = state.Blocked
 	a.guardForceRecover = false
+	a.guardRecoveryGraceUntilMs = 0
 	a.guardPersistMu.Unlock()
 	return nil
 }
@@ -91,6 +92,43 @@ func (a *Agent) replaceGuardRecoveryState(attempts []int64, blocked bool) error 
 // 返回：写盘失败时返回错误。
 func (a *Agent) clearGuardRecoveryState() error {
 	return a.replaceGuardRecoveryState(nil, false)
+}
+
+// armGuardRecoveryGrace 设置一次恢复计数宽限窗口。
+// 参数：untilMs 为宽限截止毫秒时间戳；小于等于 0 表示清除宽限。
+// 返回：无。
+func (a *Agent) armGuardRecoveryGrace(untilMs int64) {
+	a.guardPersistMu.Lock()
+	defer a.guardPersistMu.Unlock()
+	if untilMs <= 0 {
+		a.guardRecoveryGraceUntilMs = 0
+		return
+	}
+	a.guardRecoveryGraceUntilMs = untilMs
+}
+
+// clearGuardRecoveryGrace 清除恢复计数宽限窗口。
+// 参数：无。
+// 返回：无。
+func (a *Agent) clearGuardRecoveryGrace() {
+	a.armGuardRecoveryGrace(0)
+}
+
+// getGuardRecoveryGraceUntilMs 读取当前恢复计数宽限截止时间。
+// 参数：无。
+// 返回：宽限截止毫秒时间戳；未设置时返回 0。
+func (a *Agent) getGuardRecoveryGraceUntilMs() int64 {
+	a.guardPersistMu.Lock()
+	defer a.guardPersistMu.Unlock()
+	return a.guardRecoveryGraceUntilMs
+}
+
+// guardRecoveryGraceActive 判断恢复计数宽限是否仍然生效。
+// 参数：nowMs 为当前毫秒时间戳。
+// 返回：当前仍处于宽限窗口内时返回 true。
+func (a *Agent) guardRecoveryGraceActive(nowMs int64) bool {
+	untilMs := a.getGuardRecoveryGraceUntilMs()
+	return untilMs > 0 && nowMs < untilMs
 }
 
 // isGuardRecoveryBlocked 返回当前是否处于 crash loop 熔断状态。
