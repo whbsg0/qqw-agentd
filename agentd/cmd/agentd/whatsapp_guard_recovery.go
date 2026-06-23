@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"strings"
@@ -204,7 +206,7 @@ func (a *Agent) executeGuardRecoveryAction(action string) error {
 		}
 		return a.startRunner()
 	case "restart_frida_server":
-		return ensureFridaUp(cfg.Frida.Host, cfg.Frida.Port, cfg.Frida.StartCmd)
+		return a.restartFridaService(cfg)
 	case "restart_agentd":
 		return a.restartAgentdService()
 	case "open_whatsapp_after_recover":
@@ -214,23 +216,91 @@ func (a *Agent) executeGuardRecoveryAction(action string) error {
 	}
 }
 
+// restartFridaService 优先通过 launchctl 重启 frida-server，并轮询端口 ready。
+// 参数：cfg 为当前配置。
+// 返回：服务未能在等待窗口内 ready 时返回错误。
+func (a *Agent) restartFridaService(cfg Config) error {
+	host := strings.TrimSpace(cfg.Frida.Host)
+	port := cfg.Frida.Port
+	if launchctlPath := guardLaunchctlPath(); launchctlPath != "" {
+		cmd := exec.Command(launchctlPath, "kickstart", "-k", "system/re.frida.server")
+		cmd.Env = append(os.Environ(), "PATH=/var/jb/usr/bin:/var/jb/bin:/usr/bin:/bin:/usr/sbin:/sbin")
+		if out, err := cmd.CombinedOutput(); err == nil {
+			if err := waitTCPReady(host, port, 8*time.Second, 250*time.Millisecond); err == nil {
+				return nil
+			}
+		} else {
+			msg := strings.TrimSpace(string(out))
+			if msg != "" {
+				err = errors.New(msg)
+			}
+			_ = err
+		}
+	}
+	if err := ensureFridaUp(host, port, cfg.Frida.StartCmd); err != nil {
+		return err
+	}
+	return waitTCPReady(host, port, 5*time.Second, 250*time.Millisecond)
+}
+
 // restartAgentdService 通过 launchctl 请求重启当前 agentd 服务。
 // 参数：无。
 // 返回：命令启动失败时返回错误。
 func (a *Agent) restartAgentdService() error {
-	launchctlPath := ""
-	for _, p := range []string{"/var/jb/usr/bin/launchctl", "/var/jb/bin/launchctl", "/usr/bin/launchctl", "/bin/launchctl"} {
-		if firstExistingFile(p) != "" {
-			launchctlPath = p
-			break
-		}
-	}
+	launchctlPath := guardLaunchctlPath()
 	if launchctlPath == "" {
 		launchctlPath = "launchctl"
 	}
 	cmd := exec.Command(launchctlPath, "kickstart", "-k", "system/com.qqw.agentd")
 	cmd.Env = append(os.Environ(), "PATH=/var/jb/usr/bin:/var/jb/bin:/usr/bin:/bin:/usr/sbin:/sbin")
 	return cmd.Start()
+}
+
+// guardLaunchctlPath 返回当前设备上可用的 launchctl 可执行路径。
+// 参数：无。
+// 返回：找到则返回绝对路径，否则返回空串。
+func guardLaunchctlPath() string {
+	for _, p := range []string{"/var/jb/usr/bin/launchctl", "/var/jb/bin/launchctl", "/usr/bin/launchctl", "/bin/launchctl"} {
+		if firstExistingFile(p) != "" {
+			return p
+		}
+	}
+	return ""
+}
+
+// waitTCPReady 在限定窗口内轮询目标 TCP 地址是否已准备完成。
+// 参数：host 为目标主机；port 为目标端口；timeout 为总等待时间；interval 为轮询间隔。
+// 返回：连通返回 nil；超时返回最后一次拨号错误。
+func waitTCPReady(host string, port int, timeout time.Duration, interval time.Duration) error {
+	host = strings.TrimSpace(host)
+	if host == "" || port <= 0 {
+		return errors.New("frida host/port missing")
+	}
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	if interval <= 0 {
+		interval = 250 * time.Millisecond
+	}
+	addr := net.JoinHostPort(host, fmt.Sprintf("%d", port))
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+	for {
+		conn, err := net.DialTimeout("tcp", addr, interval)
+		if err == nil {
+			_ = conn.Close()
+			return nil
+		}
+		lastErr = err
+		if time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(interval)
+	}
+	if lastErr != nil {
+		return lastErr
+	}
+	return errors.New("tcp ready wait timeout")
 }
 
 // buildGuardRecoveryTask 根据当前派生状态构造恢复任务。

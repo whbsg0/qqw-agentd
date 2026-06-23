@@ -237,6 +237,22 @@ func (a *Agent) runGuardLoop(ctx context.Context) {
 			now,
 			&confirmStartedAt,
 		)
+		if blocked && guardBlockedAutoClearEligible(snapshot) {
+			if err := a.clearGuardRecoveryState(); err == nil {
+				blocked = false
+				trimmedAttempts = 0
+				a.clearGuardRecoverySchedule()
+				snapshot = deriveGuardRuntimeSnapshot(
+					cfg,
+					a.getGuardProbeSnapshot(),
+					trimmedAttempts,
+					blocked,
+					a.getGuardRecoveryStatus(),
+					now,
+					&confirmStartedAt,
+				)
+			}
+		}
 		a.setGuardRuntimeSnapshot(snapshot)
 		if !snapshot.RecoveryInFlight && !snapshot.RecoveryPending {
 			_ = a.maybeScheduleGuardRecovery(cfg, snapshot, manualRecover)
@@ -249,6 +265,27 @@ func (a *Agent) runGuardLoop(ctx context.Context) {
 		case <-time.After(waitFor):
 		}
 	}
+}
+
+// guardBlockedAutoClearEligible 判断熔断状态是否已具备自动解封条件。
+// 参数：snapshot 为当前基于实时 probe 派生的 guard 快照。
+// 返回：实时 probe 已恢复到可继续判定状态时返回 true。
+func guardBlockedAutoClearEligible(snapshot guardRuntimeSnapshot) bool {
+	if !snapshot.GuardEnabled {
+		return false
+	}
+	if snapshot.ProcessProbeErr != "" || !snapshot.ProcessRunning {
+		return false
+	}
+	if snapshot.FrontmostQueryEnabled {
+		if !snapshot.FrontmostFresh {
+			return false
+		}
+		if strings.TrimSpace(snapshot.FrontmostErr) != "" {
+			return false
+		}
+	}
+	return true
 }
 
 // detectWhatsAppProcess 检查当前设备上是否存在 WhatsApp 进程。
