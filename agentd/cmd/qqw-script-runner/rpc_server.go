@@ -93,14 +93,18 @@ func startRPCServer(addr string) {
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/rpc/health", handleRPCHealth)
-	mux.HandleFunc("/rpc/tx/send", handleRPCTxSend)
-	mux.HandleFunc("/rpc/tx/status", handleRPCTxStatus)
-	mux.HandleFunc("/rpc/msg/action", handleRPCMsgAction)
-	mux.HandleFunc("/rpc/status/action", handleRPCStatusAction)
-	mux.HandleFunc("/rpc/avatar/url", handleRPCAvatarURL)
-	mux.HandleFunc("/rpc/self/card", handleRPCSelfCard)
-	mux.HandleFunc("/rpc/contacts/note/upsert", handleRPCContactsNoteUpsert)
-	mux.HandleFunc("/rpc/contacts/add", handleRPCContactsAdd)
+	if serviceMode == runnerModeFrontmostProbe {
+		mux.HandleFunc("/rpc/frontmost/status", handleRPCFrontmostStatus)
+	} else {
+		mux.HandleFunc("/rpc/tx/send", handleRPCTxSend)
+		mux.HandleFunc("/rpc/tx/status", handleRPCTxStatus)
+		mux.HandleFunc("/rpc/msg/action", handleRPCMsgAction)
+		mux.HandleFunc("/rpc/status/action", handleRPCStatusAction)
+		mux.HandleFunc("/rpc/avatar/url", handleRPCAvatarURL)
+		mux.HandleFunc("/rpc/self/card", handleRPCSelfCard)
+		mux.HandleFunc("/rpc/contacts/note/upsert", handleRPCContactsNoteUpsert)
+		mux.HandleFunc("/rpc/contacts/add", handleRPCContactsAdd)
+	}
 	srv := &http.Server{
 		Addr:              addr,
 		Handler:           mux,
@@ -201,6 +205,17 @@ func handleRPCHealth(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	if serviceMode == runnerModeFrontmostProbe {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":            true,
+			"ts":            time.Now().UnixMilli(),
+			"startedAtMs":   runnerStartedAtMs,
+			"probeReady":    frontmostProbeReady(),
+			"lastHealthErr": getRunnerLastHealthErr(),
+			"mode":          runnerModeFrontmostProbe,
+		})
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":            true,
 		"ts":            time.Now().UnixMilli(),
@@ -210,6 +225,29 @@ func handleRPCHealth(w http.ResponseWriter, r *http.Request) {
 		"scriptSha256":  strings.TrimSpace(runnerScriptSha256),
 		"scriptBuild":   strings.TrimSpace(runnerScriptBuild),
 		"lastHealthErr": getRunnerLastHealthErr(),
+		"mode":          runnerModeScript,
+	})
+}
+
+// handleRPCFrontmostStatus 返回最近一次结构化前台探测结果，供 agentd guard 读取。
+func handleRPCFrontmostStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	snapshot := getFrontmostProbeStatus()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":           snapshot.Ok,
+		"ts":           time.Now().UnixMilli(),
+		"source":       strings.TrimSpace(snapshot.Source),
+		"sampleAtMs":   snapshot.SampleAtMs,
+		"bundleId":     strings.TrimSpace(snapshot.BundleID),
+		"displayName":  strings.TrimSpace(snapshot.DisplayName),
+		"visibility":   strings.TrimSpace(snapshot.Visibility),
+		"taskState":    strings.TrimSpace(snapshot.TaskState),
+		"retryable":    snapshot.Retryable,
+		"errorCode":    strings.TrimSpace(snapshot.ErrorCode),
+		"errorMessage": strings.TrimSpace(snapshot.ErrorMessage),
 	})
 }
 

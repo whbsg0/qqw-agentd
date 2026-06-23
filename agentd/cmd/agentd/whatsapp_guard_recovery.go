@@ -205,6 +205,11 @@ func (a *Agent) executeGuardRecoveryAction(action string) error {
 			return err
 		}
 		return a.startRunner()
+	case "restart_frontmost_probe":
+		if err := a.stopFrontmostProbeIfRunning(); err != nil {
+			return err
+		}
+		return a.startFrontmostProbe()
 	case "restart_frida_server":
 		return a.restartFridaService(cfg)
 	case "restart_agentd":
@@ -324,7 +329,11 @@ func buildGuardRecoveryTask(snapshot guardRuntimeSnapshot, manual bool) (guardRe
 		if state == "wa_frontmost_query_failed" && !manual && !shouldAutoRecoverFrontmostQueryFailure(snapshot.FrontmostErr) {
 			return guardRecoveryTask{}, false
 		}
-		return guardRecoveryTask{GuardState: state, ReasonCode: reason, Manual: manual, Actions: []string{"restart_frida_server", "restart_agentd", "open_whatsapp_after_recover"}}, true
+		actions := []string{"restart_frontmost_probe"}
+		if manual || snapshot.RecoveryAttempts >= 2 {
+			actions = []string{"restart_frida_server", "restart_frontmost_probe", "open_whatsapp_after_recover"}
+		}
+		return guardRecoveryTask{GuardState: state, ReasonCode: reason, Manual: manual, Actions: actions}, true
 	case "wa_process_probe_failed":
 		if snapshot.RecoveryAttempts >= 2 || manual {
 			return guardRecoveryTask{GuardState: state, ReasonCode: reason, Manual: manual, Actions: []string{"restart_agentd"}}, true

@@ -27,6 +27,9 @@ func deriveGuardRuntimeSnapshot(
 	snapshot.FrontmostErr = strings.TrimSpace(probes.Frontmost.Err)
 	snapshot.FrontmostSampleAtMs = probes.Frontmost.SampleAtMs
 	snapshot.FrontmostFresh = !frontmostEnabled || !probes.Process.Running || guardTimestampFresh(probes.Frontmost.SampleAtMs, guardFrontmostFreshnessThresholdMs(cfg), nowMs)
+	snapshot.FrontmostSource = strings.TrimSpace(probes.Frontmost.Source)
+	snapshot.FrontmostObservedID = strings.TrimSpace(probes.Frontmost.ObservedBundleID)
+	snapshot.FrontmostDetail = strings.TrimSpace(probes.Frontmost.Detail)
 	snapshot.RunnerProcessAlive = probes.Runner.RunnerProcessAlive
 	snapshot.RunnerPid = probes.Runner.RunnerPid
 	snapshot.RunnerRPCOK = probes.Runner.RunnerRPCOK

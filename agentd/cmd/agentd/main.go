@@ -293,6 +293,10 @@ type Agent struct {
 	runnerCmd *exec.Cmd
 	runnerPid atomic.Int64
 
+	frontmostProbeMu  sync.Mutex
+	frontmostProbeCmd *exec.Cmd
+	frontmostProbePid atomic.Int64
+
 	guardLastActionTS     atomic.Int64
 	guardLastAction       atomic.Value
 	guardLastError        atomic.Value
@@ -1076,6 +1080,91 @@ func (a *Agent) runnerBinaryPath() (string, error) {
 	return filepath.Join(filepath.Dir(exe), "qqw-script-runner"), nil
 }
 
+// startFrontmostProbe 启动独立 frontmost-probe 实例，并等待本地 RPC 口 ready。
+// 参数：无。
+// 返回：启动成功返回 nil；否则返回错误。
+func (a *Agent) startFrontmostProbe() error {
+	a.frontmostProbeMu.Lock()
+	defer a.frontmostProbeMu.Unlock()
+
+	if a.frontmostProbeCmd != nil && a.frontmostProbeCmd.Process != nil {
+		return nil
+	}
+	cfg := a.getCfg()
+	runnerPath, err := a.runnerBinaryPath()
+	if err != nil {
+		return err
+	}
+	outBuf := newLimitedLineBuffer(8 * 1024)
+	probeIntervalMs := maxInt(cfg.WhatsApp.HealthCheckMs, 1000)
+	cmd := exec.Command(
+		runnerPath,
+		"-mode", "frontmost-probe",
+		"-fridaHost", strings.TrimSpace(cfg.Frida.Host),
+		"-fridaPort", strconv.Itoa(cfg.Frida.Port),
+		"-rpcAddr", "127.0.0.1:17173",
+		"-probeIntervalMs", strconv.Itoa(probeIntervalMs),
+		"-probeTimeoutMs", "3000",
+	)
+	cmd.Env = append(os.Environ(), "PATH=/var/jb/usr/bin:/var/jb/bin:/usr/bin:/bin:/usr/sbin:/sbin")
+	mw := io.MultiWriter(os.Stderr, outBuf)
+	cmd.Stdout = mw
+	cmd.Stderr = mw
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	a.frontmostProbeCmd = cmd
+	a.frontmostProbePid.Store(int64(cmd.Process.Pid))
+	a.bumpGuardProbeEpoch("frontmost_probe_started")
+	go func() {
+		err := cmd.Wait()
+		a.frontmostProbeMu.Lock()
+		if a.frontmostProbeCmd == cmd {
+			a.frontmostProbeCmd = nil
+			a.frontmostProbePid.Store(0)
+		}
+		a.frontmostProbeMu.Unlock()
+		if err != nil {
+			a.guardLastError.Store(strings.TrimSpace(firstNonEmpty(outBuf.String(), err.Error())))
+		}
+		a.bumpGuardProbeEpoch("frontmost_probe_exited")
+	}()
+	if err := waitTCPReady("127.0.0.1", 17173, 3*time.Second, 150*time.Millisecond); err != nil {
+		_ = cmd.Process.Kill()
+		return err
+	}
+	return nil
+}
+
+// ensureFrontmostProbeRunning 确保独立 frontmost-probe 已就绪。
+// 参数：无。
+// 返回：ready 返回 nil；否则返回错误。
+func (a *Agent) ensureFrontmostProbeRunning() error {
+	if !guardFrontmostQueryEnabled() {
+		return nil
+	}
+	return a.startFrontmostProbe()
+}
+
+// stopFrontmostProbeIfRunning 停止独立 frontmost-probe 实例。
+// 参数：无。
+// 返回：停止失败时返回错误。
+func (a *Agent) stopFrontmostProbeIfRunning() error {
+	a.frontmostProbeMu.Lock()
+	defer a.frontmostProbeMu.Unlock()
+
+	if a.frontmostProbeCmd == nil || a.frontmostProbeCmd.Process == nil {
+		return nil
+	}
+	if err := a.frontmostProbeCmd.Process.Kill(); err != nil {
+		return err
+	}
+	a.frontmostProbeCmd = nil
+	a.frontmostProbePid.Store(0)
+	a.bumpGuardProbeEpoch("frontmost_probe_stopped")
+	return nil
+}
+
 func (a *Agent) startRunner() error {
 	cfg := a.getCfg()
 	requireForeground := cfg.WhatsApp.AutoGuardEnabled
@@ -1246,6 +1335,9 @@ func (a *Agent) guardStatusSnapshot(cfg Config) map[string]any {
 		"frontmostErr":               runtime.FrontmostErr,
 		"frontmostSampleAtMs":        runtime.FrontmostSampleAtMs,
 		"frontmostFresh":             runtime.FrontmostFresh,
+		"frontmostSource":            runtime.FrontmostSource,
+		"frontmostObservedBundleId":  runtime.FrontmostObservedID,
+		"frontmostDetail":            runtime.FrontmostDetail,
 		"runnerProcessAlive":         runtime.RunnerProcessAlive,
 		"runnerPid":                  runtime.RunnerPid,
 		"runnerRpcOk":                runtime.RunnerRPCOK,
@@ -1895,6 +1987,29 @@ type runnerRPCHealthResp struct {
 	LastHealthErr string `json:"lastHealthErr"`
 }
 
+type frontmostProbeRPCHealthResp struct {
+	Ok            bool   `json:"ok"`
+	Ts            int64  `json:"ts"`
+	StartedAtMs   int64  `json:"startedAtMs"`
+	ProbeReady    bool   `json:"probeReady"`
+	LastHealthErr string `json:"lastHealthErr"`
+	Mode          string `json:"mode"`
+}
+
+type frontmostProbeRPCStatusResp struct {
+	Ok           bool   `json:"ok"`
+	Ts           int64  `json:"ts"`
+	Source       string `json:"source"`
+	SampleAtMs   int64  `json:"sampleAtMs"`
+	BundleID     string `json:"bundleId"`
+	DisplayName  string `json:"displayName"`
+	Visibility   string `json:"visibility"`
+	TaskState    string `json:"taskState"`
+	Retryable    bool   `json:"retryable"`
+	ErrorCode    string `json:"errorCode"`
+	ErrorMessage string `json:"errorMessage"`
+}
+
 func (a *Agent) getRunnerRPCHealth() (runnerRPCHealthResp, error) {
 	var out runnerRPCHealthResp
 	ctx, cancel := context.WithTimeout(context.Background(), 800*time.Millisecond)
@@ -1921,6 +2036,72 @@ func (a *Agent) getRunnerRPCHealth() (runnerRPCHealthResp, error) {
 	}
 	if !out.Ok {
 		return out, fmt.Errorf("runner rpc health not ok")
+	}
+	return out, nil
+}
+
+// getFrontmostProbeRPCHealth 读取独立 frontmost-probe 的健康口。
+// 参数：无。
+// 返回：解析后的健康结果；请求失败时返回错误。
+func (a *Agent) getFrontmostProbeRPCHealth() (frontmostProbeRPCHealthResp, error) {
+	var out frontmostProbeRPCHealthResp
+	ctx, cancel := context.WithTimeout(context.Background(), 800*time.Millisecond)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://127.0.0.1:17173/rpc/health", nil)
+	if err != nil {
+		return out, err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return out, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		bs, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		msg := strings.TrimSpace(string(bs))
+		if msg == "" {
+			msg = resp.Status
+		}
+		return out, fmt.Errorf("frontmost probe health status=%d err=%s", resp.StatusCode, msg)
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 64<<10)).Decode(&out); err != nil {
+		return out, err
+	}
+	if !out.Ok {
+		return out, errors.New("frontmost probe health not ok")
+	}
+	if strings.TrimSpace(out.Mode) != "frontmost-probe" {
+		return out, fmt.Errorf("frontmost probe mode mismatch: %s", strings.TrimSpace(out.Mode))
+	}
+	return out, nil
+}
+
+// getFrontmostProbeRPCStatus 读取独立 frontmost-probe 最近一次结构化前台结果。
+// 参数：无。
+// 返回：结构化前台结果；请求失败时返回错误。
+func (a *Agent) getFrontmostProbeRPCStatus() (frontmostProbeRPCStatusResp, error) {
+	var out frontmostProbeRPCStatusResp
+	ctx, cancel := context.WithTimeout(context.Background(), 800*time.Millisecond)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://127.0.0.1:17173/rpc/frontmost/status", nil)
+	if err != nil {
+		return out, err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return out, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		bs, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		msg := strings.TrimSpace(string(bs))
+		if msg == "" {
+			msg = resp.Status
+		}
+		return out, fmt.Errorf("frontmost probe status=%d err=%s", resp.StatusCode, msg)
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 64<<10)).Decode(&out); err != nil {
+		return out, err
 	}
 	return out, nil
 }

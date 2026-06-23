@@ -103,6 +103,9 @@ type guardRuntimeSnapshot struct {
 	FrontmostErr        string
 	FrontmostSampleAtMs int64
 	FrontmostFresh      bool
+	FrontmostSource     string
+	FrontmostObservedID string
+	FrontmostDetail     string
 
 	RunnerProcessAlive      bool
 	RunnerPid               int64

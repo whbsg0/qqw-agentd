@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"os"
 	"regexp"
 	"strings"
@@ -27,11 +28,19 @@ type processProbeResult struct {
 // frontmostProbeResult 表示 WhatsApp 前台探测的原始采样结果。
 // 字段用途：供 guard supervisor 派生前台、查询失败与 stale 状态。
 type frontmostProbeResult struct {
-	Running    bool
-	Err        string
-	SampleAtMs int64
-	Fresh      bool
-	Epoch      int64
+	Running          bool
+	Err              string
+	SampleAtMs       int64
+	Fresh            bool
+	Source           string
+	ObservedBundleID string
+	DisplayName      string
+	Visibility       string
+	TaskState        string
+	Retryable        bool
+	ErrorCode        string
+	Detail           string
+	Epoch            int64
 }
 
 // runnerProbeResult 表示 runner 与脚本健康面的原始采样结果。
@@ -238,27 +247,113 @@ func (a *Agent) sampleProcessProbe(epoch int64) processProbeResult {
 // 返回：前台 probe 结果。
 func (a *Agent) sampleFrontmostProbe(epoch int64) frontmostProbeResult {
 	now := time.Now().UnixMilli()
-	process := a.getGuardProbeSnapshot().Process
-	if !process.Running {
-		return frontmostProbeResult{
-			Running:    false,
-			Err:        "",
-			SampleAtMs: now,
-			Fresh:      true,
-			Epoch:      epoch,
-		}
-	}
-	running, err := a.detectWhatsAppFrontmost()
 	result := frontmostProbeResult{
-		Running:    running,
 		SampleAtMs: now,
 		Fresh:      true,
 		Epoch:      epoch,
 	}
-	if err != nil {
+	if err := a.ensureFrontmostProbeRunning(); err != nil {
+		result.Source = "frontmost-probe.rpc"
+		result.ErrorCode = "probe_unavailable"
 		result.Err = strings.TrimSpace(err.Error())
+		result.Detail = result.Err
+		return result
 	}
+	health, err := a.getFrontmostProbeRPCHealth()
+	if err != nil {
+		result.Source = "frontmost-probe.rpc"
+		result.ErrorCode = "probe_health_failed"
+		result.Err = strings.TrimSpace(err.Error())
+		result.Detail = result.Err
+		return result
+	}
+	if !health.ProbeReady {
+		result.Source = "frontmost-probe.rpc"
+		result.ErrorCode = "not_ready"
+		result.Err = strings.TrimSpace(health.LastHealthErr)
+		if result.Err == "" {
+			result.Err = "frontmost probe not ready"
+		}
+		result.Detail = result.Err
+		return result
+	}
+	status, err := a.getFrontmostProbeRPCStatus()
+	if err != nil {
+		result.Source = "frontmost-probe.rpc"
+		result.ErrorCode = "probe_status_failed"
+		result.Err = strings.TrimSpace(err.Error())
+		result.Detail = result.Err
+		return result
+	}
+	if status.SampleAtMs > 0 {
+		result.SampleAtMs = status.SampleAtMs
+	}
+	result.Source = strings.TrimSpace(status.Source)
+	if result.Source == "" {
+		result.Source = "frontmost-probe.rpc"
+	}
+	result.ObservedBundleID = strings.TrimSpace(status.BundleID)
+	result.DisplayName = strings.TrimSpace(status.DisplayName)
+	result.Visibility = strings.TrimSpace(status.Visibility)
+	result.TaskState = strings.TrimSpace(status.TaskState)
+	result.Retryable = status.Retryable
+	result.ErrorCode = strings.TrimSpace(status.ErrorCode)
+	result.Detail = buildFrontmostProbeDetail(result)
+	if !status.Ok {
+		result.Err = joinFrontmostProbeError(result.ErrorCode, strings.TrimSpace(status.ErrorMessage))
+		if result.ErrorCode == "" {
+			result.ErrorCode = "frontmost_query_failed"
+		}
+		return result
+	}
+	targetBundleID := strings.TrimSpace(a.getCfg().WhatsApp.BundleID)
+	if targetBundleID == "" {
+		targetBundleID = "net.whatsapp.WhatsApp"
+	}
+	result.Running = strings.EqualFold(result.ObservedBundleID, targetBundleID)
 	return result
+}
+
+// joinFrontmostProbeError 把 frontmost-probe 的错误码与错误消息压缩为一条稳定错误文本。
+// 参数：errorCode 为结构化错误码；errorMessage 为结构化错误消息。
+// 返回：适合 guard 状态机持久化与展示的错误摘要。
+func joinFrontmostProbeError(errorCode string, errorMessage string) string {
+	errorCode = strings.TrimSpace(errorCode)
+	errorMessage = strings.TrimSpace(errorMessage)
+	switch {
+	case errorCode != "" && errorMessage != "":
+		return errorCode + ": " + errorMessage
+	case errorCode != "":
+		return errorCode
+	default:
+		return errorMessage
+	}
+}
+
+// buildFrontmostProbeDetail 组装 frontmost-probe 最近一次采样的摘要字符串，便于 guard/status 透传取证。
+// 参数：result 为结构化前台探测结果。
+// 返回：稳定、单行的摘要文本。
+func buildFrontmostProbeDetail(result frontmostProbeResult) string {
+	parts := make([]string, 0, 6)
+	if strings.TrimSpace(result.Source) != "" {
+		parts = append(parts, "source="+strings.TrimSpace(result.Source))
+	}
+	if strings.TrimSpace(result.ObservedBundleID) != "" {
+		parts = append(parts, "bundleId="+strings.TrimSpace(result.ObservedBundleID))
+	}
+	if strings.TrimSpace(result.DisplayName) != "" {
+		parts = append(parts, "displayName="+strings.TrimSpace(result.DisplayName))
+	}
+	if strings.TrimSpace(result.Visibility) != "" {
+		parts = append(parts, "visibility="+strings.TrimSpace(result.Visibility))
+	}
+	if strings.TrimSpace(result.TaskState) != "" {
+		parts = append(parts, "taskState="+strings.TrimSpace(result.TaskState))
+	}
+	if strings.TrimSpace(result.ErrorCode) != "" || strings.TrimSpace(result.Err) != "" {
+		parts = append(parts, fmt.Sprintf("error=%s", joinFrontmostProbeError(result.ErrorCode, result.Err)))
+	}
+	return strings.Join(parts, "; ")
 }
 
 // sampleRunnerProbe 执行单次 runner 与脚本健康探测。
