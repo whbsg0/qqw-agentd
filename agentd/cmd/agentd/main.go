@@ -891,21 +891,6 @@ func (a *Agent) startControlServer(cfgPath string) {
 		running = a.runnerCmd != nil && a.runnerCmd.Process != nil
 		a.runnerMu.Unlock()
 		runtime := a.getGuardRuntimeSnapshot(a.getCfg())
-		// #region debug-point H2:script-status
-		debugGuardReport("pre-fix", "H2", "main.go:/script/status", "script status served", map[string]any{
-			"running":          running,
-			"scriptPath":       a.scriptPath,
-			"updatedAtTsMs":    a.scriptUpdatedAtTS.Load(),
-			"lastError":        strings.TrimSpace(lastErr),
-			"lastEventTsMs":    a.scriptLastEventTS.Load(),
-			"lastPongTsMs":     a.scriptLastPongTS.Load(),
-			"runnerPid":        a.runnerPid.Load(),
-			"runnerRpcOk":      runtime.RunnerRPCOK,
-			"scriptReady":      runtime.ScriptReady,
-			"scriptBuildMatch": runtime.ScriptBuildMatch,
-			"scriptPongFresh":  runtime.ScriptPongFresh,
-		})
-		// #endregion
 		writeJSON(w, http.StatusOK, map[string]any{
 			"ok":                    true,
 			"running":               running,
@@ -1306,15 +1291,6 @@ func (a *Agent) startRunnerWithOptions(requireForeground bool, waitForegroundMs 
 	a.runnerCmd = cmd
 	a.runnerPid.Store(int64(cmd.Process.Pid))
 	a.bumpGuardProbeEpoch("runner_started")
-	// #region debug-point H2:runner-start
-	debugGuardReport("pre-fix", "H2", "main.go:startRunner", "runner process started", map[string]any{
-		"runnerPid":  a.runnerPid.Load(),
-		"scriptPath": a.scriptPath,
-		"bundleId":   strings.TrimSpace(cfg.WhatsApp.BundleID),
-		"fridaHost":  strings.TrimSpace(cfg.Frida.Host),
-		"fridaPort":  cfg.Frida.Port,
-	})
-	// #endregion
 	go func() {
 		err := cmd.Wait()
 		a.runnerMu.Lock()
@@ -1334,22 +1310,7 @@ func (a *Agent) startRunnerWithOptions(requireForeground bool, waitForegroundMs 
 		} else {
 			a.scriptLastError.Store("")
 		}
-		lastErr, _ := a.scriptLastError.Load().(string)
 		a.bumpGuardProbeEpoch("runner_exited")
-		// #region debug-point H2:runner-exit
-		debugGuardReport("pre-fix", "H2", "main.go:startRunner.wait", "runner process exited", map[string]any{
-			"exitError": func() string {
-				if err != nil {
-					return err.Error()
-				}
-				return ""
-			}(),
-			"storedLastErr": strings.TrimSpace(lastErr),
-			"updatedAtTsMs": a.scriptUpdatedAtTS.Load(),
-			"lastEventTsMs": a.scriptLastEventTS.Load(),
-			"lastPongTsMs":  a.scriptLastPongTS.Load(),
-		})
-		// #endregion
 	}()
 	return nil
 }

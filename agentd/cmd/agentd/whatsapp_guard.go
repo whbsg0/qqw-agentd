@@ -1,69 +1,12 @@
 package main
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
-	"net/http"
-	"os"
 	"os/exec"
 	"strings"
 	"time"
 )
-
-const debugGuardServerURL = "http://192.168.1.4:7777/event"
-const debugGuardSessionID = "multi-device-guard-drift"
-const debugGuardLocalLogPath = "/var/mobile/Library/QQwAgent/trae-debug-log-whatsapp-frontmost-sbs.ndjson"
-
-// appendDebugGuardLocalLog 将调试事件追加写入设备本地 ndjson，保证调试服务不可达时证据仍可落盘。
-// 参数：body 为已编码的单条 JSON 调试事件。
-// 返回：写入失败时返回错误。
-func appendDebugGuardLocalLog(body []byte) error {
-	f, err := os.OpenFile(debugGuardLocalLogPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	if _, err := f.Write(body); err != nil {
-		return err
-	}
-	if _, err := f.Write([]byte("\n")); err != nil {
-		return err
-	}
-	return nil
-}
-
-// #region debug-point H1-H5:guard-debug-report
-func debugGuardReport(runID string, hypothesisID string, location string, msg string, data map[string]any) {
-	go func() {
-		body, err := json.Marshal(map[string]any{
-			"sessionId":    debugGuardSessionID,
-			"runId":        runID,
-			"hypothesisId": hypothesisID,
-			"location":     location,
-			"msg":          "[DEBUG] " + strings.TrimSpace(msg),
-			"data":         data,
-			"ts":           time.Now().UnixMilli(),
-		})
-		if err != nil {
-			return
-		}
-		_ = appendDebugGuardLocalLog(body)
-		ctx, cancel := context.WithTimeout(context.Background(), 700*time.Millisecond)
-		defer cancel()
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, debugGuardServerURL, bytes.NewReader(body))
-		if err != nil {
-			return
-		}
-		req.Header.Set("Content-Type", "application/json")
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			return
-		}
-		_ = resp.Body.Close()
-	}()
-}
 
 func debugGuardSamplePS(output string) []string {
 	src := strings.Split(output, "\n")
@@ -82,8 +25,6 @@ func debugGuardSamplePS(output string) []string {
 	}
 	return out
 }
-
-// #endregion
 
 // guardRuntimeSnapshot 表示当前守护循环的运行态快照。
 // 字段用途：用于 `/status`、`/guard/status` 和手机端守护状态展示。
@@ -197,20 +138,6 @@ func (a *Agent) setGuardRuntimeSnapshot(snapshot guardRuntimeSnapshot) {
 	a.guardStateMu.Lock()
 	a.guardState = snapshot
 	a.guardStateMu.Unlock()
-	// #region debug-point H4:guard-snapshot
-	debugGuardReport("pre-fix", "H4", "whatsapp_guard.go:setGuardRuntimeSnapshot", "guard snapshot updated", map[string]any{
-		"state":            snapshot.State,
-		"runnerState":      snapshot.RunnerState,
-		"reasonCode":       snapshot.ReasonCode,
-		"listeningReady":   snapshot.ListeningReady,
-		"processRunning":   snapshot.ProcessRunning,
-		"frontmostFresh":   snapshot.FrontmostFresh,
-		"runnerRpcOk":      snapshot.RunnerRPCOK,
-		"scriptReady":      snapshot.ScriptReady,
-		"recoveryAttempts": snapshot.RecoveryAttempts,
-		"nextRetryAtMs":    snapshot.NextRetryAtMs,
-	})
-	// #endregion
 }
 
 // wakeGuardLoop 唤醒守护循环，使配置切换和手工动作能尽快生效。
@@ -341,34 +268,14 @@ func (a *Agent) detectWhatsAppProcess() (bool, error) {
 			} else {
 				lastErr = err
 			}
-			// #region debug-point H1:ps-command-error
-			debugGuardReport("pre-fix", "H1", "whatsapp_guard.go:detectWhatsAppProcess", "ps command failed", map[string]any{
-				"path":  command.path,
-				"args":  command.args,
-				"error": lastErr.Error(),
-			})
-			// #endregion
 			continue
 		}
 		matched := parsePSContainsWhatsApp(string(out))
-		// #region debug-point H1:ps-command-result
-		debugGuardReport("pre-fix", "H1", "whatsapp_guard.go:detectWhatsAppProcess", "ps command parsed", map[string]any{
-			"path":    command.path,
-			"args":    command.args,
-			"matched": matched,
-			"sample":  debugGuardSamplePS(string(out)),
-		})
-		// #endregion
 		return matched, nil
 	}
 	if lastErr == nil {
 		lastErr = errors.New("ps not available")
 	}
-	// #region debug-point H1:ps-unavailable
-	debugGuardReport("pre-fix", "H1", "whatsapp_guard.go:detectWhatsAppProcess", "all ps commands unavailable", map[string]any{
-		"error": lastErr.Error(),
-	})
-	// #endregion
 	return false, lastErr
 }
 

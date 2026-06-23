@@ -326,6 +326,9 @@ func buildGuardRecoveryTask(snapshot guardRuntimeSnapshot, manual bool) (guardRe
 		}
 		return guardRecoveryTask{GuardState: state, ReasonCode: reason, Manual: manual, Actions: actions}, true
 	case "wa_frontmost_query_failed", "wa_frontmost_stale":
+		if shouldDeferFrontmostRecoveryWhileRunnerStarting(snapshot) {
+			return guardRecoveryTask{}, false
+		}
 		if state == "wa_frontmost_query_failed" && !manual && !shouldAutoRecoverFrontmostQueryFailure(snapshot.FrontmostErr) {
 			return guardRecoveryTask{}, false
 		}
@@ -342,6 +345,13 @@ func buildGuardRecoveryTask(snapshot guardRuntimeSnapshot, manual bool) (guardRe
 	default:
 		return guardRecoveryTask{}, false
 	}
+}
+
+// shouldDeferFrontmostRecoveryWhileRunnerStarting 判断当前是否应暂缓 frontmost 侧恢复。
+// 参数：snapshot 为当前统一派生快照。
+// 返回：true 表示 runner 仍处于启动窗口，不应让 frontmost 恢复链打断其启动；false 表示可按常规恢复。
+func shouldDeferFrontmostRecoveryWhileRunnerStarting(snapshot guardRuntimeSnapshot) bool {
+	return strings.TrimSpace(snapshot.RunnerState) == "runner_starting" && snapshot.RunnerProcessAlive
 }
 
 // shouldAutoRecoverFrontmostQueryFailure 判断 frontmost 查询失败是否仍值得自动触发重启链。

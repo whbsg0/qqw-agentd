@@ -132,10 +132,6 @@ func (a *Agent) currentGuardRecoveryEpoch() int64 {
 // 返回：新的 probe epoch。
 func (a *Agent) bumpGuardProbeEpoch(reason string) int64 {
 	next := a.nextGuardProbeEpoch()
-	debugGuardReport("guard-refactor", "P0", "whatsapp_guard_probes.go:bumpGuardProbeEpoch", "guard probe epoch bumped", map[string]any{
-		"epoch":  next,
-		"reason": strings.TrimSpace(reason),
-	})
 	a.wakeGuardLoop()
 	return next
 }

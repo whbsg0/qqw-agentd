@@ -702,12 +702,6 @@ func (a *Agent) detectWhatsAppFrontmost() (bool, error) {
 	cfg := a.getCfg()
 	host := strings.TrimSpace(cfg.Frida.Host)
 	if host == "" || cfg.Frida.Port <= 0 {
-		// #region debug-point H3:frontmost-config
-		debugGuardReport("pre-fix", "H3", "whatsapp_frontmost_ios.go:detectWhatsAppFrontmost", "frontmost config missing", map[string]any{
-			"host": host,
-			"port": cfg.Frida.Port,
-		})
-		// #endregion
 		return false, errors.New("frida host/port missing")
 	}
 	bundleID := strings.TrimSpace(cfg.WhatsApp.BundleID)
@@ -732,35 +726,11 @@ func (a *Agent) detectWhatsAppFrontmost() (bool, error) {
 	if cErr != nil {
 		defer C.qqw_guard_free(cErr)
 		err := errors.New(C.GoString(cErr))
-		// #region debug-point H3:frontmost-query-error
-		debugGuardReport("pre-fix", "H3", "whatsapp_frontmost_ios.go:detectWhatsAppFrontmost", "frontmost query returned c error", map[string]any{
-			"addr":     addr,
-			"bundleId": bundleID,
-			"detail":   detail,
-			"error":    err.Error(),
-		})
-		// #endregion
 		return false, err
 	}
 	if rc < 0 {
-		// #region debug-point H3:frontmost-query-negative
-		debugGuardReport("pre-fix", "H3", "whatsapp_frontmost_ios.go:detectWhatsAppFrontmost", "frontmost query returned negative rc", map[string]any{
-			"addr":     addr,
-			"bundleId": bundleID,
-			"rc":       rc,
-		})
-		// #endregion
 		return false, errors.New("frontmost query failed")
 	}
 	matched := rc != 0
-	// #region debug-point H3:frontmost-query-result
-	debugGuardReport("pre-fix", "H3", "whatsapp_frontmost_ios.go:detectWhatsAppFrontmost", "frontmost query result", map[string]any{
-		"addr":     addr,
-		"bundleId": bundleID,
-		"detail":   detail,
-		"matched":  matched,
-		"rc":       rc,
-	})
-	// #endregion
 	return matched, nil
 }
