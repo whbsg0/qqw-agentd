@@ -4,6 +4,9 @@ package main
 
 /*
 #cgo CFLAGS: -Wno-deprecated-declarations
+#cgo LDFLAGS: -framework CoreFoundation
+#include <CoreFoundation/CoreFoundation.h>
+#include <dlfcn.h>
 #include <stdlib.h>
 #include <string.h>
 #include <frida-core.h>
@@ -14,7 +17,117 @@ static gchar *qqw_guard_strdup2(const gchar *prefix, const gchar *msg) {
   return g_strdup_printf("%s%s", prefix, msg);
 }
 
-static int qqw_guard_query_frontmost(const char *address, const char *process_name, const char *bundle_id, char **error_out) {
+// qqw_guard_cfstring_to_utf8 将 CFStringRef 安全转换为 UTF-8 副本。
+// 参数：value 为待转换的 CoreFoundation 字符串。
+// 返回：成功时返回 g_strdup 分配的 UTF-8 字符串；失败返回空串副本。
+static gchar *qqw_guard_cfstring_to_utf8(CFStringRef value) {
+  if (value == NULL) {
+    return g_strdup("");
+  }
+  const char *direct = CFStringGetCStringPtr(value, kCFStringEncodingUTF8);
+  if (direct != NULL) {
+    return g_strdup(direct);
+  }
+  CFIndex length = CFStringGetLength(value);
+  CFIndex max_size = CFStringGetMaximumSizeForEncoding(length, kCFStringEncodingUTF8) + 1;
+  gchar *buffer = g_malloc0((gsize) max_size);
+  if (!CFStringGetCString(value, buffer, max_size, kCFStringEncodingUTF8)) {
+    g_free(buffer);
+    return g_strdup("");
+  }
+  return buffer;
+}
+
+// qqw_guard_query_frontmost_sbs 在 Frida frontmost 返回空值时改用 SBS 取前台 display identifier。
+// 参数：process_name 为目标进程名；bundle_id 为目标 bundle id；detail_out 输出诊断细节；error_out 输出失败原因。
+// 返回：1 表示目标前台；0 表示已明确不是目标前台；-1 表示 fallback 也无法得到可信前台真值。
+static int qqw_guard_query_frontmost_sbs(const char *process_name, const char *bundle_id, char **detail_out, char **error_out) {
+  const gchar *proc = process_name != NULL && process_name[0] != '\0' ? process_name : "WhatsApp";
+  const gchar *bid = bundle_id != NULL ? bundle_id : "";
+  void *handle = dlopen("/System/Library/PrivateFrameworks/SpringBoardServices.framework/SpringBoardServices", RTLD_GLOBAL | RTLD_LAZY);
+  if (handle == NULL) {
+    if (error_out != NULL) {
+      const char *msg = dlerror();
+      *error_out = qqw_guard_strdup2("frontmost fallback sbs dlopen: ", msg != NULL ? msg : "unknown");
+    }
+    return -1;
+  }
+
+  typedef CFStringRef (*qqw_sbs_copy_frontmost_application_display_identifier_fn)(void);
+  typedef CFStringRef (*qqw_sbs_copy_localized_application_name_for_display_identifier_fn)(CFStringRef identifier);
+
+  dlerror();
+  qqw_sbs_copy_frontmost_application_display_identifier_fn copy_frontmost =
+    (qqw_sbs_copy_frontmost_application_display_identifier_fn) dlsym(handle, "SBSCopyFrontmostApplicationDisplayIdentifier");
+  const char *frontmost_sym_error = dlerror();
+  if (copy_frontmost == NULL || frontmost_sym_error != NULL) {
+    if (error_out != NULL) {
+      *error_out = qqw_guard_strdup2("frontmost fallback sbs symbol: ",
+        frontmost_sym_error != NULL ? frontmost_sym_error : "SBSCopyFrontmostApplicationDisplayIdentifier missing");
+    }
+    dlclose(handle);
+    return -1;
+  }
+
+  dlerror();
+  qqw_sbs_copy_localized_application_name_for_display_identifier_fn copy_name =
+    (qqw_sbs_copy_localized_application_name_for_display_identifier_fn) dlsym(handle, "SBSCopyLocalizedApplicationNameForDisplayIdentifier");
+  const char *name_sym_error = dlerror();
+  if (name_sym_error != NULL) {
+    copy_name = NULL;
+  }
+
+  CFStringRef front_id_ref = copy_frontmost();
+  if (front_id_ref == NULL) {
+    if (detail_out != NULL) {
+      *detail_out = g_strdup_printf("front.source=sbs front.id= front.name= expected.id=%s expected.name=%s front=nil",
+        bid != NULL ? bid : "",
+        proc != NULL ? proc : "");
+    }
+    if (error_out != NULL) {
+      *error_out = g_strdup("frontmost fallback sbs returned nil");
+    }
+    dlclose(handle);
+    return -1;
+  }
+
+  gchar *front_id = qqw_guard_cfstring_to_utf8(front_id_ref);
+  CFStringRef front_name_ref = NULL;
+  gchar *front_name = g_strdup("");
+  if (copy_name != NULL) {
+    front_name_ref = copy_name(front_id_ref);
+    if (front_name_ref != NULL) {
+      g_free(front_name);
+      front_name = qqw_guard_cfstring_to_utf8(front_name_ref);
+    }
+  }
+
+  if (detail_out != NULL) {
+    *detail_out = g_strdup_printf("front.source=sbs front.id=%s front.name=%s expected.id=%s expected.name=%s",
+      front_id != NULL ? front_id : "",
+      front_name != NULL ? front_name : "",
+      bid != NULL ? bid : "",
+      proc != NULL ? proc : "");
+  }
+
+  int matched = 0;
+  if (bid[0] != '\0' && front_id != NULL && g_strcmp0(front_id, bid) == 0) {
+    matched = 1;
+  } else if (front_name != NULL && g_strcmp0(front_name, proc) == 0) {
+    matched = 1;
+  }
+
+  if (front_name_ref != NULL) {
+    CFRelease(front_name_ref);
+  }
+  CFRelease(front_id_ref);
+  g_free(front_id);
+  g_free(front_name);
+  dlclose(handle);
+  return matched;
+}
+
+static int qqw_guard_query_frontmost(const char *address, const char *process_name, const char *bundle_id, char **detail_out, char **error_out) {
   frida_init();
   GError *error = NULL;
 
@@ -87,12 +200,27 @@ static int qqw_guard_query_frontmost(const char *address, const char *process_na
     if (front != NULL) {
       const gchar *fid = frida_application_get_identifier(front);
       const gchar *fname = frida_application_get_name(front);
+      if (detail_out != NULL) {
+        *detail_out = g_strdup_printf("front.source=frida front.id=%s front.name=%s expected.id=%s expected.name=%s",
+          fid != NULL ? fid : "",
+          fname != NULL ? fname : "",
+          bid != NULL ? bid : "",
+          proc != NULL ? proc : "");
+      }
       if (bid[0] != '\0' && fid != NULL && g_strcmp0(fid, bid) == 0) {
         matched = 1;
       } else if (fname != NULL && g_strcmp0(fname, proc) == 0) {
         matched = 1;
       }
       g_object_unref(front);
+    } else {
+      int sbs_matched = qqw_guard_query_frontmost_sbs(proc, bid, detail_out, error_out);
+      g_object_unref(device);
+      g_object_unref(manager);
+      if (sbs_matched >= 0) {
+        return sbs_matched;
+      }
+      return -1;
     }
 
     g_object_unref(device);
@@ -154,7 +282,13 @@ func (a *Agent) detectWhatsAppFrontmost() (bool, error) {
 	defer C.free(unsafe.Pointer(cProc))
 	defer C.free(unsafe.Pointer(cBundle))
 	var cErr *C.char
-	rc := C.qqw_guard_query_frontmost(cAddr, cProc, cBundle, &cErr)
+	var cDetail *C.char
+	rc := C.qqw_guard_query_frontmost(cAddr, cProc, cBundle, &cDetail, &cErr)
+	detail := ""
+	if cDetail != nil {
+		defer C.qqw_guard_free(cDetail)
+		detail = C.GoString(cDetail)
+	}
 	if cErr != nil {
 		defer C.qqw_guard_free(cErr)
 		err := errors.New(C.GoString(cErr))
@@ -162,6 +296,7 @@ func (a *Agent) detectWhatsAppFrontmost() (bool, error) {
 		debugGuardReport("pre-fix", "H3", "whatsapp_frontmost_ios.go:detectWhatsAppFrontmost", "frontmost query returned c error", map[string]any{
 			"addr":     addr,
 			"bundleId": bundleID,
+			"detail":   detail,
 			"error":    err.Error(),
 		})
 		// #endregion
@@ -180,10 +315,11 @@ func (a *Agent) detectWhatsAppFrontmost() (bool, error) {
 	matched := rc != 0
 	// #region debug-point H3:frontmost-query-result
 	debugGuardReport("pre-fix", "H3", "whatsapp_frontmost_ios.go:detectWhatsAppFrontmost", "frontmost query result", map[string]any{
-		"addr":      addr,
-		"bundleId":  bundleID,
-		"matched":   matched,
-		"rc":        rc,
+		"addr":     addr,
+		"bundleId": bundleID,
+		"detail":   detail,
+		"matched":  matched,
+		"rc":       rc,
 	})
 	// #endregion
 	return matched, nil
