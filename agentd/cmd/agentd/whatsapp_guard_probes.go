@@ -332,7 +332,7 @@ func (a *Agent) shouldRunFrontmostProbe() bool {
 	if a.runnerOwnsFridaConnection() {
 		return false
 	}
-	snapshot := a.getGuardRuntimeSnapshot()
+	snapshot := a.getGuardRuntimeSnapshot(a.getCfg())
 	if strings.TrimSpace(snapshot.ProcessProbeErr) != "" || !snapshot.ProcessRunning {
 		return false
 	}
