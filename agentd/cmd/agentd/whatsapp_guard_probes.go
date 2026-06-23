@@ -248,7 +248,7 @@ func (a *Agent) sampleProcessProbe(epoch int64) processProbeResult {
 // 参数：epoch 为本轮采样绑定的 probe epoch。
 // 返回：前台 probe 结果。
 func (a *Agent) sampleFrontmostProbe(epoch int64) frontmostProbeResult {
-	if a.runnerOwnsFridaConnection() {
+	if !a.shouldRunFrontmostProbe() {
 		_ = a.stopFrontmostProbeIfRunning()
 		prev := a.getGuardProbeSnapshot().Frontmost
 		prev.Epoch = epoch
@@ -320,6 +320,26 @@ func (a *Agent) sampleFrontmostProbe(epoch int64) frontmostProbeResult {
 	}
 	result.Running = strings.EqualFold(result.ObservedBundleID, targetBundleID)
 	return result
+}
+
+// shouldRunFrontmostProbe 判断当前是否仍需要 frontmost-probe 参与前台确认。
+// 参数：无。
+// 返回：true 表示当前仍应运行 frontmost-probe；false 表示应停用并依赖 runner 主真值或其他轻量信号。
+func (a *Agent) shouldRunFrontmostProbe() bool {
+	if !guardFrontmostQueryEnabled() {
+		return false
+	}
+	if a.runnerOwnsFridaConnection() {
+		return false
+	}
+	snapshot := a.getGuardRuntimeSnapshot()
+	if strings.TrimSpace(snapshot.ProcessProbeErr) != "" || !snapshot.ProcessRunning {
+		return false
+	}
+	if snapshot.ScriptPongFresh && strings.HasPrefix(strings.TrimSpace(snapshot.FrontmostSource), "runner.qqw_pong") {
+		return false
+	}
+	return true
 }
 
 // joinFrontmostProbeError 把 frontmost-probe 的错误码与错误消息压缩为一条稳定错误文本。

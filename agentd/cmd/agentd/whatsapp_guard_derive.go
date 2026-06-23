@@ -136,7 +136,7 @@ func deriveGuardRuntimeSnapshot(
 			snapshot.ReasonCode = "wa_frontmost_query_failed"
 			return snapshot
 		}
-		if !probes.Frontmost.Running {
+		if !snapshot.Frontmost {
 			if confirmStartedAt.IsZero() {
 				*confirmStartedAt = now
 				snapshot.State = "wa_wait_foreground_confirm"

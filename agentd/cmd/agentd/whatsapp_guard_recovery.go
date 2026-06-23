@@ -325,18 +325,23 @@ func buildGuardRecoveryTask(snapshot guardRuntimeSnapshot, manual bool) (guardRe
 			actions = []string{"restart_frida_server", "restart_agentd", "open_whatsapp_after_recover"}
 		}
 		return guardRecoveryTask{GuardState: state, ReasonCode: reason, Manual: manual, Actions: actions}, true
-	case "wa_frontmost_query_failed", "wa_frontmost_stale":
+	case "wa_frontmost_stale":
+		if shouldDeferFrontmostRecoveryWhileRunnerStarting(snapshot) {
+			return guardRecoveryTask{}, false
+		}
+		actions := []string{"restart_frontmost_probe"}
+		if manual {
+			actions = []string{"restart_frida_server", "restart_frontmost_probe", "open_whatsapp_after_recover"}
+		}
+		return guardRecoveryTask{GuardState: state, ReasonCode: reason, Manual: manual, Actions: actions}, true
+	case "wa_frontmost_query_failed":
 		if shouldDeferFrontmostRecoveryWhileRunnerStarting(snapshot) {
 			return guardRecoveryTask{}, false
 		}
 		if state == "wa_frontmost_query_failed" && !manual && !shouldAutoRecoverFrontmostQueryFailure(snapshot.FrontmostErr) {
 			return guardRecoveryTask{}, false
 		}
-		actions := []string{"restart_frontmost_probe"}
-		if manual || snapshot.RecoveryAttempts >= 2 {
-			actions = []string{"restart_frida_server", "restart_frontmost_probe", "open_whatsapp_after_recover"}
-		}
-		return guardRecoveryTask{GuardState: state, ReasonCode: reason, Manual: manual, Actions: actions}, true
+		return guardRecoveryTask{GuardState: state, ReasonCode: reason, Manual: manual, Actions: []string{"restart_frontmost_probe"}}, true
 	case "wa_process_probe_failed":
 		if snapshot.RecoveryAttempts >= 2 || manual {
 			return guardRecoveryTask{GuardState: state, ReasonCode: reason, Manual: manual, Actions: []string{"restart_agentd"}}, true
