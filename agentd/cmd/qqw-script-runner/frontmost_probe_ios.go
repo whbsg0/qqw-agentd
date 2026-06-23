@@ -297,6 +297,9 @@ const frontmostProbeScriptSource = `
       return out;
     }
     var bundle = /bundle identifier:\s*([^;>]+)/i.exec(text);
+    if (!bundle) {
+      bundle = /<SBApplication:[^;]+;\s*([^>]+)>/i.exec(text);
+    }
     var display = /display name:\s*([^;>]+)/i.exec(text);
     var visibility = /visibility:\s*([^;>]+)/i.exec(text);
     var taskState = /taskState:\s*([^;>]+)/i.exec(text);
