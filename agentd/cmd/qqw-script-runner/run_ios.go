@@ -6,6 +6,7 @@ package main
 #cgo CFLAGS: -Wno-deprecated-declarations
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <frida-core.h>
 
 extern void goFridaOnMessage(char *message);
@@ -16,10 +17,49 @@ typedef struct {
 
 static GMutex g_script_mu;
 static FridaScript *g_script = NULL;
+static const char *qqw_runner_debug_local_log_path = "/var/mobile/Library/QQwAgent/trae-debug-log-guard-fuse-errors.ndjson";
+static const char *qqw_runner_debug_afc_log_path = "/var/mobile/Media/QQwAgent/trae-debug-log-guard-fuse-errors.ndjson";
 
 static gchar * qqw_strdup_printf2(const gchar *prefix, const gchar *msg);
 
+// qqw_runner_debug_append_line 追加一行调试文本到设备私有路径或 AFC 镜像路径。
+// 参数：path 为目标路径；line 为已经格式化完成的单行日志。
+// 返回：无。
+static void qqw_runner_debug_append_line(const char *path, const gchar *line) {
+  if (path == NULL || path[0] == '\0' || line == NULL || line[0] == '\0') {
+    return;
+  }
+  FILE *fp = fopen(path, "a");
+  if (fp == NULL) {
+    return;
+  }
+  fputs(line, fp);
+  fputc('\n', fp);
+  fclose(fp);
+}
+
+// qqw_runner_debug_log_stage 将 runner 注入生命周期阶段写入设备侧调试日志。
+// 参数：stage 为阶段名；detail 为附加文本；value 为阶段相关整数值。
+// 返回：无。
+static void qqw_runner_debug_log_stage(const gchar *stage, const gchar *detail, gint value) {
+  gchar *safe_stage = g_strescape(stage != NULL ? stage : "", NULL);
+  gchar *safe_detail = g_strescape(detail != NULL ? detail : "", NULL);
+  gchar *line = g_strdup_printf(
+    "{\"sessionId\":\"guard-fuse-errors\",\"runId\":\"runner-load\",\"hypothesisId\":\"H3\",\"location\":\"run_ios.go:qqw_run\",\"msg\":\"[DEBUG] runner-stage %s\",\"data\":{\"stage\":\"%s\",\"detail\":\"%s\",\"value\":%d},\"ts\":%" G_GINT64_FORMAT "}",
+    safe_stage != NULL ? safe_stage : "",
+    safe_stage != NULL ? safe_stage : "",
+    safe_detail != NULL ? safe_detail : "",
+    (int) value,
+    (gint64) (g_get_real_time() / 1000));
+  qqw_runner_debug_append_line(qqw_runner_debug_local_log_path, line);
+  qqw_runner_debug_append_line(qqw_runner_debug_afc_log_path, line);
+  g_free(line);
+  g_free(safe_stage);
+  g_free(safe_detail);
+}
+
 static void qqw_set_script(FridaScript *script) {
+  qqw_runner_debug_log_stage("before_set_script", script != NULL ? "script_present" : "script_nil", 0);
   g_mutex_lock(&g_script_mu);
   if (g_script != NULL) {
     g_object_unref(g_script);
@@ -30,6 +70,7 @@ static void qqw_set_script(FridaScript *script) {
     g_object_ref(g_script);
   }
   g_mutex_unlock(&g_script_mu);
+  qqw_runner_debug_log_stage("after_set_script", script != NULL ? "script_present" : "script_nil", 0);
 }
 
 static int qqw_script_ready() {
@@ -70,6 +111,7 @@ static gchar * qqw_strdup_printf3(const gchar *prefix, const gchar *mid, const g
 
 static void on_message(FridaScript *script, const gchar *message, GBytes *data, gpointer user_data) {
   if (message == NULL) return;
+  qqw_runner_debug_log_stage("callback_message", message, 0);
   goFridaOnMessage((char *) message);
 }
 
@@ -77,6 +119,7 @@ static void on_detached(FridaSession *session, FridaSessionDetachReason reason, 
   qqw_ctx_t *ctx = (qqw_ctx_t *) user_data;
   if (ctx == NULL || ctx->loop == NULL) return;
   fprintf(stderr, "frida detached: reason=%d\n", (int) reason);
+  qqw_runner_debug_log_stage("callback_detached", NULL, (gint) reason);
   qqw_set_script(NULL);
   g_main_loop_quit(ctx->loop);
 }
@@ -101,7 +144,9 @@ static guint find_pid(FridaDevice *device, const gchar *name, GError **error) {
 }
 
 static int qqw_run(const char *address, const char *process_name, const char *bundle_id, int require_foreground, int wait_foreground_ms, const char *script_source, char **error_out) {
+  qqw_runner_debug_log_stage("enter_run", address, wait_foreground_ms);
   frida_init();
+  qqw_runner_debug_log_stage("after_frida_init", process_name, require_foreground);
   GError *error = NULL;
 
   const gchar *proc = process_name != NULL && process_name[0] != '\0' ? process_name : "WhatsApp";
@@ -112,22 +157,28 @@ static int qqw_run(const char *address, const char *process_name, const char *bu
   FridaDevice *device = NULL;
 
   for (int attempt = 1; attempt <= max_attempts; attempt++) {
+    qqw_runner_debug_log_stage("attempt_begin", NULL, attempt);
     if (device != NULL) { g_object_unref(device); device = NULL; }
     if (manager != NULL) { g_object_unref(manager); manager = NULL; }
     if (error != NULL) { g_error_free(error); error = NULL; }
 
     manager = frida_device_manager_new();
+    qqw_runner_debug_log_stage("after_manager_new", NULL, manager != NULL ? 1 : 0);
+    qqw_runner_debug_log_stage("before_add_remote_device", address, attempt);
     device = frida_device_manager_add_remote_device_sync(manager, address, NULL, NULL, &error);
     if (error != NULL && address != NULL) {
+      qqw_runner_debug_log_stage("add_remote_device_primary_error", error->message, attempt);
       const char *colon = strchr(address, ':');
       if (colon != NULL) {
         gchar *host_only = g_strndup(address, (gsize) (colon - address));
         g_error_free(error);
         error = NULL;
+        qqw_runner_debug_log_stage("before_add_remote_device_host_only", host_only, attempt);
         device = frida_device_manager_add_remote_device_sync(manager, host_only, NULL, NULL, &error);
         g_free(host_only);
       }
     }
+    qqw_runner_debug_log_stage("after_add_remote_device", error != NULL ? error->message : NULL, device != NULL ? 1 : 0);
     if (error != NULL) {
       if (attempt < max_attempts && g_strcmp0(error->message, "Timeout was reached") == 0) {
         g_usleep((gulong) (200000 * attempt));
@@ -149,6 +200,7 @@ static int qqw_run(const char *address, const char *process_name, const char *bu
         FridaApplication *front = frida_device_get_frontmost_application_sync(device, fopts, NULL, &error);
         if (error != NULL) {
           fprintf(stderr, "frontmost query failed: %s\n", error->message);
+          qqw_runner_debug_log_stage("frontmost_query_error", error->message, attempt);
           g_error_free(error);
           error = NULL;
           break;
@@ -172,6 +224,7 @@ static int qqw_run(const char *address, const char *process_name, const char *bu
     }
 
     guint pid = find_pid(device, proc, &error);
+    qqw_runner_debug_log_stage("after_find_pid", proc, (gint) pid);
     if (error != NULL) {
       if (attempt < max_attempts && (g_strcmp0(error->message, "Timeout was reached") == 0 || g_strrstr(error->message, "end-of-stream") != NULL)) {
         g_error_free(error);
@@ -192,7 +245,9 @@ static int qqw_run(const char *address, const char *process_name, const char *bu
       return 2;
     }
 
+    qqw_runner_debug_log_stage("before_attach", proc, (gint) pid);
     FridaSession *session = frida_device_attach_sync(device, pid, NULL, NULL, &error);
+    qqw_runner_debug_log_stage("after_attach", error != NULL ? error->message : NULL, session != NULL ? 1 : 0);
     if (error != NULL || session == NULL) {
       if (attempt < max_attempts && error != NULL) {
         if (g_strcmp0(error->message, "Timeout was reached") == 0 || g_strrstr(error->message, "end-of-stream") != NULL) {
@@ -213,44 +268,54 @@ static int qqw_run(const char *address, const char *process_name, const char *bu
       return 2;
     }
 
-  FridaScript *script = frida_session_create_script_sync(session, script_source, NULL, NULL, &error);
-  if (error != NULL) {
-    *error_out = qqw_strdup_printf2("create_script: ", error->message);
-    g_error_free(error);
-    g_object_unref(session);
-    g_object_unref(device);
-    g_object_unref(manager);
-    return 2;
-  }
+    qqw_runner_debug_log_stage("before_create_script", NULL, attempt);
+    FridaScript *script = frida_session_create_script_sync(session, script_source, NULL, NULL, &error);
+    qqw_runner_debug_log_stage("after_create_script", error != NULL ? error->message : NULL, script != NULL ? 1 : 0);
+    if (error != NULL) {
+      *error_out = qqw_strdup_printf2("create_script: ", error->message);
+      g_error_free(error);
+      g_object_unref(session);
+      g_object_unref(device);
+      g_object_unref(manager);
+      return 2;
+    }
 
-  qqw_ctx_t ctx;
-  ctx.loop = g_main_loop_new(NULL, FALSE);
-  g_signal_connect(script, "message", G_CALLBACK(on_message), &ctx);
-  g_signal_connect(session, "detached", G_CALLBACK(on_detached), &ctx);
+    qqw_ctx_t ctx;
+    ctx.loop = g_main_loop_new(NULL, FALSE);
+    qqw_runner_debug_log_stage("after_loop_new", NULL, ctx.loop != NULL ? 1 : 0);
+    g_signal_connect(script, "message", G_CALLBACK(on_message), &ctx);
+    g_signal_connect(session, "detached", G_CALLBACK(on_detached), &ctx);
 
-  frida_script_load_sync(script, NULL, &error);
-  if (error != NULL) {
-    *error_out = qqw_strdup_printf2("script_load: ", error->message);
-    g_error_free(error);
+    qqw_runner_debug_log_stage("before_script_load", NULL, attempt);
+    frida_script_load_sync(script, NULL, &error);
+    qqw_runner_debug_log_stage("after_script_load", error != NULL ? error->message : NULL, 0);
+    if (error != NULL) {
+      *error_out = qqw_strdup_printf2("script_load: ", error->message);
+      g_error_free(error);
+      g_main_loop_unref(ctx.loop);
+      g_object_unref(script);
+      g_object_unref(session);
+      g_object_unref(device);
+      g_object_unref(manager);
+      return 2;
+    }
+    qqw_set_script(script);
+
+    qqw_runner_debug_log_stage("before_main_loop_run", NULL, 0);
+    g_main_loop_run(ctx.loop);
+    qqw_runner_debug_log_stage("after_main_loop_run", NULL, 0);
+
+    qqw_set_script(NULL);
+    qqw_runner_debug_log_stage("before_script_unload", NULL, 0);
+    frida_script_unload_sync(script, NULL, NULL);
+    qqw_runner_debug_log_stage("after_script_unload", NULL, 0);
     g_main_loop_unref(ctx.loop);
     g_object_unref(script);
     g_object_unref(session);
     g_object_unref(device);
     g_object_unref(manager);
-    return 2;
-  }
-  qqw_set_script(script);
-
-  g_main_loop_run(ctx.loop);
-
-  qqw_set_script(NULL);
-  frida_script_unload_sync(script, NULL, NULL);
-  g_main_loop_unref(ctx.loop);
-  g_object_unref(script);
-  g_object_unref(session);
-  g_object_unref(device);
-  g_object_unref(manager);
-  return 0;
+    qqw_runner_debug_log_stage("return_success", NULL, 0);
+    return 0;
   }
 
   *error_out = g_strdup("attach: failed after retries");
