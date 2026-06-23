@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"os"
 	"os/exec"
 	"strings"
 	"time"
@@ -13,6 +14,25 @@ import (
 
 const debugGuardServerURL = "http://192.168.1.4:7777/event"
 const debugGuardSessionID = "multi-device-guard-drift"
+const debugGuardLocalLogPath = "/var/mobile/Library/QQwAgent/trae-debug-log-whatsapp-frontmost-sbs.ndjson"
+
+// appendDebugGuardLocalLog 将调试事件追加写入设备本地 ndjson，保证调试服务不可达时证据仍可落盘。
+// 参数：body 为已编码的单条 JSON 调试事件。
+// 返回：写入失败时返回错误。
+func appendDebugGuardLocalLog(body []byte) error {
+	f, err := os.OpenFile(debugGuardLocalLogPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if _, err := f.Write(body); err != nil {
+		return err
+	}
+	if _, err := f.Write([]byte("\n")); err != nil {
+		return err
+	}
+	return nil
+}
 
 // #region debug-point H1-H5:guard-debug-report
 func debugGuardReport(runID string, hypothesisID string, location string, msg string, data map[string]any) {
@@ -29,6 +49,7 @@ func debugGuardReport(runID string, hypothesisID string, location string, msg st
 		if err != nil {
 			return
 		}
+		_ = appendDebugGuardLocalLog(body)
 		ctx, cancel := context.WithTimeout(context.Background(), 700*time.Millisecond)
 		defer cancel()
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, debugGuardServerURL, bytes.NewReader(body))
